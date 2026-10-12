@@ -4,6 +4,7 @@ import type { RateLimiters } from "../lib/rate-limit";
 import { loadSession } from "../modules/auth/auth.middleware";
 import { authRoutes } from "../modules/auth/auth.routes";
 import { csrfProtection } from "../modules/auth/csrf";
+import { fabricRoutes } from "../modules/fabrics/fabric.routes";
 import { roleRoutes } from "../modules/permissions/permission.routes";
 import { userRoutes } from "../modules/users/user.routes";
 
@@ -23,6 +24,7 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use("/auth", authRoutes(limiters));
   router.use("/users", userRoutes());
   router.use("/roles", roleRoutes());
+  router.use("/fabrics", fabricRoutes());
 
   return router;
 }

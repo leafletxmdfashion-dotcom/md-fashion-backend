@@ -19,7 +19,14 @@ export type AuditEventType =
   | "USER_ENABLED"
   | "ROLE_CHANGED"
   | "PERMISSION_CHANGED"
-  | "SESSION_REVOKED";
+  | "SESSION_REVOKED"
+  | "FABRIC_CREATED"
+  | "FABRIC_UPDATED"
+  | "FABRIC_INWARD_POSTED"
+  | "FABRIC_INWARD_REVERSED"
+  | "FABRIC_STOCK_ADJUSTED"
+  | "FABRIC_STATUS_BULK_CHANGED"
+  | "FABRIC_IMPORTED";
 
 export interface AuditEvent {
   type: AuditEventType;
