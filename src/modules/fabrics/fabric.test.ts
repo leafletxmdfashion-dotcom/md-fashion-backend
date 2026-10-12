@@ -446,6 +446,18 @@ describe("purchases and stock ledger", () => {
     );
   });
 
+  it("rejects colour or roll on a stock adjustment", async () => {
+    const { owner } = await setup();
+    const fabric = await createFabric(owner);
+    const res = await owner.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {
+      direction: "IN",
+      quantity: 1,
+      reason: "Count",
+      color: "Red",
+    });
+    expect(res.status).toBe(400);
+  });
+
   it("keeps the ledger append-only at the database level", async () => {
     const { owner } = await setup();
     const fabric = await createFabric(owner);

@@ -69,8 +69,6 @@ export const adjustmentSchema = z.strictObject({
   direction: z.enum(["IN", "OUT"], { error: "Choose increase or reduce." }),
   quantity,
   reason,
-  color: optionalText(50),
-  rollRef: optionalText(50),
 });
 
 export const idParamsSchema = z.object({ id: z.uuid() });

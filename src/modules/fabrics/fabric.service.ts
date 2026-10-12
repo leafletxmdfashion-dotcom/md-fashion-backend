@@ -161,8 +161,6 @@ export const fabricService = {
         fabricId,
         type: input.direction === "IN" ? "ADJUSTMENT_IN" : "ADJUSTMENT_OUT",
         quantity: input.quantity,
-        color: input.color,
-        rollRef: input.rollRef,
         reason: input.reason,
         createdBy: actor.user.id,
       });
