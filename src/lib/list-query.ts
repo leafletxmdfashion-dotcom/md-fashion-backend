@@ -1,8 +1,11 @@
 import { z } from "zod";
 
+import { Prisma } from "../generated/prisma/client";
+
 // Per-column filtering and sorting for list endpoints. Each list declares its columns
 // once; the query string can only reference those keys, and every SQL fragment comes
-// from the declaration, never from the request. Values always travel as parameters.
+// from the declaration, never from the request. Values always travel as bound
+// parameters inside Prisma.sql fragments.
 //
 // Query-string contract (mirrored by the frontend table):
 //   text   → <key>=needle            (case-insensitive "contains")
@@ -18,7 +21,7 @@ export interface ColumnSpec {
   /** SQL expression sorted on, when it differs from `sql`. */
   sortSql?: string;
   values?: readonly string[];
-  /** Indexed condition ANDed in front of a text filter (e.g. a trigram haystack). */
+  /** Trigram-indexed haystack matched with the same pattern first, to narrow rows cheaply. */
   prefilter?: string;
   sortable?: boolean;
   filterable?: boolean;
@@ -67,42 +70,48 @@ export function contains(text: string): string {
   return `%${text.toLowerCase().replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
 }
 
-/**
- * SQL conditions for the active column filters. Appends values to `params` and
- * references them by position, so callers can mix in their own conditions.
- */
-export function columnFilters(columns: ColumnSpecs, query: Record<string, unknown>, params: unknown[]): string[] {
-  const clauses: string[] = [];
-  const add = (value: unknown) => {
-    params.push(value);
-    return `$${params.length}`;
-  };
+/** SQL conditions for the active column filters, ready to AND with the caller's own. */
+export function columnFilters(columns: ColumnSpecs, query: Record<string, unknown>): Prisma.Sql[] {
+  const clauses: Prisma.Sql[] = [];
   for (const [key, column] of Object.entries(columns)) {
     if (column.filterable === false) continue;
+    const sql = Prisma.raw(column.sql);
     if (column.type === "text" && typeof query[key] === "string" && query[key]) {
-      const ref = add(contains(query[key]));
-      const match = `${column.sql} LIKE ${ref}`;
-      clauses.push(column.prefilter ? `(${column.prefilter.replaceAll("$?", ref)} AND ${match})` : match);
+      const pattern = contains(query[key]);
+      const match = Prisma.sql`${sql} LIKE ${pattern}`;
+      clauses.push(column.prefilter ? Prisma.sql`(${Prisma.raw(column.prefilter)} LIKE ${pattern} AND ${match})` : match);
     }
     if (column.type === "enum" && Array.isArray(query[key]) && query[key].length > 0) {
-      clauses.push(`${column.sql} = ANY(${add(query[key])}::text[])`);
+      clauses.push(Prisma.sql`${sql} = ANY(${query[key]}::text[])`);
     }
     const [low, high] = column.type === "date" ? ["From", "To"] : ["Min", "Max"];
     if (column.type === "number" || column.type === "date") {
-      const cast = column.type === "date" ? "::date" : "::numeric";
-      if (query[`${key}${low}`] !== undefined) clauses.push(`${column.sql} >= ${add(query[`${key}${low}`])}${cast}`);
-      if (query[`${key}${high}`] !== undefined) clauses.push(`${column.sql} <= ${add(query[`${key}${high}`])}${cast}`);
+      const cast = Prisma.raw(column.type === "date" ? "::date" : "::numeric");
+      const min = query[`${key}${low}`];
+      const max = query[`${key}${high}`];
+      if (min !== undefined) clauses.push(Prisma.sql`${sql} >= ${min}${cast}`);
+      if (max !== undefined) clauses.push(Prisma.sql`${sql} <= ${max}${cast}`);
     }
   }
   return clauses;
 }
 
+/** WHERE clause from conditions; an empty list matches everything. */
+export function where(clauses: Prisma.Sql[]): Prisma.Sql {
+  return clauses.length ? Prisma.sql`WHERE ${Prisma.join(clauses, " AND ")}` : Prisma.empty;
+}
+
 /** ORDER BY for the requested column, falling back to the list's default; `tiebreak` keeps paging stable. */
-export function orderBy(columns: ColumnSpecs, query: ColumnQuery, fallback: string, tiebreak: string): string {
+export function orderBy(columns: ColumnSpecs, query: ColumnQuery, fallback: string, tiebreak: string): Prisma.Sql {
   const column = query.sort ? columns[query.sort] : undefined;
-  if (!column) return `ORDER BY ${fallback}, ${tiebreak}`;
+  if (!column) return Prisma.raw(`ORDER BY ${fallback}, ${tiebreak}`);
   const dir = query.dir === "desc" ? "DESC" : "ASC";
-  return `ORDER BY ${column.sortSql ?? column.sql} ${dir} NULLS LAST, ${tiebreak}`;
+  return Prisma.raw(`ORDER BY ${column.sortSql ?? column.sql} ${dir} NULLS LAST, ${tiebreak}`);
+}
+
+/** LIMIT/OFFSET for one page. */
+export function page(query: { page: number; pageSize: number }): Prisma.Sql {
+  return Prisma.sql`LIMIT ${query.pageSize} OFFSET ${(query.page - 1) * query.pageSize}`;
 }
 
 /** RFC 4180 CSV. Cells that a spreadsheet would run as a formula are prefixed with '. */

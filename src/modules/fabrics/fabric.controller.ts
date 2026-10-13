@@ -5,12 +5,10 @@ import { clientMeta } from "../../lib/request";
 import { toCsv } from "../../lib/list-query";
 import {
   adjustmentSchema,
-  bulkStatusSchema,
   createFabricSchema,
   createInwardSchema,
   fabricListQuerySchema,
   idParamsSchema,
-  importFabricsSchema,
   inwardListQuerySchema,
   movementListQuerySchema,
   reverseInwardSchema,
@@ -57,47 +55,18 @@ export const fabricController = {
     sendCsv(
       res,
       "fabrics",
-      [
-        "Code",
-        "Name",
-        "Category",
-        "Unit",
-        "In stock",
-        "Reorder at",
-        "Avg rate",
-        "Stock value",
-        "Status",
-        "Description",
-      ],
+      ["Code", "Name", "Unit", "In stock", "Reorder at", "Avg rate", "Stock value", "Description"],
       fabrics.map((f) => [
         f.code,
         f.name,
-        f.category,
         f.unit,
         f.balance,
         f.lowStockThreshold,
         f.avgRate === null ? null : Math.round(f.avgRate * 100) / 100,
         f.stockValue,
-        f.isActive ? "Active" : "Inactive",
         f.description,
       ]),
     );
-  }) satisfies RequestHandler,
-
-  bulkStatus: (async (req, res) => {
-    const { ids, isActive } = bulkStatusSchema.parse(req.body);
-    const updated = await fabricService.setActive(actorOf(req), ids, isActive, clientMeta(req));
-    res.json({ success: true, data: { updated } });
-  }) satisfies RequestHandler,
-
-  importFabrics: (async (req, res) => {
-    const { rows } = importFabricsSchema.parse(req.body);
-    const created = await fabricService.importFabrics(actorOf(req), rows, clientMeta(req));
-    res.status(201).json({ success: true, data: { created } });
-  }) satisfies RequestHandler,
-
-  categories: (async (_req, res) => {
-    res.json({ success: true, data: { categories: await fabricService.categories() } });
   }) satisfies RequestHandler,
 
   options: (async (_req, res) => {

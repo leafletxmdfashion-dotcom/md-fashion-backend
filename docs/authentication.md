@@ -17,11 +17,12 @@ Browser ──HTTPS──▶ Next.js (md_frontend)  ──rewrite /api/v1/*─�
   `SHA-256(token)`. No JWTs, nothing in localStorage/sessionStorage.
 - **RBAC.** Permission catalog in code (`permission.types.ts`), role → permission grants in the
   `role_permissions` table, one role per user, role `rank` for hierarchy.
-- **Data layer.** Raw `pg` with parameterized SQL and embedded migrations.
-  *Deviation:* the brief says to preserve an existing ORM. Prisma packages were installed but
-  never configured (no schema, CLI `8.0.0-rc` vs client `7.10` mismatch), so nothing existed to
-  preserve. A pre-release ORM is not a sound base for auth, and explicit SQL keeps the security
-  invariants (atomic token consumption, row locks) readable.
+- **Data layer.** Prisma ORM 7.10 (stable) with the `@prisma/adapter-pg` driver adapter. Schema in
+  `prisma/schema.prisma`, migrations in `prisma/migrations`, client generated to `src/generated/prisma`
+  (`src/db/prisma.ts` exports the client, `transaction()` and `isUniqueViolation()`). CRUD uses Prisma
+  Client. Statements whose safety depends on one atomic SQL statement or a row lock stay typed raw SQL
+  (`$queryRaw` tagged templates, always parameterized): single-use token consumption, login counters,
+  `FOR UPDATE` locks, session lookup against the database clock, and the fabric list/ledger queries.
 
 Backend modules (`src/modules`):
 
@@ -42,14 +43,14 @@ Frontend (`md_frontend`): `features/auth` (api, hooks, schemas, components, lib)
 
 ## 2. Files created
 
-Backend: `src/config/env.ts`, `src/db/{pool,migrate,migrations}.ts`,
+Backend: `src/config/env.ts`, `src/db/prisma.ts`, `prisma/schema.prisma`, `prisma/migrations/*`, `prisma.config.ts`,
 `src/lib/{crypto,errors,logger,rate-limit,request}.ts`, `src/types/express.d.ts`,
 `src/modules/auth/{auth.constants,auth.controller,auth.cookies,auth.middleware,auth.repository,auth.routes,auth.schema,auth.service,csrf,password,password-reset.service}.ts`,
 `src/modules/sessions/{session.repository,session.service,session.types}.ts`,
 `src/modules/users/{invitation.service,user.controller,user.repository,user.routes,user.schema,user.service,user.types}.ts`,
 `src/modules/permissions/{permission.middleware,permission.repository,permission.routes,permission.schema,permission.service,permission.types,role.service}.ts`,
 `src/modules/audit/audit.service.ts`, `src/modules/mail/mailer.ts`,
-`src/scripts/{migrate,bootstrap-owner}.ts`, tests `src/**/*.test.ts`, `src/test/{helpers,global-setup,setup-env,e2e-reset}.ts`,
+`src/scripts/bootstrap-owner.ts`, tests `src/**/*.test.ts`, `src/test/{helpers,global-setup,setup-env,e2e-reset,rebuild-database}.ts`,
 `vitest.config.ts`, `eslint.config.js`, `.prettierrc.json`, `.gitignore`, `docs/authentication.md`.
 
 Frontend: `proxy.ts`, `lib/{api-client,safe-redirect,form-errors,initials}.ts`,
@@ -74,7 +75,20 @@ Frontend: `app/layout.tsx`, `app/page.tsx`, `app/globals.css` (Linear-style toke
 
 ## 4. Database
 
-Migration `0001_auth` (`src/db/migrations.ts`), applied by `npm run db:migrate`:
+Prisma Migrate owns the schema. `npm run db:migrate` (`prisma migrate deploy`) applies pending
+migrations; `npm run db:status` shows what is applied. Prisma CLI commands connect with `DIRECT_URL`
+when set (Neon's pooled URL cannot hold Migrate's advisory lock); the app uses `DATABASE_URL`.
+
+| Migration | Contents |
+| --- | --- |
+| `20261012000000_init` | Baseline: auth tables, roles and permissions seed, fabric master, purchases, ledger, stock projection, triggers. Consolidates the earlier hand-rolled `0001_auth` … `0006_fabric_drop_active`. |
+| `20261013000000_fabric_search_text` | Fabric search uses a generated, trigram-indexed `search_text` column instead of an expression index. |
+
+New migration: edit `prisma/schema.prisma`, run `npm run db:migrate:dev -- --create-only --name <name>`,
+review the SQL (CHECK constraints, triggers and generated columns are written by hand, since Prisma
+has no syntax for them), then `npm run db:migrate`. Never edit an applied migration.
+
+Auth tables:
 
 | Table | Key points |
 | --- | --- |
@@ -241,7 +255,8 @@ BOOTSTRAP_OWNER_EMAIL=you@company.com BOOTSTRAP_OWNER_NAME="Your Name" \
 BOOTSTRAP_OWNER_PASSWORD="a long unique passphrase" npm run bootstrap:owner
 ```
 
-Production build: `npm run db:migrate:prod` and `npm run bootstrap:owner:prod`. The script
+Production build: `npm run db:migrate` (needs the `prisma` CLI, a dev dependency, so run it from CI
+or a full install) and `npm run bootstrap:owner:prod`. The script
 refuses to run once any OWNER exists (it takes an advisory lock, so concurrent runs are safe). There
 is no HTTP endpoint for it. Remove `BOOTSTRAP_OWNER_PASSWORD` from the environment afterwards.
 
@@ -274,13 +289,14 @@ cd md_frontend && npm run dev                           # http://localhost:3001 
 ```bash
 cd md_backend
 npm run typecheck && npm run lint
-npm test              # 68 integration tests (Vitest + Supertest, real PostgreSQL via TEST_DATABASE_URL)
+npm test              # 84 integration tests (Vitest + Supertest, real PostgreSQL via TEST_DATABASE_URL;
+                      # the schema is rebuilt with `prisma migrate deploy` before each run)
 npm run build
 
 cd md_frontend
 npm run typecheck && npm run lint
-npm test              # 37 component/unit tests (Vitest + Testing Library, jsdom)
-npm run test:e2e      # 7 Playwright flows against real API + garment_e2e database
+npm test              # 42 component/unit tests (Vitest + Testing Library, jsdom)
+npm run test:e2e      # 15 Playwright flows against real API + garment_e2e database
 npm run build
 ```
 
@@ -300,7 +316,7 @@ Chromium download timed out on this machine. Set `PW_CHANNEL=""` after `npx play
   limits and lockout are unaffected).
 - Strong `CSRF_SECRET` from a secret manager. Use `MAIL_TRANSPORT=resend` with `RESEND_API_KEY` and a
   verified `MAIL_FROM`, or swap the transport in `mailer.ts`.
-- Run `db:migrate:prod` before starting new versions; bootstrap the owner once.
+- Run `npm run db:migrate` before starting new versions; bootstrap the owner once.
 - Least-privilege DB user (DML on app tables; DDL only for the migration step).
 
 ## 18. Remaining risks and next steps

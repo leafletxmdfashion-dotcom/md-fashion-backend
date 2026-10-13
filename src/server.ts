@@ -1,6 +1,6 @@
 import { createApp } from "./app";
 import { env } from "./config/env";
-import { pool } from "./db/pool";
+import { prisma } from "./db/prisma";
 import { logger } from "./lib/logger";
 
 const server = createApp().listen(env.PORT, () => {
@@ -10,7 +10,7 @@ const server = createApp().listen(env.PORT, () => {
 const shutdown = (signal: string) => {
   logger.info({ signal }, "shutting down");
   server.close(() => {
-    void pool.end().finally(() => process.exit(0));
+    void prisma.$disconnect().finally(() => process.exit(0));
   });
 };
 

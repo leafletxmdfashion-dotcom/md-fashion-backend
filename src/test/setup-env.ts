@@ -15,6 +15,6 @@ process.env.MAIL_TRANSPORT = "outbox";
 process.env.MAIL_OUTBOX_DIR = path.join(os.tmpdir(), `garment-test-outbox-${process.pid}`);
 
 afterAll(async () => {
-  const { pool } = await import("../db/pool");
-  await pool.end();
+  const { prisma } = await import("../db/prisma");
+  await prisma.$disconnect();
 });

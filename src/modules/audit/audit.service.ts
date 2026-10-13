@@ -1,4 +1,4 @@
-import type { Queryable } from "../../db/pool";
+import type { Db } from "../../db/prisma";
 import type { ClientMeta } from "../sessions/session.types";
 
 export type AuditEventType =
@@ -24,9 +24,7 @@ export type AuditEventType =
   | "FABRIC_UPDATED"
   | "FABRIC_INWARD_POSTED"
   | "FABRIC_INWARD_REVERSED"
-  | "FABRIC_STOCK_ADJUSTED"
-  | "FABRIC_STATUS_BULK_CHANGED"
-  | "FABRIC_IMPORTED";
+  | "FABRIC_STOCK_ADJUSTED";
 
 export interface AuditEvent {
   type: AuditEventType;
@@ -39,18 +37,16 @@ export interface AuditEvent {
 }
 
 // Accepts a transaction client so the audit row commits or rolls back with the change it records.
-export async function recordAudit(db: Queryable, event: AuditEvent): Promise<void> {
-  await db.query(
-    `INSERT INTO audit_events (event_type, actor_user_id, target_user_id, session_id, ip_address, user_agent, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [
-      event.type,
-      event.actorUserId ?? null,
-      event.targetUserId ?? null,
-      event.sessionId ?? null,
-      event.meta?.ip ?? null,
-      event.meta?.userAgent ?? null,
-      JSON.stringify(event.metadata ?? {}),
-    ],
-  );
+export async function recordAudit(db: Db, event: AuditEvent): Promise<void> {
+  await db.auditEvent.create({
+    data: {
+      eventType: event.type,
+      actorUserId: event.actorUserId ?? null,
+      targetUserId: event.targetUserId ?? null,
+      sessionId: event.sessionId ?? null,
+      ipAddress: event.meta?.ip ?? null,
+      userAgent: event.meta?.userAgent ?? null,
+      metadata: event.metadata ?? {},
+    },
+  });
 }

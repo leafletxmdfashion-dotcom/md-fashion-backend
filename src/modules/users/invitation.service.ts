@@ -1,7 +1,5 @@
-import { DatabaseError } from "pg";
-
 import { env } from "../../config/env";
-import { pool, withTransaction, type Queryable } from "../../db/pool";
+import { isUniqueViolation, prisma, transaction, type Db } from "../../db/prisma";
 import { generateToken, hashToken } from "../../lib/crypto";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { logger } from "../../lib/logger";
@@ -27,7 +25,7 @@ function inviteUrl(token: string): string {
   return `${env.clientOrigin}/accept-invitation#token=${token}`;
 }
 
-async function issueInvitation(tx: Queryable, userId: string, invitedBy: string) {
+async function issueInvitation(tx: Db, userId: string, invitedBy: string) {
   const token = generateToken();
   const expiresAt = new Date(Date.now() + INVITATION_TTL_MS);
   const invitationId = await invitationRepository.create(tx, {
@@ -65,14 +63,14 @@ export const invitationService = {
     input: { email: string; name: string; roleKey: string },
     meta: ClientMeta,
   ): Promise<IssuedInvitation> {
-    const role = await permissionRepository.findRoleByKey(pool, input.roleKey);
+    const role = await permissionRepository.findRoleByKey(prisma, input.roleKey);
     if (!role) {
       throw new AppError(400, ErrorCode.VALIDATION_ERROR, "Unknown role.", { roleKey: ["Unknown role."] });
     }
     if (!canAssignRole(actor.user, role)) throw errors.forbidden();
 
     try {
-      const result = await withTransaction(async (tx) => {
+      const result = await transaction(async (tx) => {
         if (await userRepository.emailExists(tx, input.email)) {
           throw errors.conflict("A user with this email already exists.");
         }
@@ -99,7 +97,7 @@ export const invitationService = {
       return { userId: result.userId, invitationId: result.invitationId, expiresAt: result.expiresAt, inviteUrl: url };
     } catch (error) {
       // Concurrent invite for the same email loses on the unique constraint.
-      if (error instanceof DatabaseError && error.code === "23505") {
+      if (isUniqueViolation(error)) {
         throw errors.conflict("A user with this email already exists.");
       }
       throw error;
@@ -108,7 +106,7 @@ export const invitationService = {
 
   /** Replaces any open invitation for a still-invited user with a fresh link. */
   async resend(actor: AuthContext, userId: string, meta: ClientMeta): Promise<IssuedInvitation> {
-    const result = await withTransaction(async (tx) => {
+    const result = await transaction(async (tx) => {
       const target = await userRepository.findForUpdate(tx, userId);
       if (!target) throw errors.notFound("User");
       if (!canManageUser(actor.user, target.role)) throw errors.forbidden();
@@ -133,7 +131,7 @@ export const invitationService = {
   },
 
   async revoke(actor: AuthContext, userId: string, meta: ClientMeta): Promise<void> {
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       const target = await userRepository.findForUpdate(tx, userId);
       if (!target) throw errors.notFound("User");
       if (!canManageUser(actor.user, target.role)) throw errors.forbidden();
@@ -157,7 +155,7 @@ export const invitationService = {
 
   /** Consume token + set password + activate + audit, atomically. Does not sign the user in. */
   async accept(input: { token: string; name: string; newPassword: string }, meta: ClientMeta): Promise<void> {
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       const invitation = await invitationRepository.consume(tx, hashToken(input.token));
       if (!invitation) throw errors.tokenInvalid();
 

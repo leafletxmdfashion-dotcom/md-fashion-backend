@@ -7,7 +7,9 @@ export function generateToken(): string {
 
 // Tokens are high-entropy, so a fast unsalted SHA-256 is sufficient: the stored
 // digest cannot be reversed into a usable token, and lookups stay indexable.
-export function hashToken(token: string): Buffer {
+export type TokenHash = Uint8Array<ArrayBuffer>;
+
+export function hashToken(token: string): TokenHash {
   return createHash("sha256").update(token, "utf8").digest();
 }
 

@@ -1,9 +1,8 @@
-import { pool, withTransaction } from "../../db/pool";
+import { isUniqueViolation, prisma, transaction } from "../../db/prisma";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
 import { fabricRepository, inwardRepository, type FabricDto, type InwardDto } from "./fabric.repository";
-import { createFabricSchema } from "./fabric.schema";
 import type {
   AdjustmentInput,
   CreateFabricInput,
@@ -16,10 +15,6 @@ import type {
 
 function fieldError(field: string, message: string): AppError {
   return new AppError(400, ErrorCode.VALIDATION_ERROR, message, { [field]: [message] });
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
 }
 
 const duplicateCode = () =>
@@ -39,23 +34,19 @@ export const fabricService = {
     return fabricRepository.list(query);
   },
 
-  categories(): Promise<string[]> {
-    return fabricRepository.categories();
-  },
-
   options() {
     return fabricRepository.options();
   },
 
   async get(id: string): Promise<FabricDto> {
-    const fabric = await fabricRepository.findById(pool, id);
+    const fabric = await fabricRepository.findById(prisma, id);
     if (!fabric) throw errors.notFound("Fabric");
     return fabric;
   },
 
   async create(actor: AuthContext, input: CreateFabricInput, meta: ClientMeta): Promise<FabricDto> {
     try {
-      return await withTransaction(async (tx) => {
+      return await transaction(async (tx) => {
         const id = await fabricRepository.create(tx, input, actor.user.id);
         await recordAudit(tx, {
           type: "FABRIC_CREATED",
@@ -71,7 +62,7 @@ export const fabricService = {
 
   async update(actor: AuthContext, id: string, input: UpdateFabricInput, meta: ClientMeta): Promise<FabricDto> {
     try {
-      return await withTransaction(async (tx) => {
+      return await transaction(async (tx) => {
         const current = await fabricRepository.lock(tx, id);
         if (!current) throw errors.notFound("Fabric");
         const before = (await fabricRepository.findById(tx, id))!;
@@ -80,9 +71,9 @@ export const fabricService = {
           throw fieldError("unit", "The unit cannot change once stock has been posted for this fabric.");
         }
         await fabricRepository.update(tx, id, input);
-        const fields = (
-          ["code", "name", "unit", "category", "lowStockThreshold", "description", "isActive"] as const
-        ).filter((field) => input[field] !== before[field]);
+        const fields = (["code", "name", "unit", "lowStockThreshold", "description"] as const).filter(
+          (field) => input[field] !== before[field],
+        );
         await recordAudit(tx, { type: "FABRIC_UPDATED", ...audit(actor, meta), metadata: { fabricId: id, fields } });
         return (await fabricRepository.findById(tx, id))!;
       });
@@ -91,67 +82,8 @@ export const fabricService = {
     }
   },
 
-  /** Activates or deactivates many fabrics at once; returns how many actually changed. */
-  async setActive(actor: AuthContext, ids: string[], isActive: boolean, meta: ClientMeta): Promise<number> {
-    return withTransaction(async (tx) => {
-      const changed = await fabricRepository.setActive(tx, [...new Set(ids)], isActive);
-      if (changed.length > 0) {
-        await recordAudit(tx, {
-          type: "FABRIC_STATUS_BULK_CHANGED",
-          ...audit(actor, meta),
-          metadata: { isActive, count: changed.length, fabricIds: changed.slice(0, 100) },
-        });
-      }
-      return changed.length;
-    });
-  },
-
-  /**
-   * All-or-nothing import. Every row is validated with the same rules as the form; if any
-   * row is invalid or duplicates a code (in the file or already saved), nothing is created
-   * and the errors name each row ("rows.3.code").
-   */
-  async importFabrics(actor: AuthContext, rows: unknown[], meta: ClientMeta): Promise<number> {
-    const details: Record<string, string[]> = {};
-    const valid: CreateFabricInput[] = [];
-    rows.forEach((row, index) => {
-      const parsed = createFabricSchema.safeParse(row);
-      if (parsed.success) {
-        valid.push(parsed.data);
-        return;
-      }
-      for (const issue of parsed.error.issues) {
-        (details[`rows.${index + 1}.${issue.path.join(".") || "row"}`] ??= []).push(issue.message);
-      }
-    });
-
-    const seen = new Map<string, number>();
-    rows.forEach((row, index) => {
-      const code = (row as { code?: unknown } | null)?.code;
-      if (typeof code !== "string") return;
-      const key = code.trim().toUpperCase();
-      if (seen.has(key)) {
-        (details[`rows.${index + 1}.code`] ??= []).push(`Same code as row ${seen.get(key)}.`);
-      } else seen.set(key, index + 1);
-    });
-
-    return withTransaction(async (tx) => {
-      const taken = await fabricRepository.existingCodes(tx, [...seen.keys()]);
-      for (const [code, rowNumber] of seen) {
-        if (taken.has(code))
-          (details[`rows.${rowNumber}.code`] ??= []).push(`A fabric with code ${code} already exists.`);
-      }
-      if (Object.keys(details).length > 0) {
-        throw new AppError(400, ErrorCode.VALIDATION_ERROR, "Some rows need fixing. Nothing was imported.", details);
-      }
-      for (const input of valid) await fabricRepository.create(tx, input, actor.user.id);
-      await recordAudit(tx, { type: "FABRIC_IMPORTED", ...audit(actor, meta), metadata: { count: valid.length } });
-      return valid.length;
-    });
-  },
-
   async adjust(actor: AuthContext, fabricId: string, input: AdjustmentInput, meta: ClientMeta): Promise<void> {
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       const fabric = await fabricRepository.lock(tx, fabricId);
       if (!fabric) throw errors.notFound("Fabric");
       if (input.direction === "OUT" && input.quantity > fabric.balance) {
@@ -191,10 +123,9 @@ export const inwardService = {
   },
 
   async create(actor: AuthContext, input: CreateInwardInput, meta: ClientMeta): Promise<InwardDto> {
-    return withTransaction(async (tx) => {
+    return transaction(async (tx) => {
       const fabric = await fabricRepository.lock(tx, input.fabricId);
       if (!fabric) throw fieldError("fabricId", "Choose a fabric.");
-      if (!fabric.isActive) throw fieldError("fabricId", "This fabric is inactive. Reactivate it before purchasing.");
 
       const id = await inwardRepository.create(tx, input, actor.user.id);
       await fabricRepository.addMovement(tx, {
@@ -218,7 +149,7 @@ export const inwardService = {
 
   /** Posts an equal OUT movement; the purchase row stays, marked reversed. */
   async reverse(actor: AuthContext, id: string, reason: string, meta: ClientMeta): Promise<InwardDto> {
-    return withTransaction(async (tx) => {
+    return transaction(async (tx) => {
       const inward = await inwardRepository.findById(tx, id, true);
       if (!inward) throw errors.notFound("Purchase");
       if (inward.reversal) throw errors.conflict("This purchase has already been reversed.");

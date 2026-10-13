@@ -1,0 +1,241 @@
+// Garment Manager database schema.
+//
+// Migrations in prisma/migrations are the source of truth for the database. Some of
+// what they create has no Prisma syntax and lives only in their SQL: CHECK
+// constraints, triggers (append-only ledger, fabric_stock projection), generated
+// columns and the pg_trgm extension. Create new migrations with
+// `npm run db:migrate:dev -- --create-only --name <name>`, review the SQL, then apply.
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  DISABLED
+  LOCKED
+
+  @@map("user_status")
+}
+
+model Role {
+  id          String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key         String           @unique
+  name        String
+  rank        Int              @unique
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  permissions RolePermission[]
+  users       User[]
+
+  @@map("roles")
+}
+
+model RolePermission {
+  roleId     String @map("role_id") @db.Uuid
+  permission String
+  role       Role   @relation(fields: [roleId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([roleId, permission])
+  @@map("role_permissions")
+}
+
+model User {
+  id                  String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email               String               @unique
+  name                String
+  passwordHash        String?              @map("password_hash")
+  status              UserStatus           @default(INVITED)
+  roleId              String               @map("role_id") @db.Uuid
+  failedLoginCount    Int                  @default(0) @map("failed_login_count")
+  lastFailedLoginAt   DateTime?            @map("last_failed_login_at") @db.Timestamptz(6)
+  lockedUntil         DateTime?            @map("locked_until") @db.Timestamptz(6)
+  lastLoginAt         DateTime?            @map("last_login_at") @db.Timestamptz(6)
+  passwordChangedAt   DateTime?            @map("password_changed_at") @db.Timestamptz(6)
+  createdById         String?              @map("created_by") @db.Uuid
+  createdAt           DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  role                Role                 @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy           User?                @relation("UserCreatedBy", fields: [createdById], references: [id], onUpdate: NoAction)
+  createdUsers        User[]               @relation("UserCreatedBy")
+  sessions            Session[]
+  passwordResets      PasswordResetToken[]
+  invitations         Invitation[]         @relation("InvitationUser")
+  sentInvitations     Invitation[]         @relation("InvitationInvitedBy")
+  auditEventsActed    AuditEvent[]         @relation("AuditActor")
+  auditEventsTargeted AuditEvent[]         @relation("AuditTarget")
+  fabricsCreated      Fabric[]
+  inwardsCreated      FabricInward[]       @relation("InwardCreatedBy")
+  inwardsReversed     FabricInward[]       @relation("InwardReversedBy")
+  movementsCreated    FabricMovement[]
+
+  @@index([roleId, status], map: "users_role_status_idx")
+  @@map("users")
+}
+
+model Session {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  tokenHash     Bytes     @unique @map("token_hash")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastSeenAt    DateTime  @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt     DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revokedReason String?   @map("revoked_reason")
+  ipAddress     String?   @map("ip_address") @db.Inet
+  userAgent     String?   @map("user_agent")
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([expiresAt])
+  @@index([userId], map: "sessions_user_active_idx", where: raw("(revoked_at IS NULL)"))
+  @@map("sessions")
+}
+
+model PasswordResetToken {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  tokenHash   Bytes     @unique @map("token_hash")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt      DateTime? @map("used_at") @db.Timestamptz(6)
+  requestedIp String?   @map("requested_ip") @db.Inet
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "password_reset_tokens_user_unused_idx", where: raw("(used_at IS NULL)"))
+  @@map("password_reset_tokens")
+}
+
+model Invitation {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // At most one open invitation per invited user.
+  userId      String    @unique(map: "invitations_one_open_per_user_idx", where: raw("((accepted_at IS NULL) AND (revoked_at IS NULL))")) @map("user_id") @db.Uuid
+  tokenHash   Bytes     @unique @map("token_hash")
+  invitedById String?   @map("invited_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  acceptedAt  DateTime? @map("accepted_at") @db.Timestamptz(6)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
+  user        User      @relation("InvitationUser", fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  invitedBy   User?     @relation("InvitationInvitedBy", fields: [invitedById], references: [id], onUpdate: NoAction)
+
+  @@map("invitations")
+}
+
+model AuditEvent {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  eventType    String   @map("event_type")
+  actorUserId  String?  @map("actor_user_id") @db.Uuid
+  targetUserId String?  @map("target_user_id") @db.Uuid
+  sessionId    String?  @map("session_id") @db.Uuid
+  ipAddress    String?  @map("ip_address") @db.Inet
+  userAgent    String?  @map("user_agent")
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  actor        User?    @relation("AuditActor", fields: [actorUserId], references: [id], onUpdate: NoAction)
+  target       User?    @relation("AuditTarget", fields: [targetUserId], references: [id], onUpdate: NoAction)
+
+  @@index([targetUserId, createdAt(sort: Desc)], map: "audit_events_target_created_idx")
+  @@index([eventType, createdAt(sort: Desc)], map: "audit_events_type_created_idx")
+  @@map("audit_events")
+}
+
+model Fabric {
+  id                String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code              String           @unique
+  name              String
+  /// KG | METER (CHECK constraint)
+  unit              String
+  lowStockThreshold Decimal?         @map("low_stock_threshold") @db.Decimal(12, 3)
+  description       String?
+  createdById       String?          @map("created_by") @db.Uuid
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Generated: lower(name || ' ' || code), trigram-indexed for search.
+  searchText        String?          @default(dbgenerated("lower(((name || ' '::text) || code))")) @map("search_text")
+  createdBy         User?            @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  stock             FabricStock?
+  inwards           FabricInward[]
+  movements         FabricMovement[]
+
+  @@index([searchText(ops: raw("gin_trgm_ops"))], map: "fabrics_search_idx", type: Gin)
+  @@map("fabrics")
+}
+
+/// Per-fabric totals, maintained by triggers from fabric_movements. Read-only for the app.
+model FabricStock {
+  fabricId        String  @id @map("fabric_id") @db.Uuid
+  balance         Decimal @default(0) @db.Decimal(14, 3)
+  movementCount   Int     @default(0) @map("movement_count")
+  purchasedQty    Decimal @default(0) @map("purchased_qty") @db.Decimal(14, 3)
+  purchasedAmount Decimal @default(0) @map("purchased_amount") @db.Decimal(16, 2)
+  fabric          Fabric  @relation(fields: [fabricId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@map("fabric_stock")
+}
+
+/// A posted purchase. Never edited or deleted; corrections reverse it.
+model FabricInward {
+  id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number         Int              @unique @default(autoincrement())
+  fabricId       String           @map("fabric_id") @db.Uuid
+  inwardDate     DateTime         @map("inward_date") @db.Date
+  quantity       Decimal          @db.Decimal(12, 3)
+  rate           Decimal          @db.Decimal(12, 2)
+  /// Generated: round(quantity * rate, 2).
+  amount         Decimal?         @default(dbgenerated("round((quantity * rate), 2)")) @db.Decimal(14, 2)
+  supplier       String?
+  invoiceRef     String?          @map("invoice_ref")
+  color          String?
+  rollRef        String?          @map("roll_ref")
+  notes          String?
+  createdById    String           @map("created_by") @db.Uuid
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  reversedAt     DateTime?        @map("reversed_at") @db.Timestamptz(6)
+  reversedById   String?          @map("reversed_by") @db.Uuid
+  reversalReason String?          @map("reversal_reason")
+  /// Generated: lower(supplier, invoice, colour, roll), trigram-indexed for search.
+  searchText     String?          @default(dbgenerated("lower(((((((COALESCE(supplier, ''::text) || ' '::text) || COALESCE(invoice_ref, ''::text)) || ' '::text) || COALESCE(color, ''::text)) || ' '::text) || COALESCE(roll_ref, ''::text)))")) @map("search_text")
+  fabric         Fabric           @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy      User             @relation("InwardCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy     User?            @relation("InwardReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  movements      FabricMovement[]
+
+  @@index([inwardDate(sort: Desc), number(sort: Desc)], map: "fabric_inwards_date_idx")
+  @@index([fabricId, inwardDate(sort: Desc)], map: "fabric_inwards_fabric_idx")
+  @@index([searchText(ops: raw("gin_trgm_ops"))], map: "fabric_inwards_search_idx", type: Gin)
+  @@map("fabric_inwards")
+}
+
+/// The stock ledger. Append-only (trigger); balances are sums of these rows.
+model FabricMovement {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seq          BigInt        @unique @default(autoincrement())
+  fabricId     String        @map("fabric_id") @db.Uuid
+  movementDate DateTime      @map("movement_date") @db.Date
+  /// PURCHASE_IN | PURCHASE_REVERSAL | ADJUSTMENT_IN | ADJUSTMENT_OUT (CHECK constraint)
+  type         String
+  qtyIn        Decimal       @default(0) @map("qty_in") @db.Decimal(12, 3)
+  qtyOut       Decimal       @default(0) @map("qty_out") @db.Decimal(12, 3)
+  color        String?
+  rollRef      String?       @map("roll_ref")
+  inwardId     String?       @map("inward_id") @db.Uuid
+  reason       String?
+  createdById  String        @map("created_by") @db.Uuid
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  fabric       Fabric        @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  inward       FabricInward? @relation(fields: [inwardId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy    User          @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([movementDate(sort: Desc), seq(sort: Desc)], map: "fabric_movements_date_idx")
+  // The SQL index is (fabric_id, movement_date, seq) INCLUDE (qty_in, qty_out): running
+  // balances read it index-only. Prisma has no INCLUDE syntax and sees all five columns.
+  @@index([fabricId, movementDate, seq, qtyIn, qtyOut], map: "fabric_movements_fabric_idx")
+  @@index([type, movementDate(sort: Desc), seq(sort: Desc)], map: "fabric_movements_type_date_idx")
+  @@map("fabric_movements")
+}

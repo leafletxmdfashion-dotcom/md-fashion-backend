@@ -6,7 +6,7 @@
 // Remove BOOTSTRAP_OWNER_PASSWORD from the environment afterwards.
 import { z } from "zod";
 
-import { pool, withTransaction } from "../db/pool";
+import { prisma, transaction } from "../db/prisma";
 import { logger } from "../lib/logger";
 import { recordAudit } from "../modules/audit/audit.service";
 import { emailSchema, nameSchema, newPasswordSchema } from "../modules/auth/auth.schema";
@@ -33,21 +33,18 @@ async function main(): Promise<void> {
   assertPasswordPolicy(password, { email, name });
   const passwordHash = await hashPassword(password);
 
-  const userId = await withTransaction(async (tx) => {
-    await tx.query("SELECT pg_advisory_xact_lock($1)", [BOOTSTRAP_LOCK_KEY]);
-    const owners = await tx.query("SELECT 1 FROM users u JOIN roles r ON r.id = u.role_id WHERE r.key = $1 LIMIT 1", [
-      OWNER_ROLE,
-    ]);
-    if (owners.rowCount) throw new Error("An owner already exists. Bootstrap is disabled; invite users from the app.");
+  const userId = await transaction(async (tx) => {
+    await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(${BOOTSTRAP_LOCK_KEY}::bigint)`;
+    if (await tx.user.findFirst({ where: { role: { key: OWNER_ROLE } }, select: { id: true } })) {
+      throw new Error("An owner already exists. Bootstrap is disabled; invite users from the app.");
+    }
+    const role = await tx.role.findUnique({ where: { key: OWNER_ROLE }, select: { id: true } });
+    if (!role) throw new Error("OWNER role missing. Run migrations first (npm run db:migrate).");
 
-    const { rows } = await tx.query<{ id: string }>(
-      `INSERT INTO users (email, name, password_hash, status, role_id, password_changed_at)
-       SELECT $1, $2, $3, 'ACTIVE', r.id, now() FROM roles r WHERE r.key = $4
-       RETURNING id`,
-      [email, name, passwordHash, OWNER_ROLE],
-    );
-    const id = rows[0]?.id;
-    if (!id) throw new Error("OWNER role missing. Run migrations first.");
+    const { id } = await tx.user.create({
+      data: { email, name, passwordHash, status: "ACTIVE", roleId: role.id, passwordChangedAt: new Date() },
+      select: { id: true },
+    });
     await recordAudit(tx, { type: "OWNER_BOOTSTRAPPED", targetUserId: id, metadata: { source: "cli" } });
     return id;
   });
@@ -61,5 +58,5 @@ try {
   logger.fatal({ err: error }, "bootstrap failed");
   process.exitCode = 1;
 } finally {
-  await pool.end();
+  await prisma.$disconnect();
 }

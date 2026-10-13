@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { pool } from "../../db/pool";
-import { auditTypes, createUser, loggedInClient, readMails, resetDatabase, TestClient } from "../../test/helpers";
+import { auditTypes, createUser, loggedInClient, readMails, resetDatabase, sql, TestClient } from "../../test/helpers";
 
 const OWNER = "owner@garment.test";
 const INVITEE = "new.hire@garment.test";
@@ -27,9 +26,9 @@ describe("invitations", () => {
     const { res, userId, token } = await invite();
     expect(res.body.data.invitation.inviteUrl).toMatch(/^http:\/\/localhost:3000\/accept-invitation#token=[\w-]{43}$/);
 
-    const { rows } = await pool.query("SELECT status FROM users WHERE id = $1", [userId]);
+    const { rows } = await sql("SELECT status FROM users WHERE id = $1", [userId]);
     expect(rows[0].status).toBe("INVITED");
-    const stored = await pool.query("SELECT encode(token_hash, 'escape') AS raw FROM invitations");
+    const stored = await sql("SELECT encode(token_hash, 'escape') AS raw FROM invitations");
     expect(stored.rows[0].raw).not.toContain(token);
     expect((await readMails(INVITEE))[0]?.text).toContain(token);
     expect(await auditTypes(userId)).toEqual(["INVITATION_CREATED"]);
@@ -54,7 +53,7 @@ describe("invitations", () => {
     expect(res.status).toBe(200);
     expect(res.headers["set-cookie"]?.toString() ?? "").not.toMatch(/gm_session=[\w-]{43}/);
 
-    const { rows } = await pool.query("SELECT status FROM users WHERE id = $1", [userId]);
+    const { rows } = await sql("SELECT status FROM users WHERE id = $1", [userId]);
     expect(rows[0].status).toBe("ACTIVE");
     expect((await new TestClient().login(INVITEE, PASSPHRASE)).status).toBe(200);
     expect(await auditTypes(userId)).toContain("INVITATION_ACCEPTED");
@@ -78,7 +77,7 @@ describe("invitations", () => {
 
   it("rejects an expired invitation", async () => {
     const { token } = await invite();
-    await pool.query("UPDATE invitations SET expires_at = now() - interval '1 second'");
+    await sql("UPDATE invitations SET expires_at = now() - interval '1 second'");
     expect((await accept(token)).body.error.code).toBe("TOKEN_INVALID");
   });
 

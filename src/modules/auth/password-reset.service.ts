@@ -1,5 +1,5 @@
 import { env } from "../../config/env";
-import { withTransaction } from "../../db/pool";
+import { transaction } from "../../db/prisma";
 import { generateToken, hashToken } from "../../lib/crypto";
 import { errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
@@ -22,7 +22,7 @@ export const passwordResetService = {
     if (await authRepository.hasRecentResetToken(user.id, RESET_REQUEST_COOLDOWN_SECONDS)) return;
 
     const token = generateToken();
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       // Only the newest link works.
       await authRepository.invalidateResetTokens(tx, user.id);
       await authRepository.createResetToken(tx, {
@@ -56,7 +56,7 @@ export const passwordResetService = {
    * and the audit record commit together or not at all.
    */
   async resetPassword(input: { token: string; newPassword: string }, meta: ClientMeta): Promise<void> {
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       const userId = await authRepository.consumeResetToken(tx, hashToken(input.token));
       if (!userId) throw errors.tokenInvalid();
 

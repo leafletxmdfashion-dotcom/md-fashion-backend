@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { pool } from "../../db/pool";
-import { auditTypes, createUser, loggedInClient, resetDatabase, TestClient } from "../../test/helpers";
+import { auditTypes, createUser, loggedInClient, resetDatabase, sql, TestClient } from "../../test/helpers";
 
 beforeEach(resetDatabase);
 
@@ -52,7 +51,7 @@ describe("authorization", () => {
     const { staffId } = await setup();
     const staff = await loggedInClient("staff@garment.test");
     expect((await staff.get("/api/v1/users")).status).toBe(403);
-    await pool.query("UPDATE users SET role_id = (SELECT id FROM roles WHERE key = 'MANAGER') WHERE id = $1", [
+    await sql("UPDATE users SET role_id = (SELECT id FROM roles WHERE key = 'MANAGER') WHERE id = $1", [
       staffId,
     ]);
     expect((await staff.get("/api/v1/users")).status).toBe(200);
@@ -134,7 +133,7 @@ describe("account administration", () => {
     const { staffId } = await setup();
     const admin = await loggedInClient("admin@garment.test");
     expect((await admin.send("put", `/api/v1/users/${staffId}/role`, { roleKey: "MANAGER" })).status).toBe(200);
-    const { rows } = await pool.query(
+    const { rows } = await sql(
       "SELECT metadata FROM audit_events WHERE event_type = 'ROLE_CHANGED' AND target_user_id = $1",
       [staffId],
     );
@@ -162,7 +161,7 @@ describe("account administration", () => {
       });
       expect(res.status).toBe(200);
       expect(res.body.data.role.permissions).toEqual(["dashboard.view", "orders.view"]);
-      const audit = await pool.query("SELECT metadata FROM audit_events WHERE event_type = 'PERMISSION_CHANGED'");
+      const audit = await sql("SELECT metadata FROM audit_events WHERE event_type = 'PERMISSION_CHANGED'");
       expect(audit.rows[0].metadata.role).toBe("STAFF");
 
       const unknown = await owner.send("put", "/api/v1/roles/STAFF/permissions", { permissions: ["root.everything"] });

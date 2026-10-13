@@ -42,14 +42,13 @@ const fabricFields = {
     .regex(/^[A-Z0-9][A-Z0-9-]{0,23}$/, "Use up to 24 letters, numbers or dashes."),
   name: z.string().trim().min(1, "Name is required.").max(100, "Keep the name under 100 characters."),
   unit: z.enum(FABRIC_UNITS, { error: "Choose a unit." }),
-  category: optionalText(50),
   lowStockThreshold: z.number().min(0, "Threshold cannot be negative.").max(999_999_999).nullish().default(null),
   description: optionalText(500),
 };
 
 export const createFabricSchema = z.strictObject(fabricFields);
 
-export const updateFabricSchema = z.strictObject({ ...fabricFields, isActive: z.boolean() });
+export const updateFabricSchema = z.strictObject(fabricFields);
 
 export const createInwardSchema = z.strictObject({
   fabricId: z.uuid("Choose a fabric."),
@@ -99,15 +98,6 @@ export const movementListQuerySchema = z.object({
   fabricId: z.uuid().optional(),
   ...columnQueryShape(MOVEMENT_COLUMNS),
   ...page,
-});
-
-const ids = z.array(z.uuid()).min(1, "Select at least one fabric.").max(500, "Select up to 500 fabrics at a time.");
-
-export const bulkStatusSchema = z.strictObject({ ids, isActive: z.boolean() });
-
-// Imported rows go through the same rules as the form, one at a time, so errors name the row.
-export const importFabricsSchema = z.strictObject({
-  rows: z.array(z.unknown()).min(1, "The file has no rows.").max(500, "Import up to 500 fabrics at a time."),
 });
 
 export type CreateFabricInput = z.infer<typeof createFabricSchema>;

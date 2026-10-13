@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { pool } from "../../db/pool";
 import {
   auditTypes,
   createUser,
   loggedInClient,
   readMails,
   resetDatabase,
+  sql,
   TestClient,
   tokenFromMail,
 } from "../../test/helpers";
@@ -48,7 +48,7 @@ describe("POST /auth/forgot-password", () => {
     expect(await readMails("nobody@garment.test")).toHaveLength(0);
 
     // A request never changes account state.
-    const { rows } = await pool.query("SELECT status, password_changed_at FROM users WHERE id = $1", [userId]);
+    const { rows } = await sql("SELECT status, password_changed_at FROM users WHERE id = $1", [userId]);
     expect(rows[0]).toEqual({ status: "ACTIVE", password_changed_at: null });
     expect(await auditTypes(userId)).toEqual(["PASSWORD_RESET_REQUESTED"]);
   });
@@ -56,7 +56,7 @@ describe("POST /auth/forgot-password", () => {
   it("stores only a hash of the reset token", async () => {
     await createUser({ email: EMAIL });
     const token = await requestResetToken();
-    const { rows } = await pool.query("SELECT encode(token_hash, 'escape') AS raw FROM password_reset_tokens");
+    const { rows } = await sql("SELECT encode(token_hash, 'escape') AS raw FROM password_reset_tokens");
     expect(rows).toHaveLength(1);
     expect(rows[0].raw).not.toContain(token);
   });
@@ -107,7 +107,7 @@ describe("POST /auth/reset-password", () => {
   it("rejects an expired token", async () => {
     await createUser({ email: EMAIL });
     const token = await requestResetToken();
-    await pool.query("UPDATE password_reset_tokens SET expires_at = now() - interval '1 second'");
+    await sql("UPDATE password_reset_tokens SET expires_at = now() - interval '1 second'");
     const res = await new TestClient().send("post", "/api/v1/auth/reset-password", {
       token,
       newPassword: NEW_PASSWORD,
@@ -151,7 +151,7 @@ describe("POST /auth/reset-password", () => {
   it("only the newest reset link works", async () => {
     await createUser({ email: EMAIL });
     const first = await requestResetToken();
-    await pool.query("UPDATE password_reset_tokens SET created_at = now() - interval '2 minutes'");
+    await sql("UPDATE password_reset_tokens SET created_at = now() - interval '2 minutes'");
     const second = await requestResetToken();
     expect(second).not.toBe(first);
 

@@ -3,7 +3,6 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../../app";
 
-import { pool } from "../../db/pool";
 import { hashToken } from "../../lib/crypto";
 import {
   auditTypes,
@@ -14,6 +13,7 @@ import {
   resetDatabase,
   sessionCookie,
   setCookies,
+  sql,
   TestClient,
 } from "../../test/helpers";
 import { cookieNames, sessionCookieOptions } from "./auth.cookies";
@@ -42,11 +42,11 @@ describe("POST /auth/login", () => {
     expect(cookie).not.toMatch(/Domain=/);
 
     const token = /gm_session=([^;]+)/.exec(cookie!)![1]!;
-    const { rows } = await pool.query("SELECT token_hash FROM sessions WHERE user_id = $1", [userId]);
+    const { rows } = await sql("SELECT token_hash FROM sessions WHERE user_id = $1", [userId]);
     expect(rows).toHaveLength(1);
     // Only the SHA-256 of the token is stored.
     expect(Buffer.compare(rows[0].token_hash, hashToken(token))).toBe(0);
-    expect(rows[0].token_hash.toString("utf8")).not.toContain(token);
+    expect(Buffer.from(rows[0].token_hash).toString("utf8")).not.toContain(token);
     expect(await auditTypes(userId)).toEqual(["LOGIN_SUCCESS"]);
   });
 
@@ -108,7 +108,7 @@ describe("POST /auth/login", () => {
     const client = new TestClient();
     for (let i = 0; i < 5; i++) await client.login(EMAIL, `wrong-password-${i}`);
 
-    const { rows } = await pool.query("SELECT status, locked_until FROM users WHERE id = $1", [userId]);
+    const { rows } = await sql("SELECT status, locked_until FROM users WHERE id = $1", [userId]);
     expect(rows[0].status).toBe("LOCKED");
     expect(rows[0].locked_until.getTime()).toBeGreaterThan(Date.now());
 
@@ -117,21 +117,21 @@ describe("POST /auth/login", () => {
     expect(whileLocked.status).toBe(401);
     expect(whileLocked.body.error).toEqual(GENERIC);
 
-    await pool.query("UPDATE users SET locked_until = now() - interval '1 second' WHERE id = $1", [userId]);
+    await sql("UPDATE users SET locked_until = now() - interval '1 second' WHERE id = $1", [userId]);
     const after = await client.login(EMAIL);
     expect(after.status).toBe(200);
-    const reset = await pool.query("SELECT status, failed_login_count FROM users WHERE id = $1", [userId]);
+    const reset = await sql("SELECT status, failed_login_count FROM users WHERE id = $1", [userId]);
     expect(reset.rows[0]).toEqual({ status: "ACTIVE", failed_login_count: 0 });
   });
 
   it("rotates the session on re-login and retires the previous one", async () => {
     await createUser({ email: EMAIL });
     const client = await loggedInClient(EMAIL);
-    const first = await pool.query("SELECT id FROM sessions");
+    const first = await sql("SELECT id FROM sessions");
 
     const res = await client.login(EMAIL);
     expect(res.status).toBe(200);
-    const { rows } = await pool.query("SELECT id, revoked_reason FROM sessions ORDER BY created_at");
+    const { rows } = await sql("SELECT id, revoked_reason FROM sessions ORDER BY created_at");
     expect(rows).toHaveLength(2);
     expect(rows[0]).toEqual({ id: first.rows[0].id, revoked_reason: "login_rotation" });
     expect(rows[1].revoked_reason).toBeNull();
@@ -175,7 +175,7 @@ describe("GET /auth/me and session validity", () => {
   it("rejects an absolutely expired session and clears the cookie", async () => {
     await createUser({ email: EMAIL });
     const client = await loggedInClient(EMAIL);
-    await pool.query("UPDATE sessions SET expires_at = now() - interval '1 second'");
+    await sql("UPDATE sessions SET expires_at = now() - interval '1 second'");
     const res = await client.get("/api/v1/auth/me");
     expect(res.status).toBe(401);
     expect(sessionCookie(res)).toMatch(/Expires=Thu, 01 Jan 1970/);
@@ -184,21 +184,21 @@ describe("GET /auth/me and session validity", () => {
   it("rejects an idle-expired session", async () => {
     await createUser({ email: EMAIL });
     const client = await loggedInClient(EMAIL);
-    await pool.query("UPDATE sessions SET last_seen_at = now() - interval '3 hours'");
+    await sql("UPDATE sessions SET last_seen_at = now() - interval '3 hours'");
     expect((await client.get("/api/v1/auth/me")).status).toBe(401);
   });
 
   it("rejects a revoked session", async () => {
     await createUser({ email: EMAIL });
     const client = await loggedInClient(EMAIL);
-    await pool.query("UPDATE sessions SET revoked_at = now()");
+    await sql("UPDATE sessions SET revoked_at = now()");
     expect((await client.get("/api/v1/auth/me")).status).toBe(401);
   });
 
   it("rejects sessions of a user disabled after login", async () => {
     await createUser({ email: EMAIL });
     const client = await loggedInClient(EMAIL);
-    await pool.query("UPDATE users SET status = 'DISABLED'");
+    await sql("UPDATE users SET status = 'DISABLED'");
     expect((await client.get("/api/v1/auth/me")).status).toBe(401);
   });
 
@@ -232,7 +232,7 @@ describe("logout", () => {
     expect(res.status).toBe(200);
     expect(sessionCookie(res)).toMatch(/gm_session=;.*Expires=Thu, 01 Jan 1970.*HttpOnly.*SameSite=Lax/);
 
-    const { rows } = await pool.query("SELECT revoked_at, revoked_reason FROM sessions");
+    const { rows } = await sql("SELECT revoked_at, revoked_reason FROM sessions");
     expect(rows[0].revoked_reason).toBe("logout");
 
     // Replaying the old cookie value does not work: the server-side session is dead.
@@ -269,12 +269,12 @@ describe("logout", () => {
     expect(list.body.data.sessions).toHaveLength(1);
     expect(list.body.data.sessions[0].current).toBe(true);
 
-    const { rows } = await pool.query(
+    const { rows } = await sql(
       "SELECT s.id FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = 'eve@garment.test'",
     );
     const res = await ada.send("delete", `/api/v1/auth/sessions/${rows[0].id}`);
     expect(res.status).toBe(404);
-    const eve = await pool.query("SELECT revoked_at FROM sessions WHERE id = $1", [rows[0].id]);
+    const eve = await sql("SELECT revoked_at FROM sessions WHERE id = $1", [rows[0].id]);
     expect(eve.rows[0].revoked_at).toBeNull();
   });
 });

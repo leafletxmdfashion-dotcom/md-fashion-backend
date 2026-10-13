@@ -15,11 +15,8 @@ export function fabricRoutes(): Router {
   router.get("/", view, fabricController.list);
   router.get("/export", view, fabricController.exportCsv);
   router.post("/", manage, fabricController.create);
-  router.post("/import", manage, fabricController.importFabrics);
-  router.post("/bulk-status", manage, fabricController.bulkStatus);
 
   router.get("/options", view, fabricController.options);
-  router.get("/categories", view, fabricController.categories);
   router.get("/movements", view, fabricController.movements);
   router.get("/movements/export", view, fabricController.exportMovements);
 

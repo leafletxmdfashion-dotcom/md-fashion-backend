@@ -1,10 +1,8 @@
 // Test support for the frontend Playwright suite: rebuilds the database named by
 // DATABASE_URL and seeds fixed accounts. Refuses to touch anything but an *_e2e database.
 //   DATABASE_URL=.../garment_e2e npx tsx src/test/e2e-reset.ts
-import pg from "pg";
-
-import { migrate } from "../db/migrate";
 import { hashPassword } from "../modules/auth/password";
+import { rebuildDatabase } from "./rebuild-database";
 
 const url = process.env.DATABASE_URL ?? "";
 if (!/\/\w+_e2e(\?|$)/.test(url)) {
@@ -13,22 +11,17 @@ if (!/\/\w+_e2e(\?|$)/.test(url)) {
 
 const E2E_PASSWORD = "correct horse battery staple";
 
-const pool = new pg.Pool({ connectionString: url, max: 1 });
+const db = await rebuildDatabase(url);
 try {
-  await pool.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
-  await migrate(pool);
-  const hash = await hashPassword(E2E_PASSWORD);
-  await pool.query(
-    `INSERT INTO users (email, name, password_hash, status, role_id)
-     SELECT v.email, v.name, $1, v.status::user_status, r.id
-     FROM (VALUES
-       ('owner@garment.test', 'Olivia Owner', 'ACTIVE', 'OWNER'),
-       ('staff@garment.test', 'Sam Staff', 'ACTIVE', 'STAFF'),
-       ('reset@garment.test', 'Riley Reset', 'ACTIVE', 'STAFF')
-     ) AS v (email, name, status, role_key)
-     JOIN roles r ON r.key = v.role_key`,
-    [hash],
-  );
+  const passwordHash = await hashPassword(E2E_PASSWORD);
+  const roles = new Map((await db.role.findMany({ select: { id: true, key: true } })).map((r) => [r.key, r.id]));
+  await db.user.createMany({
+    data: [
+      { email: "owner@garment.test", name: "Olivia Owner", role: "OWNER" },
+      { email: "staff@garment.test", name: "Sam Staff", role: "STAFF" },
+      { email: "reset@garment.test", name: "Riley Reset", role: "STAFF" },
+    ].map(({ role, ...user }) => ({ ...user, passwordHash, status: "ACTIVE" as const, roleId: roles.get(role)! })),
+  });
 } finally {
-  await pool.end();
+  await db.$disconnect();
 }

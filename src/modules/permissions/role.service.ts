@@ -1,4 +1,4 @@
-import { withTransaction } from "../../db/pool";
+import { transaction } from "../../db/prisma";
 import { errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
@@ -19,7 +19,7 @@ export const roleService = {
     permissions: Permission[],
     meta: ClientMeta,
   ): Promise<RoleWithPermissions> {
-    return withTransaction(async (tx) => {
+    return transaction(async (tx) => {
       await permissionRepository.lockRoleByKey(tx, roleKey);
       const role = await permissionRepository.findRoleByKey(tx, roleKey);
       if (!role) throw errors.notFound("Role");

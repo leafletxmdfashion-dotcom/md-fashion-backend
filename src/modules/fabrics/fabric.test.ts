@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { pool } from "../../db/pool";
-import { createUser, loggedInClient, resetDatabase, type TestClient } from "../../test/helpers";
+import { createUser, loggedInClient, resetDatabase, sql, type TestClient } from "../../test/helpers";
 
 beforeEach(resetDatabase);
 
@@ -20,7 +19,6 @@ async function createFabric(client: TestClient, overrides: object = {}) {
     code: "fb-ctj",
     name: "Cotton Jersey",
     unit: "KG",
-    category: "KNIT",
     lowStockThreshold: 50,
     ...overrides,
   });
@@ -58,37 +56,15 @@ describe("fabric master", () => {
       code: "FB-CTJ",
       name: "Other",
       unit: "METER",
-      category: "WOVEN",
     });
     expect(dup.status).toBe(409);
     expect(dup.body.error.details.code).toBeDefined();
   });
 
-  it("treats category as optional free text and suggests the ones in use", async () => {
-    const { owner } = await setup();
-    const plain = await owner.send("post", "/api/v1/fabrics", { code: "NO-CAT", name: "Plain", unit: "KG" });
-    expect(plain.status).toBe(201);
-    expect(plain.body.data.fabric.category).toBeNull();
-    await createFabric(owner, { code: "FB-1", name: "One", category: "Cotton Knit" });
-    await createFabric(owner, { code: "FB-2", name: "Two", category: "  cotton knit " });
-    await createFabric(owner, { code: "FB-3", name: "Three", category: "Denim" });
-    const categories = (await owner.get("/api/v1/fabrics/categories")).body.data.categories as string[];
-    expect(categories).toHaveLength(2);
-    expect(categories.map((c) => c.toLowerCase()).sort()).toEqual(["cotton knit", "denim"]);
-    expect((await owner.get("/api/v1/fabrics?category=knit")).body.data.total).toBe(2);
-    const tooLong = await owner.send("post", "/api/v1/fabrics", {
-      code: "X-1",
-      name: "X",
-      unit: "KG",
-      category: "x".repeat(51),
-    });
-    expect(tooLong.body.error.details.category).toBeDefined();
-  });
-
   it("locks the unit once stock has been posted", async () => {
     const { owner } = await setup();
     const fabric = await createFabric(owner);
-    const body = { code: "FB-CTJ", name: "Cotton Jersey", unit: "METER", category: "KNIT", isActive: true };
+    const body = { code: "FB-CTJ", name: "Cotton Jersey", unit: "METER" };
     expect((await owner.send("put", `/api/v1/fabrics/${fabric.id}`, body)).status).toBe(200);
 
     await postInward(owner, fabric.id, 10, 100);
@@ -116,21 +92,13 @@ describe("fabric list", () => {
     const { owner } = await setup();
     const low = await createFabric(owner, { code: "FB-INT", name: "Interlock", lowStockThreshold: 50 });
     await postInward(owner, low.id, 20, 100);
-    const ok = await createFabric(owner, { code: "FB-PPL", name: "Poplin", unit: "METER", category: "WOVEN" });
+    const ok = await createFabric(owner, { code: "FB-PPL", name: "Poplin", unit: "METER" });
     await postInward(owner, ok.id, 300, 10);
-    await createFabric(owner, { code: "FB-CRD", name: "Corduroy", category: "WOVEN" });
-    const inactive = await createFabric(owner, { code: "FB-OLD", name: "Old Twill" });
-    await owner.send("put", `/api/v1/fabrics/${inactive.id}`, {
-      code: "FB-OLD",
-      name: "Old Twill",
-      unit: "KG",
-      category: "KNIT",
-      isActive: false,
-    });
+    await createFabric(owner, { code: "FB-CRD", name: "Corduroy" });
 
     const all = (await owner.get("/api/v1/fabrics")).body.data;
     expect(all.total).toBe(3);
-    expect(all.summary).toEqual({ stockValue: 5_000, active: 3, inStock: 2, reorder: 2, inactive: 1 });
+    expect(all.summary).toEqual({ stockValue: 5_000, fabrics: 3, inStock: 2, reorder: 2 });
 
     const page2 = (await owner.get("/api/v1/fabrics?pageSize=2&page=2")).body.data;
     expect(page2.total).toBe(3);
@@ -144,19 +112,15 @@ describe("fabric list", () => {
     const reorder = (await owner.get("/api/v1/fabrics?stock=low")).body.data;
     expect(reorder.fabrics.map((f: { name: string }) => f.name)).toEqual(["Corduroy", "Interlock"]);
     expect((await owner.get("/api/v1/fabrics?stock=out")).body.data.total).toBe(1);
-    expect((await owner.get("/api/v1/fabrics?category=WOVEN")).body.data.total).toBe(2);
-    expect((await owner.get("/api/v1/fabrics?status=inactive")).body.data.fabrics[0].name).toBe("Old Twill");
-    expect((await owner.get("/api/v1/fabrics?status=active,inactive")).body.data.total).toBe(4);
     expect((await owner.get("/api/v1/fabrics?pageSize=500")).status).toBe(400);
 
     const options = (await owner.get("/api/v1/fabrics/options")).body.data.fabrics;
-    expect(options).toHaveLength(4);
+    expect(options).toHaveLength(3);
     expect(options[0]).toEqual({
       id: expect.any(String),
       code: "FB-CRD",
       name: "Corduroy",
       unit: "KG",
-      isActive: true,
       balance: 0,
     });
   });
@@ -173,11 +137,11 @@ describe("fabric list", () => {
   });
 });
 
-describe("column filters, sorting, export, bulk and import", () => {
+describe("column filters, sorting and export", () => {
   async function seed(owner: TestClient) {
     const a = await createFabric(owner, { code: "FB-A", name: "Alpha Knit", lowStockThreshold: 10 });
-    const b = await createFabric(owner, { code: "FB-B", name: "Beta Woven", unit: "METER", category: "WOVEN" });
-    const c = await createFabric(owner, { code: "FB-C", name: "Gamma", category: "WOVEN", description: "=SUM(1)" });
+    const b = await createFabric(owner, { code: "FB-B", name: "Beta Woven", unit: "METER" });
+    const c = await createFabric(owner, { code: "FB-C", name: "Gamma", description: "=SUM(1)" });
     await postInward(owner, a.id, 100, 10, { inwardDate: "2026-01-05", supplier: "Sunrise Knits", color: "Red" });
     await postInward(owner, b.id, 40, 50, {
       inwardDate: "2026-02-10",
@@ -196,7 +160,7 @@ describe("column filters, sorting, export, bulk and import", () => {
       (await owner.get(url)).body.data.fabrics.map((f: { name: string }) => f.name) as string[];
     expect(await names("/api/v1/fabrics?sort=balance&dir=desc")).toEqual(["Alpha Knit", "Beta Woven", "Gamma"]);
     expect(await names("/api/v1/fabrics?balanceMin=6&balanceMax=50")).toEqual(["Beta Woven"]);
-    expect(await names("/api/v1/fabrics?category=WOVEN&fabric=gam")).toEqual(["Gamma"]);
+    expect(await names("/api/v1/fabrics?fabric=gam")).toEqual(["Gamma"]);
     expect(await names("/api/v1/fabrics?stockValueMin=2000&sort=stockValue&dir=asc")).toEqual(["Beta Woven"]);
 
     const inwards = async (url: string) =>
@@ -216,7 +180,7 @@ describe("column filters, sorting, export, bulk and import", () => {
     expect(ledger.movements.map((m: { balance: number }) => m.balance)).toEqual([5, 40, 100]);
 
     // Anything outside the declared columns is rejected, never interpolated.
-    for (const bad of ["sort=f.name;drop", "status=NOPE", "balanceMin=abc", "dateFrom=yesterday", "dir=sideways"]) {
+    for (const bad of ["sort=f.name;drop", "stock=NOPE", "balanceMin=abc", "dateFrom=yesterday", "dir=sideways"]) {
       const target = bad.startsWith("date") ? "/api/v1/fabrics/inwards" : "/api/v1/fabrics";
       expect((await owner.get(`${target}?${bad}`)).status).toBe(400);
     }
@@ -234,55 +198,9 @@ describe("column filters, sorting, export, bulk and import", () => {
     expect(lines[0]).toMatch(/^No\.,Date,Fabric code/);
     expect(res.text).toContain("'=HYPERLINK(1)");
 
-    const fabrics = await owner.get("/api/v1/fabrics/export?category=WOVEN");
-    expect(fabrics.text.replace(/^\uFEFF/, "").split("\r\n")).toHaveLength(3);
+    const fabrics = await owner.get("/api/v1/fabrics/export?fabric=gam");
+    expect(fabrics.text.replace(/^\uFEFF/, "").split("\r\n")).toHaveLength(2);
     expect((await owner.get("/api/v1/fabrics/movements/export")).status).toBe(200);
-  });
-
-  it("changes status in bulk and audits it", async () => {
-    const { owner } = await setup();
-    const { a, b } = await seed(owner);
-    const res = await owner.send("post", "/api/v1/fabrics/bulk-status", { ids: [a.id, b.id, a.id], isActive: false });
-    expect(res.body.data.updated).toBe(2);
-    expect((await owner.get("/api/v1/fabrics?status=inactive")).body.data.total).toBe(2);
-    expect(
-      (await owner.send("post", "/api/v1/fabrics/bulk-status", { ids: [a.id], isActive: false })).body.data.updated,
-    ).toBe(0);
-    const staff = await loggedInClient("staff@garment.test");
-    expect((await staff.send("post", "/api/v1/fabrics/bulk-status", { ids: [a.id], isActive: true })).status).toBe(403);
-  });
-
-  it("imports fabrics all-or-nothing with per-row errors", async () => {
-    const { owner } = await setup();
-    await createFabric(owner, { code: "FB-OLD", name: "Existing" });
-    const bad = await owner.send("post", "/api/v1/fabrics/import", {
-      rows: [
-        { code: "fb-new", name: "New Knit", unit: "KG", category: "KNIT" },
-        { code: "FB-NEW", name: "Dup In File", unit: "KG", category: "KNIT" },
-        { code: "FB-OLD", name: "Dup Saved", unit: "KG", category: "KNIT" },
-        { code: "OK-1", name: "", unit: "LITRE", category: "KNIT" },
-      ],
-    });
-    expect(bad.status).toBe(400);
-    expect(Object.keys(bad.body.error.details).sort()).toEqual([
-      "rows.2.code",
-      "rows.3.code",
-      "rows.4.name",
-      "rows.4.unit",
-    ]);
-    expect((await owner.get("/api/v1/fabrics")).body.data.total).toBe(1);
-
-    const ok = await owner.send("post", "/api/v1/fabrics/import", {
-      rows: [
-        { code: "fb-new", name: "New Knit", unit: "KG", category: "KNIT", lowStockThreshold: 20 },
-        { code: "FB-NEW2", name: "New Woven", unit: "METER", category: "WOVEN", description: "Plain" },
-      ],
-    });
-    expect(ok.status).toBe(201);
-    expect(ok.body.data.created).toBe(2);
-    expect(
-      (await owner.get("/api/v1/fabrics?fabric=new")).body.data.fabrics.map((f: { code: string }) => f.code),
-    ).toEqual(["FB-NEW", "FB-NEW2"]);
   });
 });
 
@@ -306,7 +224,7 @@ describe("purchases and stock ledger", () => {
     expect((await owner.get("/api/v1/fabrics/inwards/suppliers")).body.data.suppliers).toEqual(["Sunrise Knits"]);
   });
 
-  it("rejects purchases for inactive fabrics and future dates", async () => {
+  it("rejects purchases with a future date", async () => {
     const { owner } = await setup();
     const fabric = await createFabric(owner);
     const future = await owner.send("post", "/api/v1/fabrics/inwards", {
@@ -315,23 +233,8 @@ describe("purchases and stock ledger", () => {
       quantity: 1,
       rate: 1,
     });
+    expect(future.status).toBe(400);
     expect(future.body.error.details.inwardDate).toBeDefined();
-
-    await owner.send("put", `/api/v1/fabrics/${fabric.id}`, {
-      code: "FB-CTJ",
-      name: "Cotton Jersey",
-      unit: "KG",
-      category: "KNIT",
-      isActive: false,
-    });
-    const res = await owner.send("post", "/api/v1/fabrics/inwards", {
-      fabricId: fabric.id,
-      inwardDate: today,
-      quantity: 1,
-      rate: 1,
-    });
-    expect(res.status).toBe(400);
-    expect(res.body.error.details.fabricId).toBeDefined();
   });
 
   it("never lets an adjustment or reversal drive stock negative", async () => {
@@ -432,7 +335,7 @@ describe("purchases and stock ledger", () => {
     });
     await postInward(owner, fabric.id, 30, 100);
     await owner.send("post", `/api/v1/fabrics/inwards/${inward.id}/reverse`, { reason: "Wrong fabric" });
-    const { rows } = await pool.query<{ projected: string; ledger: string; purchased: string }>(
+    const { rows } = await sql(
       `SELECT s.balance AS projected, s.purchased_qty AS purchased,
               (SELECT sum(qty_in - qty_out) FROM fabric_movements WHERE fabric_id = $1) AS ledger
        FROM fabric_stock s WHERE s.fabric_id = $1`,
@@ -441,7 +344,7 @@ describe("purchases and stock ledger", () => {
     expect(Number(rows[0]!.projected)).toBe(Number(rows[0]!.ledger));
     expect(Number(rows[0]!.projected)).toBe(20);
     expect(Number(rows[0]!.purchased)).toBe(30);
-    await expect(pool.query("UPDATE fabric_stock SET balance = -1 WHERE fabric_id = $1", [fabric.id])).rejects.toThrow(
+    await expect(sql("UPDATE fabric_stock SET balance = -1 WHERE fabric_id = $1", [fabric.id])).rejects.toThrow(
       /check/i,
     );
   });
@@ -462,7 +365,32 @@ describe("purchases and stock ledger", () => {
     const { owner } = await setup();
     const fabric = await createFabric(owner);
     await postInward(owner, fabric.id, 10, 1);
-    await expect(pool.query("UPDATE fabric_movements SET qty_in = 999")).rejects.toThrow(/append-only/);
-    await expect(pool.query("DELETE FROM fabric_movements")).rejects.toThrow(/append-only/);
+    await expect(sql("UPDATE fabric_movements SET qty_in = 999")).rejects.toThrow(/append-only/);
+    await expect(sql("DELETE FROM fabric_movements")).rejects.toThrow(/append-only/);
+  });
+});
+
+describe("removed features", () => {
+  it("no longer accepts category or deactivation, and has no bulk status or import endpoints", async () => {
+    const { owner } = await setup();
+    const withCategory = await owner.send("post", "/api/v1/fabrics", {
+      code: "X-1",
+      name: "X",
+      unit: "KG",
+      category: "Knit",
+    });
+    expect(withCategory.status).toBe(400);
+    expect((await owner.send("post", "/api/v1/fabrics/bulk-status", { ids: [], isActive: false })).status).toBe(404);
+    expect((await owner.send("post", "/api/v1/fabrics/import", { rows: [] })).status).toBe(404);
+    // Fabrics cannot be deactivated.
+    const fabric = await createFabric(owner, { code: "ACT-1", name: "Always On" });
+    const deactivate = await owner.send("put", `/api/v1/fabrics/${fabric.id}`, {
+      code: "ACT-1",
+      name: "Always On",
+      unit: "KG",
+      isActive: false,
+    });
+    expect(deactivate.status).toBe(400);
+    expect((await owner.get(`/api/v1/fabrics/${fabric.id}`)).body.data.fabric).not.toHaveProperty("isActive");
   });
 });

@@ -1,4 +1,4 @@
-import { pool, withTransaction, type Queryable } from "../../db/pool";
+import { prisma, transaction, type Db } from "../../db/prisma";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
 import { permissionRepository } from "../permissions/permission.repository";
@@ -9,7 +9,7 @@ import { userRepository } from "./user.repository";
 import type { ManagedUserDto, ManagedUserRecord } from "./user.types";
 
 /** Locks the target row and enforces the hierarchy; self-management goes through /auth instead. */
-async function lockManageableTarget(tx: Queryable, actor: AuthContext, userId: string): Promise<ManagedUserRecord> {
+async function lockManageableTarget(tx: Db, actor: AuthContext, userId: string): Promise<ManagedUserRecord> {
   if (userId === actor.user.id) {
     throw errors.conflict("Use your account settings to change your own account.");
   }
@@ -19,7 +19,7 @@ async function lockManageableTarget(tx: Queryable, actor: AuthContext, userId: s
   return target;
 }
 
-async function assertNotLastOwner(tx: Queryable, target: ManagedUserRecord): Promise<void> {
+async function assertNotLastOwner(tx: Db, target: ManagedUserRecord): Promise<void> {
   if (isOwner(target.role) && (await userRepository.countOtherActiveOwners(tx, target.id)) === 0) {
     throw new AppError(409, ErrorCode.LAST_OWNER, "The last active owner cannot be removed or disabled.");
   }
@@ -37,7 +37,7 @@ export const userService = {
   },
 
   async updateProfile(actor: AuthContext, userId: string, input: { name: string }, meta: ClientMeta): Promise<void> {
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       await lockManageableTarget(tx, actor, userId);
       await userRepository.updateName(tx, userId, input.name);
       await recordAudit(tx, {
@@ -52,11 +52,11 @@ export const userService = {
   },
 
   async changeRole(actor: AuthContext, userId: string, roleKey: string, meta: ClientMeta): Promise<void> {
-    const role = await permissionRepository.findRoleByKey(pool, roleKey);
+    const role = await permissionRepository.findRoleByKey(prisma, roleKey);
     if (!role) throw new AppError(400, ErrorCode.VALIDATION_ERROR, "Unknown role.", { roleKey: ["Unknown role."] });
     if (!canAssignRole(actor.user, role)) throw errors.forbidden();
 
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       const target = await lockManageableTarget(tx, actor, userId);
       if (target.role.key === role.key) return;
       if (!isOwner(role)) await assertNotLastOwner(tx, target);
@@ -74,7 +74,7 @@ export const userService = {
   },
 
   async disable(actor: AuthContext, userId: string, meta: ClientMeta): Promise<void> {
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       const target = await lockManageableTarget(tx, actor, userId);
       if (target.status === "DISABLED") return;
       if (target.status === "INVITED") throw errors.conflict("Revoke the invitation instead of disabling.");
@@ -95,7 +95,7 @@ export const userService = {
 
   /** Reactivates a disabled account or lifts a temporary lock early. */
   async enable(actor: AuthContext, userId: string, meta: ClientMeta): Promise<void> {
-    await withTransaction(async (tx) => {
+    await transaction(async (tx) => {
       const target = await lockManageableTarget(tx, actor, userId);
       if (target.status !== "DISABLED" && target.status !== "LOCKED") {
         throw errors.conflict("Only disabled or locked accounts can be enabled.");
@@ -113,7 +113,7 @@ export const userService = {
   },
 
   async revokeSessions(actor: AuthContext, userId: string, meta: ClientMeta): Promise<number> {
-    return withTransaction(async (tx) => {
+    return transaction(async (tx) => {
       await lockManageableTarget(tx, actor, userId);
       const revoked = await sessionService.revokeAllForUser(tx, userId, "revoked_by_admin");
       await recordAudit(tx, {

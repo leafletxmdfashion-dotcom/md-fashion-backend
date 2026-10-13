@@ -6,15 +6,22 @@ import type { App } from "supertest/types";
 
 import { createApp } from "../app";
 import { env } from "../config/env";
-import { pool } from "../db/pool";
+import { prisma } from "../db/prisma";
 import { hashPassword } from "../modules/auth/password";
 import type { UserStatus } from "../modules/sessions/session.types";
 
 export const ORIGIN = "http://localhost:3000";
 export const PASSWORD = "correct horse battery staple";
 
+/** Raw SQL for assertions and fixtures that reach under the API (e.g. ageing a token). */
+// Rows are untyped like supertest bodies; assertions narrow them.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function sql(text: string, values: unknown[] = []): Promise<{ rows: any[] }> {
+  return { rows: await prisma.$queryRawUnsafe(text, ...values) };
+}
+
 export async function resetDatabase(): Promise<void> {
-  await pool.query("TRUNCATE users, sessions, password_reset_tokens, invitations, audit_events CASCADE");
+  await prisma.$executeRawUnsafe("TRUNCATE users, sessions, password_reset_tokens, invitations, audit_events CASCADE");
   await rm(env.MAIL_OUTBOX_DIR, { recursive: true, force: true });
 }
 
@@ -31,12 +38,17 @@ export async function createUser(input: {
     input.password && input.password !== PASSWORD
       ? await hashPassword(input.password)
       : (passwordHashCache ??= await hashPassword(PASSWORD));
-  const { rows } = await pool.query<{ id: string }>(
-    `INSERT INTO users (email, name, password_hash, status, role_id)
-     SELECT $1, $2, $3, $4, id FROM roles WHERE key = $5 RETURNING id`,
-    [input.email, input.name ?? "Test User", passwordHash, input.status ?? "ACTIVE", input.role ?? "STAFF"],
-  );
-  return rows[0]!.id;
+  const user = await prisma.user.create({
+    data: {
+      email: input.email,
+      name: input.name ?? "Test User",
+      passwordHash,
+      status: input.status ?? "ACTIVE",
+      role: { connect: { key: input.role ?? "STAFF" } },
+    },
+    select: { id: true },
+  });
+  return user.id;
 }
 
 /** A browser-like client: persistent cookie jar, Origin header and automatic CSRF token handling. */
@@ -119,9 +131,10 @@ export function tokenFromMail(text: string): string {
 }
 
 export async function auditTypes(userId: string): Promise<string[]> {
-  const { rows } = await pool.query<{ event_type: string }>(
-    "SELECT event_type FROM audit_events WHERE target_user_id = $1 ORDER BY created_at, event_type",
-    [userId],
-  );
-  return rows.map((row) => row.event_type);
+  const events = await prisma.auditEvent.findMany({
+    where: { targetUserId: userId },
+    select: { eventType: true },
+    orderBy: [{ createdAt: "asc" }, { eventType: "asc" }],
+  });
+  return events.map((event) => event.eventType);
 }
