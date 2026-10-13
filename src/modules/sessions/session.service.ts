@@ -39,6 +39,7 @@ export const sessionService = {
     const permissions = new Set<Permission>(row.permissions.filter(isPermission));
     return {
       sessionId: row.session_id,
+      expiresAt: row.expires_at,
       user: {
         id: row.user_id,
         email: row.email,

@@ -13,6 +13,8 @@ export interface AuthenticatedUser {
 
 export interface AuthContext {
   sessionId: string;
+  /** Absolute expiry; the session also ends after SESSION_IDLE_TIMEOUT_MINUTES without requests. */
+  expiresAt: Date;
   user: AuthenticatedUser;
 }
 

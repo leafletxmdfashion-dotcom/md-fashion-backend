@@ -299,11 +299,21 @@ describe("purchases and stock ledger", () => {
       ["PURCHASE_IN", 100],
     ]);
     expect(all.summary).toEqual({ opening: 0, totalIn: 120, totalOut: 5, closing: 115 });
+    expect(all.byUnit).toEqual({ KG: { in: 120, out: 5 } });
 
     const feb = (
       await owner.get(`/api/v1/fabrics/movements?fabricId=${fabric.id}&dateFrom=2026-02-01&dateTo=2026-02-28`)
     ).body.data;
     expect(feb.total).toBe(1);
+    expect(feb.byUnit).toEqual({ KG: { in: 20, out: 0 } });
+
+    // Across fabrics, kilograms and metres are totalled separately.
+    const meters = await createFabric(owner, { code: "FB-SAT", name: "Satin", unit: "METER" });
+    await postInward(owner, meters.id, 40, 90, { inwardDate: "2026-02-12" });
+    const everything = (await owner.get("/api/v1/fabrics/movements")).body.data;
+    expect(everything.total).toBe(4);
+    expect(everything.summary).toBeNull();
+    expect(everything.byUnit).toEqual({ KG: { in: 120, out: 5 }, METER: { in: 40, out: 0 } });
     expect(feb.summary).toEqual({ opening: 100, totalIn: 20, totalOut: 0, closing: 120 });
   });
 

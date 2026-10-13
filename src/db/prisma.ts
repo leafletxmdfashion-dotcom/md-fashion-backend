@@ -6,7 +6,14 @@ import { Prisma, PrismaClient } from "../generated/prisma/client";
 export { Prisma };
 
 export const prisma = new PrismaClient({
-  adapter: new PrismaPg({ connectionString: env.DATABASE_URL, max: env.isTest ? 5 : 10 }),
+  adapter: new PrismaPg({
+    connectionString: env.DATABASE_URL,
+    max: env.isTest ? 5 : 10,
+    // Fail fast when the database is unreachable or stuck, so requests (and the
+    // web app's session check) get a prompt error instead of hanging.
+    connectionTimeoutMillis: 5_000,
+    statement_timeout: 15_000,
+  }),
 });
 
 /** The client or an interactive-transaction client, so repositories can join a transaction. */

@@ -6,6 +6,7 @@ import type { ClientMeta, SessionRevokeReason, SessionSummary, UserStatus } from
 export interface SessionLookupRow {
   session_id: string;
   last_seen_at: Date;
+  expires_at: Date;
   user_id: string;
   email: string;
   name: string;
@@ -38,7 +39,7 @@ export const sessionRepository = {
   // account status are all enforced in SQL against the database clock.
   async findValidByTokenHash(tokenHash: TokenHash, idleTimeoutMs: number): Promise<SessionLookupRow | null> {
     const [row] = await prisma.$queryRaw<SessionLookupRow[]>`
-      SELECT s.id AS session_id, s.last_seen_at,
+      SELECT s.id AS session_id, s.last_seen_at, s.expires_at,
              u.id AS user_id, u.email, u.name, u.status::text AS status,
              r.key AS role_key, r.name AS role_name, r.rank AS role_rank,
              COALESCE(array_agg(rp.permission) FILTER (WHERE rp.permission IS NOT NULL), '{}') AS permissions

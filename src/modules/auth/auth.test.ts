@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../../app";
 
+import { env } from "../../config/env";
 import { hashToken } from "../../lib/crypto";
 import {
   auditTypes,
@@ -163,7 +164,21 @@ describe("GET /auth/me and session validity", () => {
     const client = await loggedInClient(EMAIL);
     const res = await client.get("/api/v1/auth/me");
     expect(res.status).toBe(200);
-    expect(Object.keys(res.body.data.user).sort()).toEqual(["email", "id", "name", "permissions", "role", "status"]);
+    expect(Object.keys(res.body.data.user).sort()).toEqual([
+      "email",
+      "id",
+      "name",
+      "permissions",
+      "role",
+      "session",
+      "status",
+    ]);
+    // The client schedules its own sign-out from these; the server stays the authority.
+    const { expiresAt, idleTimeoutMinutes } = res.body.data.user.session;
+    expect(idleTimeoutMinutes).toBe(env.SESSION_IDLE_TIMEOUT_MINUTES);
+    const remainingMs = new Date(expiresAt).getTime() - Date.now();
+    expect(remainingMs).toBeGreaterThan(env.sessionAbsoluteTimeoutMs - 60_000);
+    expect(remainingMs).toBeLessThanOrEqual(env.sessionAbsoluteTimeoutMs);
   });
 
   it("returns 401 AUTH_UNAUTHENTICATED without a session", async () => {

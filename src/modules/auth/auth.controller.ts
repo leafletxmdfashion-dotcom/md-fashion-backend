@@ -64,7 +64,7 @@ export const authController = {
 
   me: ((req, res) => {
     res.setHeader("Cache-Control", "no-store");
-    res.json({ success: true, data: { user: toCurrentUserDto(requireAuthContext(req).user) } });
+    res.json({ success: true, data: { user: toCurrentUserDto(requireAuthContext(req)) } });
   }) satisfies RequestHandler,
 
   updateMe: (async (req, res) => {

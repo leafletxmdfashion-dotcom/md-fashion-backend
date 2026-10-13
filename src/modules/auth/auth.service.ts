@@ -21,7 +21,7 @@ export interface AuthenticatedResult {
 async function loadCurrentUser(session: IssuedSession): Promise<CurrentUserDto> {
   const auth = await sessionService.authenticate(session.token);
   if (!auth) throw new Error("Freshly issued session failed to authenticate");
-  return toCurrentUserDto(auth.user);
+  return toCurrentUserDto(auth);
 }
 
 export const authService = {
@@ -164,7 +164,7 @@ export const authService = {
         metadata: { fields: ["name"] },
       });
     });
-    return toCurrentUserDto({ ...auth.user, name: input.name });
+    return toCurrentUserDto({ ...auth, user: { ...auth.user, name: input.name } });
   },
 
   listSessions(auth: AuthContext): Promise<(SessionSummary & { current: boolean })[]> {

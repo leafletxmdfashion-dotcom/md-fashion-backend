@@ -267,6 +267,27 @@ gets an email (`outbox` in dev: `md_backend/.outbox/*.json`). The dialog also sh
 link once, so it can be shared directly. The link expires after 72 h. **Resend** issues a new link
 and kills the old one; **Revoke** invalidates it.
 
+## 13a. Session handling in the web app
+
+Only a **session problem** signs the user out. A server or network error never does.
+
+| Situation | What the user sees |
+| --- | --- |
+| Any API call returns 401 (expired, revoked, account disabled) | Signed out → `/login?reason=expired&next=<page>`: "Your session has ended." |
+| No API request in any tab for the idle timeout (120 min) | "Are you still there?" dialog 2 minutes before, with **Stay signed in**; then signed out (`reason=idle`, session revoked) |
+| Absolute session lifetime (12 h) | Warning toast 2 minutes before, then signed out (`reason=expired`) |
+| Logged out in another tab | Every tab signs out (`reason=elsewhere`); a login in one tab also refreshes the others |
+| API or database down on first load | "Can't reach the server" screen with automatic retry (5 s → 30 s back-off), **Try again** and **Log out**. Still signed in |
+| API or database down while working | Pages show their own error state with Retry; the user stays signed in with cached data |
+| Browser offline | "You're offline" banner; queries pause and resume automatically |
+
+How it works:
+
+- `GET /auth/me` returns `user.session = { expiresAt, idleTimeoutMinutes }`. The client mirrors the server's limits; the server stays the authority.
+- Idle time is measured from the last API response in any tab (shared through `localStorage`, a timestamp only), so one active tab keeps the others signed in.
+- The API fails fast when the database is unreachable (5 s connect timeout, 15 s statement timeout). `/auth/me` has a 6 s client timeout and retries a dropped connection once.
+- Every sign-out goes through `features/auth/lib/sign-out.ts`. It revokes the session on the server when asked, and always clears the session cookie: through the API, or through the same-origin `POST /session/end` route when the API is down. It then reloads into `/login`, so no cached data, CSRF token or timer survives.
+
 ## 14. Revoking sessions
 
 - Self: Account → Security → revoke a device, or **Sign out everywhere** (`/auth/logout-all`).

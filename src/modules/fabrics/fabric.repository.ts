@@ -324,7 +324,13 @@ export const fabricRepository = {
               ${movement.createdBy}::uuid)`;
   },
 
-  async listMovements(query: MovementListQuery): Promise<{ movements: MovementDto[]; total: number }> {
+  /**
+   * One page of the ledger, plus totals over every matching movement: the count and,
+   * per unit (kg and metres never add up together), the quantity received and issued.
+   */
+  async listMovements(
+    query: MovementListQuery,
+  ): Promise<{ movements: MovementDto[]; total: number; byUnit: Record<string, { in: number; out: number }> }> {
     const clauses = columnFilters(MOVEMENT_COLUMNS, query);
     if (query.search) {
       const pattern = contains(query.search);
@@ -338,7 +344,7 @@ export const fabricRepository = {
 
     // Page first, then each row's running balance (in business-date order) via an
     // index-only range sum: cost grows with the page size, not with the ledger.
-    const [rows, [count]] = await Promise.all([
+    const [rows, totals] = await Promise.all([
       prisma.$queryRaw<MovementRow[]>`
         WITH page AS (
           SELECT m.*, f.code AS fabric_code, f.name AS fabric_name, f.unit AS fabric_unit,
@@ -354,9 +360,16 @@ export const fabricRepository = {
         FROM page p
         LEFT JOIN fabric_inwards i ON i.id = p.inward_id
         ORDER BY p.position`,
-      prisma.$queryRaw<{ total: number }[]>`SELECT count(*)::int AS total FROM fabric_movements m ${joins} ${filter}`,
+      prisma.$queryRaw<{ unit: string; count: number; qty_in: number; qty_out: number }[]>`
+        SELECT f.unit, count(*)::int AS count,
+               COALESCE(sum(m.qty_in), 0)::float8 AS qty_in, COALESCE(sum(m.qty_out), 0)::float8 AS qty_out
+        FROM fabric_movements m ${joins} ${filter} GROUP BY f.unit`,
     ]);
-    return { total: count!.total, movements: rows.map(toMovement) };
+    return {
+      movements: rows.map(toMovement),
+      total: totals.reduce((sum, row) => sum + row.count, 0),
+      byUnit: Object.fromEntries(totals.map((row) => [row.unit, { in: row.qty_in, out: row.qty_out }])),
+    };
   },
 
   /** Opening (before `from`), in and out within the range, for one fabric. */
