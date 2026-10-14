@@ -9,7 +9,7 @@
 generator client {
   provider        = "prisma-client"
   output          = "../src/generated/prisma"
-  previewFeatures = ["partialIndexes"]
+  previewFeatures = ["partialIndexes", "relationJoins"]
 }
 
 datasource db {
@@ -74,6 +74,16 @@ model User {
   inwardsCreated      FabricInward[]       @relation("InwardCreatedBy")
   inwardsReversed     FabricInward[]       @relation("InwardReversedBy")
   movementsCreated    FabricMovement[]
+  karigarsCreated     Karigar[]
+  karigarEntries      KarigarLedgerEntry[]
+  articlesCreated     Article[]
+  sizeTemplates       SizeTemplate[]
+  lotsCreated         ProductionLot[]
+  batchesCreated      CuttingBatch[]       @relation("BatchCreatedBy")
+  batchesFinalized    CuttingBatch[]       @relation("BatchFinalizedBy")
+  batchesReversed     CuttingBatch[]       @relation("BatchReversedBy")
+  cuttingMovements    CuttingMovement[]
+  lotCosts            LotCost[]
 
   @@index([roleId, status], map: "users_role_status_idx")
   @@map("users")
@@ -146,22 +156,25 @@ model AuditEvent {
 }
 
 model Fabric {
-  id                String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  code              String           @unique
+  id                String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code              String            @unique
   name              String
   /// KG | METER (CHECK constraint)
   unit              String
-  lowStockThreshold Decimal?         @map("low_stock_threshold") @db.Decimal(12, 3)
+  lowStockThreshold Decimal?          @map("low_stock_threshold") @db.Decimal(12, 3)
   description       String?
-  createdById       String?          @map("created_by") @db.Uuid
-  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt         DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdById       String?           @map("created_by") @db.Uuid
+  createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   /// Generated: lower(name || ' ' || code), trigram-indexed for search.
-  searchText        String?          @default(dbgenerated("lower(((name || ' '::text) || code))")) @map("search_text")
-  createdBy         User?            @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  searchText        String?           @default(dbgenerated("lower(((name || ' '::text) || code))")) @map("search_text")
+  createdBy         User?             @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   stock             FabricStock?
   inwards           FabricInward[]
   movements         FabricMovement[]
+  articles          Article[]
+  lots              ProductionLot[]
+  cuttingMovements  CuttingMovement[]
 
   @@index([searchText(ops: raw("gin_trgm_ops"))], map: "fabrics_search_idx", type: Gin)
   @@map("fabrics")
@@ -191,16 +204,14 @@ model FabricInward {
   amount         Decimal?         @default(dbgenerated("round((quantity * rate), 2)")) @db.Decimal(14, 2)
   supplier       String?
   invoiceRef     String?          @map("invoice_ref")
-  color          String?
-  rollRef        String?          @map("roll_ref")
   notes          String?
   createdById    String           @map("created_by") @db.Uuid
   createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
   reversedAt     DateTime?        @map("reversed_at") @db.Timestamptz(6)
   reversedById   String?          @map("reversed_by") @db.Uuid
   reversalReason String?          @map("reversal_reason")
-  /// Generated: lower(supplier, invoice, colour, roll), trigram-indexed for search.
-  searchText     String?          @default(dbgenerated("lower(((((((COALESCE(supplier, ''::text) || ' '::text) || COALESCE(invoice_ref, ''::text)) || ' '::text) || COALESCE(color, ''::text)) || ' '::text) || COALESCE(roll_ref, ''::text)))")) @map("search_text")
+  /// Generated: lower(supplier, invoice), trigram-indexed for search.
+  searchText     String?          @default(dbgenerated("lower(((COALESCE(supplier, ''::text) || ' '::text) || COALESCE(invoice_ref, ''::text)))")) @map("search_text")
   fabric         Fabric           @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   createdBy      User             @relation("InwardCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversedBy     User?            @relation("InwardReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
@@ -214,23 +225,24 @@ model FabricInward {
 
 /// The stock ledger. Append-only (trigger); balances are sums of these rows.
 model FabricMovement {
-  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  seq          BigInt        @unique @default(autoincrement())
-  fabricId     String        @map("fabric_id") @db.Uuid
-  movementDate DateTime      @map("movement_date") @db.Date
-  /// PURCHASE_IN | PURCHASE_REVERSAL | ADJUSTMENT_IN | ADJUSTMENT_OUT (CHECK constraint)
-  type         String
-  qtyIn        Decimal       @default(0) @map("qty_in") @db.Decimal(12, 3)
-  qtyOut       Decimal       @default(0) @map("qty_out") @db.Decimal(12, 3)
-  color        String?
-  rollRef      String?       @map("roll_ref")
-  inwardId     String?       @map("inward_id") @db.Uuid
-  reason       String?
-  createdById  String        @map("created_by") @db.Uuid
-  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
-  fabric       Fabric        @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  inward       FabricInward? @relation(fields: [inwardId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  createdBy    User          @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seq            BigInt        @unique @default(autoincrement())
+  fabricId       String        @map("fabric_id") @db.Uuid
+  movementDate   DateTime      @map("movement_date") @db.Date
+  /// PURCHASE_IN | PURCHASE_REVERSAL | ADJUSTMENT_IN | ADJUSTMENT_OUT | CUTTING_ISSUE | CUTTING_RETURN (CHECK constraint)
+  type           String
+  qtyIn          Decimal       @default(0) @map("qty_in") @db.Decimal(12, 3)
+  qtyOut         Decimal       @default(0) @map("qty_out") @db.Decimal(12, 3)
+  inwardId       String?       @map("inward_id") @db.Uuid
+  reason         String?
+  createdById    String        @map("created_by") @db.Uuid
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Set exactly for CUTTING_ISSUE / CUTTING_RETURN (CHECK constraint).
+  cuttingBatchId String?       @map("cutting_batch_id") @db.Uuid
+  fabric         Fabric        @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  inward         FabricInward? @relation(fields: [inwardId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy      User          @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  cuttingBatch   CuttingBatch? @relation(fields: [cuttingBatchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@index([movementDate(sort: Desc), seq(sort: Desc)], map: "fabric_movements_date_idx")
   // The SQL index is (fabric_id, movement_date, seq) INCLUDE (qty_in, qty_out): running
@@ -238,4 +250,335 @@ model FabricMovement {
   @@index([fabricId, movementDate, seq, qtyIn, qtyOut], map: "fabric_movements_fabric_idx")
   @@index([type, movementDate(sort: Desc), seq(sort: Desc)], map: "fabric_movements_type_date_idx")
   @@map("fabric_movements")
+}
+
+/// A worker. Pay mode decides what a finalized cutting job earns them.
+model Karigar {
+  id          String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number      Int                  @unique @default(autoincrement())
+  name        String
+  phone       String?
+  /// CUTTING_MASTER | TAILOR | HELPER | OTHER (CHECK constraint)
+  category    String
+  /// PER_PIECE | PER_PALA | PER_KG | FIXED_JOB | SALARY (CHECK constraint)
+  payMode     String               @map("pay_mode")
+  payRate     Decimal              @default(0) @map("pay_rate") @db.Decimal(12, 2)
+  active      Boolean              @default(true)
+  notes       String?
+  /// Generated: lower(name, phone), trigram-indexed for search.
+  searchText  String?              @default(dbgenerated("lower(((name || ' '::text) || COALESCE(phone, ''::text)))")) @map("search_text")
+  createdById String               @map("created_by") @db.Uuid
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdBy   User                 @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  ledger      KarigarLedgerEntry[]
+  batches     CuttingBatch[]
+
+  @@index([searchText(ops: raw("gin_trgm_ops"))], map: "karigars_search_idx", type: Gin)
+  @@map("karigars")
+}
+
+/// Person ledger. Append-only (trigger); one earning per source document, reversed by a negative row.
+model KarigarLedgerEntry {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seq         BigInt   @unique @default(autoincrement())
+  karigarId   String   @map("karigar_id") @db.Uuid
+  entryDate   DateTime @map("entry_date") @db.Date
+  /// EARNING | EARNING_REVERSAL (CHECK constraint)
+  type        String
+  payMode     String   @map("pay_mode")
+  quantity    Decimal  @db.Decimal(18, 6)
+  rate        Decimal  @db.Decimal(12, 2)
+  amount      Decimal  @db.Decimal(14, 2)
+  /// CUTTING (CHECK constraint)
+  sourceType  String   @map("source_type")
+  sourceId    String   @map("source_id") @db.Uuid
+  description String
+  createdById String   @map("created_by") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  karigar     Karigar  @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy   User     @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([sourceType, sourceId, type], map: "karigar_ledger_once")
+  @@index([karigarId, entryDate], map: "karigar_ledger_karigar_idx")
+  @@map("karigar_ledger")
+}
+
+/// An item / design. name_key blocks names that differ only by case, spacing or punctuation.
+model Article {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code            String          @unique
+  name            String
+  /// Generated: name lower-cased with every non-alphanumeric removed; unique.
+  nameKey         String?         @unique(map: "articles_name_key_unique") @default(dbgenerated("lower(regexp_replace(name, '[^[:alnum:]]+'::text, ''::text, 'g'::text))")) @map("name_key")
+  defaultFabricId String?         @map("default_fabric_id") @db.Uuid
+  /// Cutting defaults (measurements and size ratio); validated by the API.
+  defaultMarker   Json?           @map("default_marker")
+  active          Boolean         @default(true)
+  /// Generated: lower(code || ' ' || name), trigram-indexed for search.
+  searchText      String?         @default(dbgenerated("lower(((code || ' '::text) || name))")) @map("search_text")
+  createdById     String          @map("created_by") @db.Uuid
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  defaultFabric   Fabric?         @relation(fields: [defaultFabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy       User            @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lots            ProductionLot[]
+
+  @@index([searchText(ops: raw("gin_trgm_ops"))], map: "articles_search_idx", type: Gin)
+  @@map("articles")
+}
+
+model SizeTemplate {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String
+  /// Generated: lower(btrim(name)); unique.
+  nameKey     String?  @unique(map: "size_templates_name_key_unique") @default(dbgenerated("lower(btrim(name))")) @map("name_key")
+  sizes       String[]
+  createdById String   @map("created_by") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdBy   User     @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@map("size_templates")
+}
+
+/// One article cut from one fabric, under an operator-typed lot number. Article code and name are snapshots.
+model ProductionLot {
+  id             String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Typed by the operator; unique ignoring case and surrounding spaces (lot_key).
+  lotNumber      String            @map("lot_number")
+  /// Generated: lower(btrim(lot_number)); unique.
+  lotKey         String?           @unique(map: "production_lots_lot_key_unique") @default(dbgenerated("lower(btrim(lot_number))")) @map("lot_key")
+  articleId      String            @map("article_id") @db.Uuid
+  articleCode    String            @map("article_code")
+  articleName    String            @map("article_name")
+  fabricId       String            @map("fabric_id") @db.Uuid
+  productionDate DateTime          @map("production_date") @db.Date
+  targetQuantity Int?              @map("target_quantity")
+  /// DRAFT | ACTIVE | COMPLETED | CANCELLED (CHECK constraint)
+  status         String            @default("DRAFT")
+  notes          String?
+  /// Generated: lower(lot number, article code and name), trigram-indexed for search.
+  searchText     String?           @default(dbgenerated("lower(((((lot_number || ' '::text) || article_code) || ' '::text) || article_name))")) @map("search_text")
+  createdById    String            @map("created_by") @db.Uuid
+  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  article        Article           @relation(fields: [articleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  fabric         Fabric            @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy      User              @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  batches        CuttingBatch[]
+  movements      CuttingMovement[]
+  outputs        CuttingOutput[]
+  costs          LotCost[]
+
+  @@index([productionDate(sort: Desc), createdAt(sort: Desc)], map: "production_lots_date_idx")
+  @@index([searchText(ops: raw("gin_trgm_ops"))], map: "production_lots_search_idx", type: Gin)
+  @@map("production_lots")
+}
+
+/// One cutting job of a lot under one marker. Posting totals are written once, on finalize.
+model CuttingBatch {
+  id                  String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number              Int               @unique @default(autoincrement())
+  lotId               String            @map("lot_id") @db.Uuid
+  cuttingMasterId     String?           @map("cutting_master_id") @db.Uuid
+  cuttingDate         DateTime          @map("cutting_date") @db.Date
+  /// DRAFT | ISSUED | FINALIZED | REVERSED (CHECK constraint)
+  status              String            @default("DRAFT")
+  notes               String?
+  widthM              Decimal?          @map("width_m") @db.Decimal(10, 4)
+  lengthM             Decimal?          @map("length_m") @db.Decimal(10, 4)
+  gsm                 Decimal?          @db.Decimal(10, 2)
+  measuredPalaKg      Decimal?          @map("measured_pala_kg") @db.Decimal(18, 6)
+  /// MEASURED | CALCULATED (CHECK constraint)
+  weightSource        String            @default("MEASURED") @map("weight_source")
+  repetitionsPerLayer Int               @default(1) @map("repetitions_per_layer")
+  calculationVersion  Int?              @map("calculation_version")
+  calculatedPalaKg    Decimal?          @map("calculated_pala_kg") @db.Decimal(18, 6)
+  activePalaKg        Decimal?          @map("active_pala_kg") @db.Decimal(18, 6)
+  totalIssuedKg       Decimal?          @map("total_issued_kg") @db.Decimal(18, 6)
+  totalReturnedKg     Decimal?          @map("total_returned_kg") @db.Decimal(18, 6)
+  totalConsumedKg     Decimal?          @map("total_consumed_kg") @db.Decimal(18, 6)
+  totalWastageKg      Decimal?          @map("total_wastage_kg") @db.Decimal(18, 6)
+  totalPala           Int?              @map("total_pala")
+  totalPlannedPieces  Int?              @map("total_planned_pieces")
+  totalAcceptedPieces Int?              @map("total_accepted_pieces")
+  fabricCost          Decimal?          @map("fabric_cost") @db.Decimal(14, 2)
+  earningAmount       Decimal?          @map("earning_amount") @db.Decimal(14, 2)
+  finalizedById       String?           @map("finalized_by") @db.Uuid
+  finalizedAt         DateTime?         @map("finalized_at") @db.Timestamptz(6)
+  reversedById        String?           @map("reversed_by") @db.Uuid
+  reversedAt          DateTime?         @map("reversed_at") @db.Timestamptz(6)
+  reversalReason      String?           @map("reversal_reason")
+  createdById         String            @map("created_by") @db.Uuid
+  createdAt           DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  lot                 ProductionLot     @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  cuttingMaster       Karigar?          @relation(fields: [cuttingMasterId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy           User              @relation("BatchCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  finalizedBy         User?             @relation("BatchFinalizedBy", fields: [finalizedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy          User?             @relation("BatchReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  sizes               CuttingSize[]
+  colours             CuttingColour[]
+  rolls               CuttingRoll[]
+  rejects             CuttingReject[]
+  outputs             CuttingOutput[]
+  movements           CuttingMovement[]
+  costs               LotCost[]
+  fabricMovements     FabricMovement[]
+
+  @@index([cuttingDate(sort: Desc), number(sort: Desc)], map: "cutting_batches_date_idx")
+  @@index([lotId, number], map: "cutting_batches_lot_idx")
+  @@map("cutting_batches")
+}
+
+/// Marker size ratio. Unique (batch_id, lower(label)) is an expression index in SQL.
+model CuttingSize {
+  id            String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  batchId       String       @map("batch_id") @db.Uuid
+  position      Int
+  label         String
+  piecesPerPala Int          @map("pieces_per_pala")
+  pieceWeightG  Decimal?     @map("piece_weight_g") @db.Decimal(10, 3)
+  batch         CuttingBatch @relation(fields: [batchId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@map("cutting_sizes")
+}
+
+/// Unique (batch_id, lower(name)) is an expression index in SQL.
+model CuttingColour {
+  id       String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  batchId  String          @map("batch_id") @db.Uuid
+  position Int
+  name     String
+  batch    CuttingBatch    @relation(fields: [batchId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  rolls    CuttingRoll[]
+  rejects  CuttingReject[]
+  outputs  CuttingOutput[]
+
+  @@map("cutting_colours")
+}
+
+/// One Thaan cut under the batch marker; once finalized, issued = consumed + returned + wastage (CHECK).
+model CuttingRoll {
+  id              String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  batchId         String            @map("batch_id") @db.Uuid
+  colourId        String            @map("colour_id") @db.Uuid
+  position        Int
+  thaan           String
+  issuedKg        Decimal           @map("issued_kg") @db.Decimal(18, 6)
+  returnedKg      Decimal           @default(0) @map("returned_kg") @db.Decimal(18, 6)
+  confirmedLayers Int?              @map("confirmed_layers")
+  /// DRAFT | ISSUED | FINALIZED | REVERSED (CHECK constraint)
+  status          String            @default("DRAFT")
+  fabricRate      Decimal?          @map("fabric_rate") @db.Decimal(14, 4)
+  issuedAt        DateTime?         @map("issued_at") @db.Timestamptz(6)
+  estimatedPala   Int?              @map("estimated_pala")
+  confirmedPala   Int?              @map("confirmed_pala")
+  consumedKg      Decimal?          @map("consumed_kg") @db.Decimal(18, 6)
+  wastageKg       Decimal?          @map("wastage_kg") @db.Decimal(18, 6)
+  batch           CuttingBatch      @relation(fields: [batchId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  colour          CuttingColour     @relation(fields: [colourId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  movements       CuttingMovement[]
+
+  @@index([batchId, position], map: "cutting_rolls_batch_idx")
+  @@map("cutting_rolls")
+}
+
+model CuttingReject {
+  id        String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  batchId   String        @map("batch_id") @db.Uuid
+  colourId  String        @map("colour_id") @db.Uuid
+  sizeLabel String        @map("size_label")
+  quantity  Int
+  reason    String
+  batch     CuttingBatch  @relation(fields: [batchId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  colour    CuttingColour @relation(fields: [colourId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@map("cutting_rejects")
+}
+
+/// Size-wise cut output per colour, posted on finalize. Stitching draws down available_for_stitching.
+model CuttingOutput {
+  id                    String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  batchId               String        @map("batch_id") @db.Uuid
+  lotId                 String        @map("lot_id") @db.Uuid
+  colourId              String        @map("colour_id") @db.Uuid
+  colourName            String        @map("colour_name")
+  sizeLabel             String        @map("size_label")
+  position              Int
+  plannedQuantity       Int           @map("planned_quantity")
+  rejectedQuantity      Int           @map("rejected_quantity")
+  acceptedQuantity      Int           @map("accepted_quantity")
+  availableForStitching Int           @map("available_for_stitching")
+  rejectReason          String?       @map("reject_reason")
+  batch                 CuttingBatch  @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  colour                CuttingColour @relation(fields: [colourId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lot                   ProductionLot @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([batchId, colourId, sizeLabel], map: "cutting_outputs_once")
+  @@index([lotId], map: "cutting_outputs_lot_idx")
+  @@map("cutting_outputs")
+}
+
+/// The cutting ledger. Append-only (trigger): kilograms moving STORE ⇄ CUTTING → CONSUMED / WASTAGE.
+model CuttingMovement {
+  id           String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seq          BigInt           @unique @default(autoincrement())
+  batchId      String           @map("batch_id") @db.Uuid
+  lotId        String           @map("lot_id") @db.Uuid
+  fabricId     String           @map("fabric_id") @db.Uuid
+  rollId       String           @map("roll_id") @db.Uuid
+  colour       String
+  thaan        String
+  movementDate DateTime         @map("movement_date") @db.Date
+  /// ISSUE | RETURN | CONSUME | WASTAGE (CHECK constraint)
+  type         String
+  fromState    String           @map("from_state")
+  toState      String           @map("to_state")
+  quantity     Decimal          @db.Decimal(18, 6)
+  unit         String           @default("KG")
+  /// AUTO_PALA_REMAINDER on wastage postings.
+  wastageType  String?          @map("wastage_type")
+  reversalOfId String?          @unique @map("reversal_of") @db.Uuid
+  reason       String?
+  createdById  String           @map("created_by") @db.Uuid
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  batch        CuttingBatch     @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lot          ProductionLot    @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  fabric       Fabric           @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  roll         CuttingRoll      @relation(fields: [rollId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy    User             @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversalOf   CuttingMovement? @relation("CuttingMovementReversal", fields: [reversalOfId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy   CuttingMovement? @relation("CuttingMovementReversal")
+
+  @@index([batchId, seq], map: "cutting_movements_batch_idx")
+  @@index([lotId, seq], map: "cutting_movements_lot_idx")
+  @@map("cutting_movements")
+}
+
+/// Manufacturing cost entries per lot, linked to their batch. Append-only (trigger).
+model LotCost {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seq          BigInt        @unique @default(autoincrement())
+  lotId        String        @map("lot_id") @db.Uuid
+  batchId      String        @map("batch_id") @db.Uuid
+  /// FABRIC_CONSUMED | FABRIC_WASTAGE | CUTTING_LABOUR (CHECK constraint)
+  kind         String
+  entryDate    DateTime      @map("entry_date") @db.Date
+  quantity     Decimal       @db.Decimal(18, 6)
+  rate         Decimal       @db.Decimal(14, 4)
+  amount       Decimal       @db.Decimal(14, 2)
+  reversalOfId String?       @unique @map("reversal_of") @db.Uuid
+  createdById  String        @map("created_by") @db.Uuid
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  lot          ProductionLot @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  batch        CuttingBatch  @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy    User          @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversalOf   LotCost?      @relation("LotCostReversal", fields: [reversalOfId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy   LotCost?      @relation("LotCostReversal")
+
+  @@unique([batchId, kind], map: "lot_costs_once_idx", where: raw("(reversal_of IS NULL)"))
+  @@index([lotId, seq], map: "lot_costs_lot_idx")
+  @@map("lot_costs")
 }

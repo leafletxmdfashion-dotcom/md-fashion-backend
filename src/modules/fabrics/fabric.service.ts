@@ -133,8 +133,6 @@ export const inwardService = {
         date: input.inwardDate,
         type: "PURCHASE_IN",
         quantity: input.quantity,
-        color: input.color,
-        rollRef: input.rollRef,
         inwardId: id,
         createdBy: actor.user.id,
       });
@@ -165,8 +163,6 @@ export const inwardService = {
         fabricId: inward.fabric.id,
         type: "PURCHASE_REVERSAL",
         quantity: inward.quantity,
-        color: inward.color,
-        rollRef: inward.rollRef,
         inwardId: id,
         reason,
         createdBy: actor.user.id,

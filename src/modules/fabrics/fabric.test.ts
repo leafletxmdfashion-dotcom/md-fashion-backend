@@ -142,7 +142,7 @@ describe("column filters, sorting and export", () => {
     const a = await createFabric(owner, { code: "FB-A", name: "Alpha Knit", lowStockThreshold: 10 });
     const b = await createFabric(owner, { code: "FB-B", name: "Beta Woven", unit: "METER" });
     const c = await createFabric(owner, { code: "FB-C", name: "Gamma", description: "=SUM(1)" });
-    await postInward(owner, a.id, 100, 10, { inwardDate: "2026-01-05", supplier: "Sunrise Knits", color: "Red" });
+    await postInward(owner, a.id, 100, 10, { inwardDate: "2026-01-05", supplier: "Sunrise Knits" });
     await postInward(owner, b.id, 40, 50, {
       inwardDate: "2026-02-10",
       supplier: "Nepal Fabrics",
@@ -173,7 +173,6 @@ describe("column filters, sorting and export", () => {
       "Sunrise Knits",
     ]);
     expect(await inwards("/api/v1/fabrics/inwards?amountMin=1500")).toEqual(["Nepal Fabrics"]);
-    expect(await inwards("/api/v1/fabrics/inwards?colorRoll=red")).toEqual(["Sunrise Knits"]);
 
     const ledger = (await owner.get("/api/v1/fabrics/movements?type=PURCHASE_IN&sort=qtyIn&dir=asc")).body.data;
     expect(ledger.movements.map((m: { qtyIn: number }) => m.qtyIn)).toEqual([5, 40, 100]);
@@ -208,11 +207,7 @@ describe("purchases and stock ledger", () => {
   it("derives balance, weighted rate and value from posted purchases", async () => {
     const { owner } = await setup();
     const fabric = await createFabric(owner);
-    const first = await postInward(owner, fabric.id, 100, 400, {
-      supplier: "Sunrise Knits",
-      color: "Red",
-      rollRef: "R-001",
-    });
+    const first = await postInward(owner, fabric.id, 100, 400, { supplier: "Sunrise Knits" });
     await postInward(owner, fabric.id, 50, 520);
     expect(first.amount).toBe(40_000);
 
@@ -220,7 +215,7 @@ describe("purchases and stock ledger", () => {
 
     const list = await owner.get("/api/v1/fabrics/inwards?search=sunrise");
     expect(list.body.data).toMatchObject({ total: 1, totalAmount: 40_000, totalQuantity: { KG: 100 } });
-    expect(list.body.data.inwards[0].color).toBe("Red");
+    expect(list.body.data.inwards[0]).not.toHaveProperty("color");
     expect((await owner.get("/api/v1/fabrics/inwards/suppliers")).body.data.suppliers).toEqual(["Sunrise Knits"]);
   });
 
@@ -359,9 +354,20 @@ describe("purchases and stock ledger", () => {
     );
   });
 
-  it("rejects colour or roll on a stock adjustment", async () => {
+  it("rejects colour or roll on purchases and adjustments", async () => {
     const { owner } = await setup();
     const fabric = await createFabric(owner);
+
+    const purchase = await owner.send("post", "/api/v1/fabrics/inwards", {
+      fabricId: fabric.id,
+      inwardDate: "2026-01-05",
+      quantity: 1,
+      rate: 1,
+      rollRef: "R-001",
+    });
+
+    expect(purchase.status).toBe(400);
+
     const res = await owner.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {
       direction: "IN",
       quantity: 1,
