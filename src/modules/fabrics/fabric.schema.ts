@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { columnQueryShape, type ColumnQuery } from "../../lib/list-query";
+import { columnQueryFields, type ColumnQuery } from "../../lib/list-query";
 import { FABRIC_COLUMNS, INWARD_COLUMNS, MOVEMENT_COLUMNS, MOVEMENT_TYPES } from "./fabric.columns";
 
 export { MOVEMENT_TYPES };
@@ -57,8 +57,6 @@ export const createInwardSchema = z.strictObject({
   rate: z.number({ error: "Enter a rate." }).min(0, "Rate cannot be negative.").max(99_999_999, "Rate is too large."),
   supplier: optionalText(100),
   invoiceRef: optionalText(50),
-  color: optionalText(50),
-  rollRef: optionalText(50),
   notes: optionalText(500),
 });
 
@@ -82,21 +80,21 @@ const search = { search: z.string().trim().max(100).optional() };
 export const fabricListQuerySchema = z.object({
   ...search,
   stock: z.enum(["low", "out"]).optional(),
-  ...columnQueryShape(FABRIC_COLUMNS),
+  ...columnQueryFields(FABRIC_COLUMNS),
   ...page,
 });
 
 export const inwardListQuerySchema = z.object({
   ...search,
   fabricId: z.uuid().optional(),
-  ...columnQueryShape(INWARD_COLUMNS),
+  ...columnQueryFields(INWARD_COLUMNS),
   ...page,
 });
 
 export const movementListQuerySchema = z.object({
   ...search,
   fabricId: z.uuid().optional(),
-  ...columnQueryShape(MOVEMENT_COLUMNS),
+  ...columnQueryFields(MOVEMENT_COLUMNS),
   ...page,
 });
 

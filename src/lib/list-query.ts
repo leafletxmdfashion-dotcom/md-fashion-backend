@@ -35,7 +35,7 @@ export type ColumnQuery = { sort?: string | undefined; dir: "asc" | "desc" } & R
 const MAX = 999_999_999_999;
 
 /** Zod shape for the filter and sort params a column set accepts. */
-export function columnQueryShape(columns: ColumnSpecs) {
+export function columnQueryFields(columns: ColumnSpecs) {
   const shape: Record<string, z.ZodType> = {};
   for (const [key, column] of Object.entries(columns)) {
     if (column.filterable === false) continue;

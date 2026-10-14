@@ -10,6 +10,7 @@ export default tseslint.config(
       ".outbox-e2e/**",
       "coverage/**",
       "src/generated/**",
+      "tools/**",
     ],
   },
   js.configs.recommended,

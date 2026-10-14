@@ -1,6 +1,7 @@
 import type { Request } from "express";
 import { ipKeyGenerator, rateLimit, type Options } from "express-rate-limit";
 
+import { env } from "../config/env";
 import { errors } from "./errors";
 import { normalizeEmail } from "./request";
 
@@ -36,7 +37,7 @@ function limiter(
 
 export function createRateLimiters() {
   return {
-    api: limiter({ windowMs: MINUTE, limit: 300 }),
+    api: limiter({ windowMs: MINUTE, limit: env.API_RATE_LIMIT_PER_MINUTE }),
     // Failed attempts only: credential stuffing from one address, and guessing against one account.
     loginByIp: limiter({ windowMs: 15 * MINUTE, limit: 20, skipSuccessfulRequests: true }),
     loginByAccount: limiter({

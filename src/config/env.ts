@@ -25,6 +25,9 @@ const envSchema = z
     SESSION_IDLE_TIMEOUT_MINUTES: z.coerce.number().int().min(5).max(1440).default(120),
     SESSION_ABSOLUTE_TIMEOUT_HOURS: z.coerce.number().int().min(1).max(720).default(12),
 
+    // General API throttle per client IP. The e2e suite raises it: every test shares one address.
+    API_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(10).max(100_000).default(300),
+
     MAIL_TRANSPORT: z.enum(["outbox", "resend"]).default("outbox"),
     MAIL_FROM: z.string().min(3).default("Garment Manager <no-reply@localhost>"),
     MAIL_OUTBOX_DIR: z.string().default(".outbox"),

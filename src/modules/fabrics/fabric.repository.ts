@@ -56,8 +56,6 @@ export interface InwardDto {
   amount: number;
   supplier: string | null;
   invoiceRef: string | null;
-  color: string | null;
-  rollRef: string | null;
   notes: string | null;
   createdBy: string | null;
   createdAt: Date;
@@ -72,8 +70,6 @@ export interface MovementDto {
   qtyIn: number;
   qtyOut: number;
   balance: number;
-  color: string | null;
-  rollRef: string | null;
   reason: string | null;
   inward: { id: string; number: number; invoiceRef: string | null; supplier: string | null } | null;
   createdBy: string | null;
@@ -129,7 +125,7 @@ export function inwardNumberOf(text: string): number | null {
 const INWARD_SELECT = Prisma.raw(`
   i.id, i.number, i.fabric_id, f.code AS fabric_code, f.name AS fabric_name, f.unit AS fabric_unit,
   i.inward_date::text AS inward_date, i.quantity::float8 AS quantity, i.rate::float8 AS rate, i.amount::float8 AS amount,
-  i.supplier, i.invoice_ref, i.color, i.roll_ref, i.notes, cu.name AS created_by_name, i.created_at,
+  i.supplier, i.invoice_ref, i.notes, cu.name AS created_by_name, i.created_at,
   i.reversed_at, ru.name AS reversed_by_name, i.reversal_reason`);
 
 const INWARD_JOINS = Prisma.raw(`
@@ -150,8 +146,6 @@ interface InwardRow {
   amount: number;
   supplier: string | null;
   invoice_ref: string | null;
-  color: string | null;
-  roll_ref: string | null;
   notes: string | null;
   created_by_name: string | null;
   created_at: Date;
@@ -171,8 +165,6 @@ function toInward(row: InwardRow): InwardDto {
     amount: row.amount,
     supplier: row.supplier,
     invoiceRef: row.invoice_ref,
-    color: row.color,
-    rollRef: row.roll_ref,
     notes: row.notes,
     createdBy: row.created_by_name,
     createdAt: row.created_at,
@@ -194,8 +186,6 @@ interface MovementRow {
   qty_in: number;
   qty_out: number;
   balance: number;
-  color: string | null;
-  roll_ref: string | null;
   reason: string | null;
   inward_id: string | null;
   inward_number: number | null;
@@ -214,8 +204,6 @@ function toMovement(row: MovementRow): MovementDto {
     qtyIn: row.qty_in,
     qtyOut: row.qty_out,
     balance: row.balance,
-    color: row.color,
-    rollRef: row.roll_ref,
     reason: row.reason,
     inward:
       row.inward_id && row.inward_number !== null
@@ -306,8 +294,6 @@ export const fabricRepository = {
       date?: string;
       type: MovementType;
       quantity: number;
-      color?: string | null;
-      rollRef?: string | null;
       inwardId?: string | null;
       reason?: string | null;
       createdBy: string;
@@ -317,10 +303,10 @@ export const fabricRepository = {
     // Raw so an undated movement takes the database's current_date.
     await db.$executeRaw`
       INSERT INTO fabric_movements
-        (fabric_id, movement_date, type, qty_in, qty_out, color, roll_ref, inward_id, reason, created_by)
+        (fabric_id, movement_date, type, qty_in, qty_out, inward_id, reason, created_by)
       VALUES (${movement.fabricId}::uuid, COALESCE(${movement.date ?? null}::date, current_date), ${movement.type},
-              ${isIn ? movement.quantity : 0}, ${isIn ? 0 : movement.quantity}, ${movement.color ?? null},
-              ${movement.rollRef ?? null}, ${movement.inwardId ?? null}::uuid, ${movement.reason ?? null},
+              ${isIn ? movement.quantity : 0}, ${isIn ? 0 : movement.quantity},
+              ${movement.inwardId ?? null}::uuid, ${movement.reason ?? null},
               ${movement.createdBy}::uuid)`;
   },
 
@@ -334,8 +320,7 @@ export const fabricRepository = {
     const clauses = columnFilters(MOVEMENT_COLUMNS, query);
     if (query.search) {
       const pattern = contains(query.search);
-      clauses.push(Prisma.sql`(f.search_text LIKE ${pattern} OR lower(COALESCE(m.reason, '')) LIKE ${pattern}
-        OR lower(COALESCE(m.color, '') || ' ' || COALESCE(m.roll_ref, '')) LIKE ${pattern})`);
+      clauses.push(Prisma.sql`(f.search_text LIKE ${pattern} OR lower(COALESCE(m.reason, '')) LIKE ${pattern})`);
     }
     if (query.fabricId) clauses.push(Prisma.sql`m.fabric_id = ${query.fabricId}::uuid`);
     const filter = where(clauses);
@@ -355,7 +340,7 @@ export const fabricRepository = {
                p.movement_date::text AS movement_date, p.type, p.qty_in::float8 AS qty_in, p.qty_out::float8 AS qty_out,
                (SELECT sum(b.qty_in - b.qty_out) FROM fabric_movements b
                  WHERE b.fabric_id = p.fabric_id AND (b.movement_date, b.seq) <= (p.movement_date, p.seq))::float8 AS balance,
-               p.color, p.roll_ref, p.reason, p.inward_id, i.number AS inward_number,
+               p.reason, p.inward_id, i.number AS inward_number,
                i.invoice_ref, i.supplier, p.created_by_name, p.created_at
         FROM page p
         LEFT JOIN fabric_inwards i ON i.id = p.inward_id
