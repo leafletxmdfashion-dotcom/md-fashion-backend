@@ -421,7 +421,6 @@ model CuttingBatch {
   sizes               CuttingSize[]
   colours             CuttingColour[]
   rolls               CuttingRoll[]
-  rejects             CuttingReject[]
   outputs             CuttingOutput[]
   movements           CuttingMovement[]
   costs               LotCost[]
@@ -453,7 +452,6 @@ model CuttingColour {
   name     String
   batch    CuttingBatch    @relation(fields: [batchId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   rolls    CuttingRoll[]
-  rejects  CuttingReject[]
   outputs  CuttingOutput[]
 
   @@map("cutting_colours")
@@ -485,19 +483,6 @@ model CuttingRoll {
   @@map("cutting_rolls")
 }
 
-model CuttingReject {
-  id        String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  batchId   String        @map("batch_id") @db.Uuid
-  colourId  String        @map("colour_id") @db.Uuid
-  sizeLabel String        @map("size_label")
-  quantity  Int
-  reason    String
-  batch     CuttingBatch  @relation(fields: [batchId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  colour    CuttingColour @relation(fields: [colourId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@map("cutting_rejects")
-}
-
 /// Size-wise cut output per colour, posted on finalize. Stitching draws down available_for_stitching.
 model CuttingOutput {
   id                    String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
@@ -508,10 +493,8 @@ model CuttingOutput {
   sizeLabel             String        @map("size_label")
   position              Int
   plannedQuantity       Int           @map("planned_quantity")
-  rejectedQuantity      Int           @map("rejected_quantity")
   acceptedQuantity      Int           @map("accepted_quantity")
   availableForStitching Int           @map("available_for_stitching")
-  rejectReason          String?       @map("reject_reason")
   batch                 CuttingBatch  @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   colour                CuttingColour @relation(fields: [colourId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   lot                   ProductionLot @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)

@@ -37,8 +37,8 @@ function roll(thaan: string, issuedKg: string, extra: Partial<RollInput> = {}): 
   return { thaan, issuedKg, returnedKg: "0", confirmedLayers: null, ...extra };
 }
 
-function colour(name: string, rolls: RollInput[], rejects: ColourInput["rejects"] = []): ColourInput {
-  return { name, rolls, rejects };
+function colour(name: string, rolls: RollInput[]): ColourInput {
+  return { name, rolls };
 }
 
 const kg = (micro: bigint) => formatKg(micro);
@@ -213,32 +213,45 @@ describe("validation", () => {
     expect(issuesFor([roll("A", "3")], "0")).toContain("marker.measuredPalaKg");
   });
 
-  it("blocks duplicate Thaan, fractional ratios and rejects beyond the cut", () => {
+  it("blocks duplicate Thaan and fractional ratios", () => {
     const result = calculateBatch(
       marker("2.130", { sizes: [{ label: "S", piecesPerPala: 1.5, pieceWeightG: null }] }),
-      [colour("Black", [roll("A", "3"), roll("a", "3")], [{ sizeLabel: "XL", quantity: 1, reason: "Torn" }])],
+      [colour("Black", [roll("A", "3"), roll("a", "3")])],
     );
 
-    expect(result.issues.map((issue) => issue.path)).toEqual([
-      "sizes.0.piecesPerPala",
-      "colours.0.rolls.1.thaan",
-      "colours.0.rejects.0.sizeLabel",
-    ]);
+    expect(result.issues.map((issue) => issue.path)).toEqual(["sizes.0.piecesPerPala", "colours.0.rolls.1.thaan"]);
   });
 
-  it("subtracts rejected pieces from the accepted output", () => {
-    const result = calculateBatch(marker("2.130"), [
-      colour("Black", [roll("A", "30.500")], [{ sizeLabel: "m", quantity: 1, reason: "Damaged" }]),
+  it("lets a size be left out of the marker with 0 pieces per Pala", () => {
+    const sizes = [
+      { label: "S", piecesPerPala: 3, pieceWeightG: null },
+      { label: "M", piecesPerPala: 0, pieceWeightG: null },
+      { label: "L", piecesPerPala: 0, pieceWeightG: null },
+    ];
+
+    const result = calculateBatch(marker("2.130", { sizes }), [colour("Black", [roll("A", "30.500")])]);
+
+    expect(result.issues).toEqual([]);
+    expect(result.marker.piecesPerPala).toBe(3);
+    expect(result.colours[0]!.sizes.map((size) => size.accepted)).toEqual([42, 0, 0]);
+    expect(result.totals).toMatchObject({ confirmedPala: 14, plannedPieces: 42, acceptedPieces: 42 });
+  });
+
+  it("needs at least one size with pieces, and no negative counts", () => {
+    const zero = [
+      { label: "S", piecesPerPala: 0, pieceWeightG: null },
+      { label: "M", piecesPerPala: 0, pieceWeightG: null },
+    ];
+
+    expect(calculateBatch(marker("2.130", { sizes: zero }), [colour("Black", [roll("A", "3")])]).issues).toEqual([
+      { path: "sizes", message: "At least one size needs pieces per Pala." },
     ]);
 
-    expect(result.colours[0]!.sizes[1]).toMatchObject({ planned: 28, rejected: 1, accepted: 27 });
-    expect(result.totals).toMatchObject({ plannedPieces: 56, acceptedPieces: 55 });
+    const negative = [{ label: "S", piecesPerPala: -1, pieceWeightG: null }];
 
-    const tooMany = calculateBatch(marker("2.130"), [
-      colour("Black", [roll("A", "3")], [{ sizeLabel: "M", quantity: 3, reason: "Damaged" }]),
+    expect(calculateBatch(marker("2.130", { sizes: negative }), [colour("Black", [roll("A", "3")])]).issues.map((issue) => issue.path)).toEqual([
+      "sizes.0.piecesPerPala",
     ]);
-
-    expect(tooMany.issues.map((issue) => issue.path)).toEqual(["colours.0.rejects.0.quantity"]);
   });
 });
 

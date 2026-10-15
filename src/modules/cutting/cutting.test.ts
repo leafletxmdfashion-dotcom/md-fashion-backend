@@ -62,7 +62,6 @@ interface ColourDraft {
   id?: string;
   name: string;
   rolls: RollDraft[];
-  rejects?: { sizeLabel: string; quantity: number; reason: string }[];
 }
 
 function draft(masterId: string | null, colours: ColourDraft[], palaKg = "2.130") {
@@ -287,27 +286,61 @@ describe("issue, returns and validation", () => {
     );
   });
 
-  it("7: colours keep separate size output and rejects reduce accepted pieces", async () => {
+  it("7: colours keep separate size output; a size with 0 pieces per Pala is left out", async () => {
     const { owner, fabricId, masterId } = await setup();
 
-    const { batch } = await newProduction(
-      owner,
-      fabricId,
-      draft(masterId, [
-        { name: "Black", rolls: [{ thaan: "TH-001", issuedKg: "30.5" }], rejects: [{ sizeLabel: "M", quantity: 1, reason: "Torn" }] },
-        { name: "Blue", rolls: [{ thaan: "TH-002", issuedKg: "15" }] },
-      ]),
-    );
+    const cutting = draft(masterId, [
+      { name: "Black", rolls: [{ thaan: "TH-001", issuedKg: "30.5" }] },
+      { name: "Blue", rolls: [{ thaan: "TH-002", issuedKg: "15" }] },
+    ]);
+
+    cutting.sizes = [
+      { label: "S", piecesPerPala: 1 },
+      { label: "M", piecesPerPala: 2 },
+      { label: "L", piecesPerPala: 0 },
+    ];
+
+    const { batch } = await newProduction(owner, fabricId, cutting);
 
     // SAFETY: finalize answers with the batch DTO; the assertions below fail if it did not.
     const posted = (await owner.send("post", `/api/v1/cutting-batches/${batch.id}/finalize`)).body.data.batch as Batch;
 
-    expect(posted.posted?.acceptedPieces).toBe(83);
-    expect(posted.outputs.filter((o) => o.colourName === "Blue").map((o) => o.accepted)).toEqual([7, 14, 7]);
-    expect(posted.outputs.find((o) => o.colourName === "Black" && o.sizeLabel === "M")).toMatchObject({
-      planned: 28,
-      accepted: 27,
+    // Black 14 Pala and Blue 7 Pala, at 3 pieces per Pala.
+    expect(posted.posted?.acceptedPieces).toBe(63);
+    expect(posted.outputs.filter((o) => o.colourName === "Blue").map((o) => o.accepted)).toEqual([7, 14, 0]);
+    expect(posted.outputs.find((o) => o.colourName === "Black" && o.sizeLabel === "M")).toMatchObject({ planned: 28, accepted: 28 });
+    expect(posted.outputs[0]).not.toHaveProperty("rejected");
+  });
+
+  it("refuses a ratio where every size is 0, and no longer takes rejected pieces", async () => {
+    const { owner, fabricId, masterId } = await setup();
+    const allZero = draft(masterId, [black("10")]);
+
+    allZero.sizes = allZero.sizes.map((size) => ({ ...size, piecesPerPala: 0 }));
+
+    const zero = await owner.send("post", "/api/v1/production-lots", {
+      lotNumber: "L-ZERO",
+      article: { name: "Polo T-Shirt" },
+      fabricId,
+      productionDate: today,
+      targetQuantity: 56,
+      cutting: allZero,
     });
+
+    expect(zero.status).toBe(400);
+    expect(zero.body.error.details).toHaveProperty(["cutting.sizes"]);
+
+    const withRejects = draft(masterId, [{ ...black("10"), rejects: [{ sizeLabel: "M", quantity: 1, reason: "Torn" }] } as ColourDraft]);
+    const res = await owner.send("post", "/api/v1/production-lots", {
+      lotNumber: "L-REJ",
+      article: { name: "Polo T-Shirt" },
+      fabricId,
+      productionDate: today,
+      targetQuantity: 56,
+      cutting: withRejects,
+    });
+
+    expect(res.status).toBe(400);
   });
 });
 
