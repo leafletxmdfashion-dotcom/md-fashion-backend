@@ -333,11 +333,6 @@ function toBatchDto(batch: BatchRecord, showCost: boolean) {
         consumedKg: dec(roll.consumedKg),
         wastageKg: dec(roll.wastageKg),
       })),
-      rejects: colour.rejects.map((reject) => ({
-        sizeLabel: reject.sizeLabel,
-        quantity: reject.quantity,
-        reason: reject.reason,
-      })),
     })),
     posted: posted
       ? {
@@ -358,10 +353,8 @@ function toBatchDto(batch: BatchRecord, showCost: boolean) {
       colourName: output.colourName,
       sizeLabel: output.sizeLabel,
       planned: output.plannedQuantity,
-      rejected: output.rejectedQuantity,
       accepted: output.acceptedQuantity,
       available: output.availableForStitching,
-      rejectReason: output.rejectReason,
     })),
     reversal: batch.reversedAt
       ? { at: batch.reversedAt, by: batch.reversedBy?.name ?? null, reason: batch.reversalReason }
@@ -417,9 +410,9 @@ async function lotDetail(id: string, showCost: boolean) {
 
   const [batches, outputs, [held], history, costs] = await Promise.all([
     listBatches({ lotId: id, page: 1, pageSize: 100, dir: "desc", sort: "number" }),
-    prisma.$queryRaw<{ colour: string; size: string; planned: number; rejected: number; accepted: number; available: number }[]>`
+    prisma.$queryRaw<{ colour: string; size: string; planned: number; accepted: number; available: number }[]>`
       SELECT o.colour_name AS colour, o.size_label AS size, sum(o.planned_quantity)::int AS planned,
-             sum(o.rejected_quantity)::int AS rejected, sum(o.accepted_quantity)::int AS accepted,
+             sum(o.accepted_quantity)::int AS accepted,
              sum(o.available_for_stitching)::int AS available
       FROM cutting_outputs o JOIN cutting_batches b ON b.id = o.batch_id AND b.status = 'FINALIZED'
       WHERE o.lot_id = ${id}::uuid
@@ -461,7 +454,6 @@ async function lotDetail(id: string, showCost: boolean) {
     output: {
       rows: outputs,
       planned: outputs.reduce((sum, row) => sum + row.planned, 0),
-      rejected: outputs.reduce((sum, row) => sum + row.rejected, 0),
       accepted,
       available: outputs.reduce((sum, row) => sum + row.available, 0),
     },
@@ -870,10 +862,8 @@ export const cuttingService = {
             sizeLabel: size.label,
             position,
             plannedQuantity: size.planned,
-            rejectedQuantity: size.rejected,
             acceptedQuantity: size.accepted,
             availableForStitching: size.accepted,
-            rejectReason: size.rejectReason,
           })),
         ),
       });

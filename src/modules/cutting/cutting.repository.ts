@@ -29,7 +29,7 @@ const BATCH_INCLUDE = {
   sizes: { orderBy: { position: "asc" } },
   colours: {
     orderBy: { position: "asc" },
-    include: { rolls: { orderBy: { position: "asc" } }, rejects: true },
+    include: { rolls: { orderBy: { position: "asc" } } },
   },
   outputs: { orderBy: [{ colourName: "asc" }, { position: "asc" }] },
   createdBy: { select: { name: true } },
@@ -74,11 +74,6 @@ export function calcInputsOf(batch: BatchRecord): CalcInputs {
         returnedKg: roll.returnedKg.toFixed(),
         confirmedLayers: roll.confirmedLayers,
       })),
-      rejects: colour.rejects.map((reject) => ({
-        sizeLabel: reject.sizeLabel,
-        quantity: reject.quantity,
-        reason: reject.reason,
-      })),
     })),
   };
 }
@@ -95,7 +90,6 @@ export function draftInputsOf(draft: CuttingDraft): CalcInputs {
         returnedKg: roll.returnedKg,
         confirmedLayers: roll.confirmedLayers,
       })),
-      rejects: colour.rejects,
     })),
   };
 }
@@ -155,7 +149,6 @@ export async function writeDraft(tx: Prisma.TransactionClient, batch: BatchRecor
   // per-batch unique names free for the rewritten rows.
   if (batch) {
     await tx.cuttingSize.deleteMany({ where: { batchId } });
-    await tx.cuttingReject.deleteMany({ where: { batchId } });
     await tx.cuttingRoll.deleteMany({ where: { batchId, status: "DRAFT" } });
     await tx.cuttingColour.deleteMany({ where: { batchId, id: { notIn: [...keptColours] } } });
   }
@@ -227,10 +220,6 @@ export async function writeDraft(tx: Prisma.TransactionClient, batch: BatchRecor
       })),
     });
   }
-
-  const rejects = entries.flatMap(({ colour, id: colourId }) => colour.rejects.map((reject) => ({ batchId, colourId, ...reject })));
-
-  if (rejects.length > 0) await tx.cuttingReject.createMany({ data: rejects });
 }
 
 /** Kilograms held by cutting (issued, not yet consumed, wasted or returned), per filter. */

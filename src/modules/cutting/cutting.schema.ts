@@ -65,7 +65,7 @@ const label = (max: number, what: string) =>
 
 const sizeSchema = z.strictObject({
   label: label(20, "size"),
-  piecesPerPala: z.number({ error: "Enter pieces per Pala." }).int("Use whole pieces.").min(1).max(999),
+  piecesPerPala: z.number({ error: "Enter pieces per Pala." }).int("Use whole pieces.").min(0).max(999),
   pieceWeightG: optionalDecimal(3, 100_000, "the weight in grams"),
 });
 
@@ -95,7 +95,14 @@ const sizesSchema = z
   .array(sizeSchema)
   .min(1, "Add at least one size.")
   .max(30, "Use at most 30 sizes.")
-  .superRefine((sizes, ctx) => uniqueBy(sizes, (size) => size.label, (index) => [index, "label"], ctx));
+  .superRefine((sizes, ctx) => {
+    uniqueBy(sizes, (size) => size.label, (index) => [index, "label"], ctx);
+
+    // Single sizes may be 0 (left out of this marker), but the Pala must yield something.
+    if (sizes.length > 0 && sizes.every((size) => size.piecesPerPala === 0)) {
+      ctx.addIssue({ code: "custom", message: "At least one size needs pieces per Pala." });
+    }
+  });
 
 // Fabric store quantities are kept to the gram, so issued and returned weights are too.
 const rollSchema = z.strictObject({
@@ -106,18 +113,11 @@ const rollSchema = z.strictObject({
   confirmedLayers: z.number().int("Use a whole number.").min(0).max(100_000).nullable().default(null),
 });
 
-const rejectSchema = z.strictObject({
-  sizeLabel: label(20, "size"),
-  quantity: z.number().int("Use whole pieces.").min(1, "Enter at least one piece."),
-  reason: z.string().trim().min(3, "Give a reason (at least 3 characters).").max(200),
-});
-
 const colourSchema = z.strictObject({
   id: z.uuid().optional(),
   name: label(50, "colour"),
   // A draft may name a colour before its Thaan are entered; finalizing requires them.
   rolls: z.array(rollSchema).max(100, "Use at most 100 Thaan per colour."),
-  rejects: z.array(rejectSchema).max(30).default([]),
 });
 
 export const cuttingDraftSchema = z
@@ -139,9 +139,6 @@ export const cuttingDraftSchema = z
     );
 
     uniqueBy(rolls, (roll) => roll.thaan, (index) => rolls[index]!.path, ctx);
-    draft.colours.forEach((colour, colourIndex) =>
-      uniqueBy(colour.rejects, (reject) => reject.sizeLabel, (index) => ["colours", colourIndex, "rejects", index, "sizeLabel"], ctx),
-    );
   });
 
 /** What an article remembers as its cutting defaults. */

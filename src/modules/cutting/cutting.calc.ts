@@ -48,16 +48,9 @@ export interface RollInput {
   confirmedLayers: number | null;
 }
 
-export interface RejectInput {
-  sizeLabel: string;
-  quantity: number;
-  reason: string;
-}
-
 export interface ColourInput {
   name: string;
   rolls: RollInput[];
-  rejects: RejectInput[];
 }
 
 export interface MarkerResult {
@@ -90,9 +83,7 @@ export interface RollResult {
 export interface SizeOutput {
   label: string;
   planned: number;
-  rejected: number;
   accepted: number;
-  rejectReason: string | null;
 }
 
 export interface Totals {
@@ -211,8 +202,9 @@ function calculateMarker(input: MarkerInput, issues: Issue[]): MarkerResult {
 
     seen.add(key);
 
-    if (!Number.isInteger(size.piecesPerPala) || size.piecesPerPala < 1 || size.piecesPerPala > 999) {
-      issues.push({ path: `sizes.${index}.piecesPerPala`, message: "Use a whole number from 1 to 999." });
+    // Zero is allowed: a marker may leave some sizes out entirely.
+    if (!Number.isInteger(size.piecesPerPala) || size.piecesPerPala < 0 || size.piecesPerPala > 999) {
+      issues.push({ path: `sizes.${index}.piecesPerPala`, message: "Use a whole number from 0 to 999." });
     } else {
       piecesPerPala += size.piecesPerPala;
     }
@@ -227,6 +219,10 @@ function calculateMarker(input: MarkerInput, issues: Issue[]): MarkerResult {
     const count = Number.isInteger(size.piecesPerPala) ? BigInt(size.piecesPerPala) : 0n;
 
     netPalaKg = weight && netPalaKg !== null ? netPalaKg + weight * count : null;
+  }
+
+  if (input.sizes.length > 0 && input.sizes.every((size) => size.piecesPerPala === 0)) {
+    issues.push({ path: "sizes", message: "At least one size needs pieces per Pala." });
   }
 
   if (input.sizes.length === 0) netPalaKg = null;
@@ -337,8 +333,7 @@ function addTotals(into: Totals, add: Totals): void {
 
 /**
  * The whole batch: each roll on its own (remainders are never pooled across
- * rolls), then per colour, size-wise output = colour Pala × size ratio, less
- * rejected pieces.
+ * rolls), then per colour, size-wise output = colour Pala × size ratio.
  */
 export function calculateBatch(markerInput: MarkerInput, colourInputs: ColourInput[]): BatchResult {
   const issues: Issue[] = [];
@@ -395,45 +390,10 @@ export function calculateBatch(markerInput: MarkerInput, colourInputs: ColourInp
       return result;
     });
 
-    const rejects = new Map<string, { input: RejectInput; index: number }>();
-
-    colour.rejects.forEach((reject, index) => {
-      const key = reject.sizeLabel.trim().toLowerCase();
-      const known = markerInput.sizes.some((size) => size.label.trim().toLowerCase() === key);
-
-      if (!known) issues.push({ path: `${path}.rejects.${index}.sizeLabel`, message: "Choose a size from the ratio." });
-      else if (rejects.has(key)) issues.push({ path: `${path}.rejects.${index}.sizeLabel`, message: "This size is listed twice." });
-      else rejects.set(key, { input: reject, index });
-
-      if (!Number.isInteger(reject.quantity) || reject.quantity < 1) {
-        issues.push({ path: `${path}.rejects.${index}.quantity`, message: "Use a whole number of pieces." });
-      }
-
-      if (reject.reason.trim().length < 3) {
-        issues.push({ path: `${path}.rejects.${index}.reason`, message: "Give a reason (at least 3 characters)." });
-      }
-    });
-
     const sizes = markerInput.sizes.map((size): SizeOutput => {
       const planned = colourTotals.confirmedPala * (Number.isInteger(size.piecesPerPala) ? size.piecesPerPala : 0);
-      const reject = rejects.get(size.label.trim().toLowerCase());
-      let rejected = reject && Number.isInteger(reject.input.quantity) && reject.input.quantity > 0 ? reject.input.quantity : 0;
 
-      if (reject && rejected > planned) {
-        issues.push({
-          path: `${path}.rejects.${reject.index}.quantity`,
-          message: `Only ${planned} ${size.label} pieces are cut in ${name || "this colour"}.`,
-        });
-        rejected = planned;
-      }
-
-      return {
-        label: size.label.trim(),
-        planned,
-        rejected,
-        accepted: planned - rejected,
-        rejectReason: reject ? reject.input.reason.trim() : null,
-      };
+      return { label: size.label.trim(), planned, accepted: planned };
     });
 
     colourTotals.plannedPieces = sizes.reduce((sum, size) => sum + size.planned, 0);
