@@ -40,6 +40,7 @@ export const userService = {
     await transaction(async (tx) => {
       await lockManageableTarget(tx, actor, userId);
       await userRepository.updateName(tx, userId, input.name);
+      sessionService.forgetCached();
       await recordAudit(tx, {
         type: "USER_UPDATED",
         actorUserId: actor.user.id,
@@ -62,6 +63,7 @@ export const userService = {
       if (!isOwner(role)) await assertNotLastOwner(tx, target);
 
       await userRepository.updateRole(tx, userId, role.id);
+      sessionService.forgetCached();
       await recordAudit(tx, {
         type: "ROLE_CHANGED",
         actorUserId: actor.user.id,

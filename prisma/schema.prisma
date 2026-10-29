@@ -29,7 +29,7 @@ model Role {
   id          String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   key         String           @unique
   name        String
-  rank        Int              @unique
+  rank        Int
   createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
   permissions RolePermission[]
   users       User[]
@@ -47,43 +47,48 @@ model RolePermission {
 }
 
 model User {
-  id                  String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  email               String               @unique
-  name                String
-  passwordHash        String?              @map("password_hash")
-  status              UserStatus           @default(INVITED)
-  roleId              String               @map("role_id") @db.Uuid
-  failedLoginCount    Int                  @default(0) @map("failed_login_count")
-  lastFailedLoginAt   DateTime?            @map("last_failed_login_at") @db.Timestamptz(6)
-  lockedUntil         DateTime?            @map("locked_until") @db.Timestamptz(6)
-  lastLoginAt         DateTime?            @map("last_login_at") @db.Timestamptz(6)
-  passwordChangedAt   DateTime?            @map("password_changed_at") @db.Timestamptz(6)
-  createdById         String?              @map("created_by") @db.Uuid
-  createdAt           DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt           DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  role                Role                 @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  createdBy           User?                @relation("UserCreatedBy", fields: [createdById], references: [id], onUpdate: NoAction)
-  createdUsers        User[]               @relation("UserCreatedBy")
-  sessions            Session[]
-  passwordResets      PasswordResetToken[]
-  invitations         Invitation[]         @relation("InvitationUser")
-  sentInvitations     Invitation[]         @relation("InvitationInvitedBy")
-  auditEventsActed    AuditEvent[]         @relation("AuditActor")
-  auditEventsTargeted AuditEvent[]         @relation("AuditTarget")
-  fabricsCreated      Fabric[]
-  inwardsCreated      FabricInward[]       @relation("InwardCreatedBy")
-  inwardsReversed     FabricInward[]       @relation("InwardReversedBy")
-  movementsCreated    FabricMovement[]
-  karigarsCreated     Karigar[]
-  karigarEntries      KarigarLedgerEntry[]
-  articlesCreated     Article[]
-  sizeTemplates       SizeTemplate[]
-  lotsCreated         ProductionLot[]
-  batchesCreated      CuttingBatch[]       @relation("BatchCreatedBy")
-  batchesFinalized    CuttingBatch[]       @relation("BatchFinalizedBy")
-  batchesReversed     CuttingBatch[]       @relation("BatchReversedBy")
-  cuttingMovements    CuttingMovement[]
-  lotCosts            LotCost[]
+  id                   String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email                String               @unique
+  name                 String
+  passwordHash         String?              @map("password_hash")
+  status               UserStatus           @default(INVITED)
+  roleId               String               @map("role_id") @db.Uuid
+  failedLoginCount     Int                  @default(0) @map("failed_login_count")
+  lastFailedLoginAt    DateTime?            @map("last_failed_login_at") @db.Timestamptz(6)
+  lockedUntil          DateTime?            @map("locked_until") @db.Timestamptz(6)
+  lastLoginAt          DateTime?            @map("last_login_at") @db.Timestamptz(6)
+  passwordChangedAt    DateTime?            @map("password_changed_at") @db.Timestamptz(6)
+  createdById          String?              @map("created_by") @db.Uuid
+  createdAt            DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  role                 Role                 @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy            User?                @relation("UserCreatedBy", fields: [createdById], references: [id], onUpdate: NoAction)
+  createdUsers         User[]               @relation("UserCreatedBy")
+  sessions             Session[]
+  passwordResets       PasswordResetToken[]
+  invitations          Invitation[]         @relation("InvitationUser")
+  sentInvitations      Invitation[]         @relation("InvitationInvitedBy")
+  auditEventsActed     AuditEvent[]         @relation("AuditActor")
+  auditEventsTargeted  AuditEvent[]         @relation("AuditTarget")
+  fabricsCreated       Fabric[]
+  inwardsCreated       FabricInward[]       @relation("InwardCreatedBy")
+  inwardsReversed      FabricInward[]       @relation("InwardReversedBy")
+  movementsCreated     FabricMovement[]
+  karigarsCreated      Karigar[]
+  karigarEntries       KarigarLedgerEntry[]
+  articlesCreated      Article[]
+  lotsCreated          ProductionLot[]
+  batchesCreated       CuttingBatch[]       @relation("BatchCreatedBy")
+  batchesFinalized     CuttingBatch[]       @relation("BatchFinalizedBy")
+  batchesReversed      CuttingBatch[]       @relation("BatchReversedBy")
+  cuttingMovements     CuttingMovement[]
+  lotCosts             LotCost[]
+  jogadiTeamsCreated   JogadiTeam[]
+  stitchingIssues      StitchingIssue[]     @relation("IssueCreatedBy")
+  stitchingIssuesRev   StitchingIssue[]     @relation("IssueReversedBy")
+  stitchingReceipts    StitchingReceipt[]   @relation("ReceiptCreatedBy")
+  stitchingReceiptsRev StitchingReceipt[]   @relation("ReceiptReversedBy")
+  reworkResolutions    ReworkResolution[]
 
   @@index([roleId, status], map: "users_role_status_idx")
   @@map("users")
@@ -157,7 +162,8 @@ model AuditEvent {
 
 model Fabric {
   id                String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  code              String            @unique
+  /// FAB-0001… from next_fabric_code(); the name is unique ignoring case (fabrics_name_key).
+  code              String            @unique @default(dbgenerated("next_fabric_code()"))
   name              String
   /// KG | METER (CHECK constraint)
   unit              String
@@ -254,25 +260,28 @@ model FabricMovement {
 
 /// A worker. Pay mode decides what a finalized cutting job earns them.
 model Karigar {
-  id          String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  number      Int                  @unique @default(autoincrement())
-  name        String
-  phone       String?
+  id                String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number            Int                    @unique @default(autoincrement())
+  name              String
+  phone             String?
   /// CUTTING_MASTER | TAILOR | HELPER | OTHER (CHECK constraint)
-  category    String
+  category          String
   /// PER_PIECE | PER_PALA | PER_KG | FIXED_JOB | SALARY (CHECK constraint)
-  payMode     String               @map("pay_mode")
-  payRate     Decimal              @default(0) @map("pay_rate") @db.Decimal(12, 2)
-  active      Boolean              @default(true)
-  notes       String?
+  payMode           String                 @map("pay_mode")
+  payRate           Decimal                @default(0) @map("pay_rate") @db.Decimal(12, 2)
+  active            Boolean                @default(true)
+  notes             String?
   /// Generated: lower(name, phone), trigram-indexed for search.
-  searchText  String?              @default(dbgenerated("lower(((name || ' '::text) || COALESCE(phone, ''::text)))")) @map("search_text")
-  createdById String               @map("created_by") @db.Uuid
-  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  createdBy   User                 @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  ledger      KarigarLedgerEntry[]
-  batches     CuttingBatch[]
+  searchText        String?                @default(dbgenerated("lower(((name || ' '::text) || COALESCE(phone, ''::text)))")) @map("search_text")
+  createdById       String                 @map("created_by") @db.Uuid
+  createdAt         DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime               @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdBy         User                   @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  ledger            KarigarLedgerEntry[]
+  batches           CuttingBatch[]
+  jogadiMemberships JogadiMember[]
+  issueMemberships  StitchingIssueMember[]
+  reworkAssigned    ReworkItem[]
 
   @@index([searchText(ops: raw("gin_trgm_ops"))], map: "karigars_search_idx", type: Gin)
   @@map("karigars")
@@ -290,7 +299,7 @@ model KarigarLedgerEntry {
   quantity    Decimal  @db.Decimal(18, 6)
   rate        Decimal  @db.Decimal(12, 2)
   amount      Decimal  @db.Decimal(14, 2)
-  /// CUTTING (CHECK constraint)
+  /// CUTTING | STITCHING | REWORK (CHECK constraint)
   sourceType  String   @map("source_type")
   sourceId    String   @map("source_id") @db.Uuid
   description String
@@ -299,7 +308,7 @@ model KarigarLedgerEntry {
   karigar     Karigar  @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   createdBy   User     @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
-  @@unique([sourceType, sourceId, type], map: "karigar_ledger_once")
+  @@unique([sourceType, sourceId, karigarId, type], map: "karigar_ledger_once")
   @@index([karigarId, entryDate], map: "karigar_ledger_karigar_idx")
   @@map("karigar_ledger")
 }
@@ -328,48 +337,37 @@ model Article {
   @@map("articles")
 }
 
-model SizeTemplate {
-  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name        String
-  /// Generated: lower(btrim(name)); unique.
-  nameKey     String?  @unique(map: "size_templates_name_key_unique") @default(dbgenerated("lower(btrim(name))")) @map("name_key")
-  sizes       String[]
-  createdById String   @map("created_by") @db.Uuid
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  createdBy   User     @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
-
-  @@map("size_templates")
-}
-
 /// One article cut from one fabric, under an operator-typed lot number. Article code and name are snapshots.
 model ProductionLot {
-  id             String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id                String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   /// Typed by the operator; unique ignoring case and surrounding spaces (lot_key).
-  lotNumber      String            @map("lot_number")
+  lotNumber         String             @map("lot_number")
   /// Generated: lower(btrim(lot_number)); unique.
-  lotKey         String?           @unique(map: "production_lots_lot_key_unique") @default(dbgenerated("lower(btrim(lot_number))")) @map("lot_key")
-  articleId      String            @map("article_id") @db.Uuid
-  articleCode    String            @map("article_code")
-  articleName    String            @map("article_name")
-  fabricId       String            @map("fabric_id") @db.Uuid
-  productionDate DateTime          @map("production_date") @db.Date
-  targetQuantity Int?              @map("target_quantity")
+  lotKey            String?            @unique(map: "production_lots_lot_key_unique") @default(dbgenerated("lower(btrim(lot_number))")) @map("lot_key")
+  articleId         String             @map("article_id") @db.Uuid
+  articleCode       String             @map("article_code")
+  articleName       String             @map("article_name")
+  fabricId          String             @map("fabric_id") @db.Uuid
+  productionDate    DateTime           @map("production_date") @db.Date
+  targetQuantity    Int?               @map("target_quantity")
   /// DRAFT | ACTIVE | COMPLETED | CANCELLED (CHECK constraint)
-  status         String            @default("DRAFT")
-  notes          String?
+  status            String             @default("DRAFT")
+  notes             String?
   /// Generated: lower(lot number, article code and name), trigram-indexed for search.
-  searchText     String?           @default(dbgenerated("lower(((((lot_number || ' '::text) || article_code) || ' '::text) || article_name))")) @map("search_text")
-  createdById    String            @map("created_by") @db.Uuid
-  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt      DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  article        Article           @relation(fields: [articleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  fabric         Fabric            @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  createdBy      User              @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  batches        CuttingBatch[]
-  movements      CuttingMovement[]
-  outputs        CuttingOutput[]
-  costs          LotCost[]
+  searchText        String?            @default(dbgenerated("lower(((((lot_number || ' '::text) || article_code) || ' '::text) || article_name))")) @map("search_text")
+  createdById       String             @map("created_by") @db.Uuid
+  createdAt         DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  article           Article            @relation(fields: [articleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  fabric            Fabric             @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy         User               @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  batches           CuttingBatch[]
+  movements         CuttingMovement[]
+  outputs           CuttingOutput[]
+  costs             LotCost[]
+  stitchingIssues   StitchingIssue[]
+  stitchingReceipts StitchingReceipt[]
+  reworkItems       ReworkItem[]
 
   @@index([productionDate(sort: Desc), createdAt(sort: Desc)], map: "production_lots_date_idx")
   @@index([searchText(ops: raw("gin_trgm_ops"))], map: "production_lots_search_idx", type: Gin)
@@ -465,8 +463,11 @@ model CuttingRoll {
   position        Int
   thaan           String
   issuedKg        Decimal           @map("issued_kg") @db.Decimal(18, 6)
-  returnedKg      Decimal           @default(0) @map("returned_kg") @db.Decimal(18, 6)
+  /// Null until entered or posted: finalize stores the worked-out return.
+  returnedKg      Decimal?          @map("returned_kg") @db.Decimal(18, 6)
   confirmedLayers Int?              @map("confirmed_layers")
+  /// Optional: why the Pala entered differ from the weight estimate (≤ 200 chars).
+  note            String?
   /// DRAFT | ISSUED | FINALIZED | REVERSED (CHECK constraint)
   status          String            @default("DRAFT")
   fabricRate      Decimal?          @map("fabric_rate") @db.Decimal(14, 4)
@@ -545,8 +546,9 @@ model LotCost {
   id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   seq          BigInt        @unique @default(autoincrement())
   lotId        String        @map("lot_id") @db.Uuid
-  batchId      String        @map("batch_id") @db.Uuid
-  /// FABRIC_CONSUMED | FABRIC_WASTAGE | CUTTING_LABOUR (CHECK constraint)
+  /// Null for stitching labour, whose source is a receipt or rework resolution.
+  batchId      String?       @map("batch_id") @db.Uuid
+  /// FABRIC_CONSUMED | FABRIC_WASTAGE | CUTTING_LABOUR | STITCHING_LABOUR (CHECK constraint)
   kind         String
   entryDate    DateTime      @map("entry_date") @db.Date
   quantity     Decimal       @db.Decimal(18, 6)
@@ -556,12 +558,209 @@ model LotCost {
   createdById  String        @map("created_by") @db.Uuid
   createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
   lot          ProductionLot @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  batch        CuttingBatch  @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  /// The document that caused the cost: cutting batch, stitching receipt or rework resolution.
+  sourceId     String        @map("source_id") @db.Uuid
+  batch        CuttingBatch? @relation(fields: [batchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   createdBy    User          @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversalOf   LotCost?      @relation("LotCostReversal", fields: [reversalOfId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversedBy   LotCost?      @relation("LotCostReversal")
 
-  @@unique([batchId, kind], map: "lot_costs_once_idx", where: raw("(reversal_of IS NULL)"))
+  @@unique([sourceId, kind], map: "lot_costs_once_idx", where: raw("(reversal_of IS NULL)"))
   @@index([lotId, seq], map: "lot_costs_lot_idx")
   @@map("lot_costs")
+}
+
+/// A Jogadi: a stitching team. Code JG-001… is generated. Name unique ignoring case (expression index).
+model JogadiTeam {
+  id          String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number      Int              @unique @default(autoincrement())
+  /// Generated: 'JG-' || lpad(number, 3).
+  code        String?          @default(dbgenerated("('JG-'::text || lpad((number)::text, 3, '0'::text))"))
+  name        String
+  active      Boolean          @default(true)
+  notes       String?
+  createdById String           @map("created_by") @db.Uuid
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdBy   User             @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  members     JogadiMember[]
+  issues      StitchingIssue[]
+
+  @@map("jogadi_teams")
+}
+
+/// Membership history: leaving sets leftAt. sharePercent is the default earning split.
+model JogadiMember {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  teamId       String     @map("team_id") @db.Uuid
+  karigarId    String     @map("karigar_id") @db.Uuid
+  sharePercent Decimal?   @map("share_percent") @db.Decimal(5, 2)
+  joinedAt     DateTime   @default(now()) @map("joined_at") @db.Timestamptz(6)
+  leftAt       DateTime?  @map("left_at") @db.Timestamptz(6)
+  team         JogadiTeam @relation(fields: [teamId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  karigar      Karigar    @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([teamId, karigarId], map: "jogadi_members_current_idx", where: raw("(left_at IS NULL)"))
+  @@index([karigarId], map: "jogadi_members_karigar_idx", where: raw("(left_at IS NULL)"))
+  @@map("jogadi_members")
+}
+
+/// Cut pieces issued to a Jogadi for one operation. POSTED | REVERSED (CHECK constraint).
+model StitchingIssue {
+  id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number         Int                    @unique @default(autoincrement())
+  lotId          String                 @map("lot_id") @db.Uuid
+  teamId         String                 @map("team_id") @db.Uuid
+  teamName       String                 @map("team_name")
+  operation      String
+  rate           Decimal                @db.Decimal(12, 2)
+  /// EQUAL | PERCENT (CHECK constraint)
+  splitMethod    String                 @map("split_method")
+  issueDate      DateTime               @map("issue_date") @db.Date
+  notes          String?
+  status         String                 @default("POSTED")
+  reversedAt     DateTime?              @map("reversed_at") @db.Timestamptz(6)
+  reversedById   String?                @map("reversed_by") @db.Uuid
+  reversalReason String?                @map("reversal_reason")
+  createdById    String                 @map("created_by") @db.Uuid
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  lot            ProductionLot          @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  team           JogadiTeam             @relation(fields: [teamId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy      User                   @relation("IssueCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy     User?                  @relation("IssueReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lines          StitchingIssueLine[]
+  members        StitchingIssueMember[]
+  receipts       StitchingReceipt[]
+  reworkItems    ReworkItem[]
+
+  @@index([issueDate(sort: Desc), number(sort: Desc)], map: "stitching_issues_date_idx")
+  @@index([lotId], map: "stitching_issues_lot_idx")
+  @@index([teamId], map: "stitching_issues_team_idx")
+  @@map("stitching_issues")
+}
+
+model StitchingIssueLine {
+  id           String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  issueId      String                 @map("issue_id") @db.Uuid
+  colour       String
+  sizeLabel    String                 @map("size_label")
+  position     Int
+  quantity     Int
+  /// Maintained by receipts and their reversals; CHECK keeps it within quantity.
+  received     Int                    @default(0)
+  issue        StitchingIssue         @relation(fields: [issueId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  receiptLines StitchingReceiptLine[]
+
+  @@unique([issueId, colour, sizeLabel], map: "stitching_issue_lines_once")
+  @@map("stitching_issue_lines")
+}
+
+/// The team as it was when the work was issued; earnings are split over these people.
+model StitchingIssueMember {
+  issueId      String         @map("issue_id") @db.Uuid
+  karigarId    String         @map("karigar_id") @db.Uuid
+  karigarName  String         @map("karigar_name")
+  sharePercent Decimal?       @map("share_percent") @db.Decimal(5, 2)
+  issue        StitchingIssue @relation(fields: [issueId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  karigar      Karigar        @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@id([issueId, karigarId])
+  @@map("stitching_issue_members")
+}
+
+/// Stitched pieces received back: Good, Rework and Reject. POSTED | REVERSED (CHECK constraint).
+model StitchingReceipt {
+  id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number         Int                    @unique @default(autoincrement())
+  issueId        String                 @map("issue_id") @db.Uuid
+  lotId          String                 @map("lot_id") @db.Uuid
+  receiptDate    DateTime               @map("receipt_date") @db.Date
+  /// EQUAL | PERCENT | AMOUNT (CHECK constraint)
+  splitMethod    String                 @map("split_method")
+  good           Int
+  earning        Decimal                @db.Decimal(14, 2)
+  notes          String?
+  status         String                 @default("POSTED")
+  reversedAt     DateTime?              @map("reversed_at") @db.Timestamptz(6)
+  reversedById   String?                @map("reversed_by") @db.Uuid
+  reversalReason String?                @map("reversal_reason")
+  createdById    String                 @map("created_by") @db.Uuid
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  issue          StitchingIssue         @relation(fields: [issueId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lot            ProductionLot          @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy      User                   @relation("ReceiptCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy     User?                  @relation("ReceiptReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lines          StitchingReceiptLine[]
+  reworkItems    ReworkItem[]
+
+  @@index([issueId], map: "stitching_receipts_issue_idx")
+  @@index([lotId], map: "stitching_receipts_lot_idx")
+  @@map("stitching_receipts")
+}
+
+/// CHECK: received = good + rework + reject; a reject needs a reason.
+model StitchingReceiptLine {
+  id           String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  receiptId    String             @map("receipt_id") @db.Uuid
+  issueLineId  String             @map("issue_line_id") @db.Uuid
+  colour       String
+  sizeLabel    String             @map("size_label")
+  received     Int
+  good         Int
+  rework       Int
+  reject       Int
+  rejectReason String?            @map("reject_reason")
+  receipt      StitchingReceipt   @relation(fields: [receiptId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  issueLine    StitchingIssueLine @relation(fields: [issueLineId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reworkItem   ReworkItem?
+
+  @@unique([receiptId, issueLineId], map: "stitching_receipt_lines_once")
+  @@map("stitching_receipt_lines")
+}
+
+/// Rework from one receipt line. PENDING | ASSIGNED | IN_PROGRESS | COMPLETED | FAILED | CANCELLED (CHECK constraint).
+model ReworkItem {
+  id            String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number        Int                  @unique @default(autoincrement())
+  receiptLineId String               @unique @map("receipt_line_id") @db.Uuid
+  receiptId     String               @map("receipt_id") @db.Uuid
+  issueId       String               @map("issue_id") @db.Uuid
+  lotId         String               @map("lot_id") @db.Uuid
+  colour        String
+  sizeLabel     String               @map("size_label")
+  quantity      Int
+  recovered     Int                  @default(0)
+  failed        Int                  @default(0)
+  status        String               @default("PENDING")
+  assignedToId  String?              @map("assigned_to") @db.Uuid
+  createdAt     DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  receiptLine   StitchingReceiptLine @relation(fields: [receiptLineId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  receipt       StitchingReceipt     @relation(fields: [receiptId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  issue         StitchingIssue       @relation(fields: [issueId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lot           ProductionLot        @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  assignedTo    Karigar?             @relation(fields: [assignedToId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  resolutions   ReworkResolution[]
+
+  @@index([lotId], map: "rework_items_lot_idx")
+  @@index([createdAt(sort: Desc)], map: "rework_items_open_idx", where: raw("(status <> ALL (ARRAY['COMPLETED'::text, 'FAILED'::text, 'CANCELLED'::text]))"))
+  @@map("rework_items")
+}
+
+/// One resolution of a rework item. Append-only (trigger).
+model ReworkResolution {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reworkId     String     @map("rework_id") @db.Uuid
+  resolvedOn   DateTime   @map("resolved_on") @db.Date
+  recovered    Int
+  failed       Int
+  failedReason String?    @map("failed_reason")
+  earning      Decimal    @default(0) @db.Decimal(14, 2)
+  createdById  String     @map("created_by") @db.Uuid
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  rework       ReworkItem @relation(fields: [reworkId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy    User       @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([reworkId], map: "rework_resolutions_rework_idx")
+  @@map("rework_resolutions")
 }

@@ -22,6 +22,13 @@ export async function sql(text: string, values: unknown[] = []): Promise<{ rows:
 
 export async function resetDatabase(): Promise<void> {
   await prisma.$executeRawUnsafe("TRUNCATE users, sessions, password_reset_tokens, invitations, audit_events CASCADE");
+  // Not owned by a column, so TRUNCATE does not restart it; codes start at FAB-0001 in every test.
+  await prisma.$executeRawUnsafe("ALTER SEQUENCE fabric_code_seq RESTART");
+  // Roles are not owned by users: custom ones go, and built-in grants return to the migrated seed.
+  await prisma.$executeRawUnsafe("DELETE FROM roles WHERE id NOT IN (SELECT id FROM test_seed.roles)");
+  await prisma.$executeRawUnsafe(
+    "DELETE FROM role_permissions; INSERT INTO role_permissions SELECT * FROM test_seed.role_permissions",
+  );
   await rm(env.MAIL_OUTBOX_DIR, { recursive: true, force: true });
 }
 

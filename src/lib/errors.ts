@@ -43,7 +43,14 @@ export const errors = {
   notFound: (what = "Resource") => new AppError(404, ErrorCode.NOT_FOUND, `${what} not found.`),
   conflict: (message: string) => new AppError(409, ErrorCode.CONFLICT, message),
   tokenInvalid: () => new AppError(400, ErrorCode.TOKEN_INVALID, "This link is invalid or has expired."),
-  rateLimited: () => new AppError(429, ErrorCode.RATE_LIMITED, "Too many requests. Please try again later."),
+  rateLimited: (minutes?: number) =>
+    new AppError(
+      429,
+      ErrorCode.RATE_LIMITED,
+      minutes
+        ? `Too many attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`
+        : "Too many requests. Please try again later.",
+    ),
 };
 
 export type ErrorBody = {
@@ -76,6 +83,10 @@ export const errorHandler: ErrorRequestHandler = (err: unknown, req, res, _next)
       err.type === "entity.too.large"
         ? new AppError(413, ErrorCode.PAYLOAD_TOO_LARGE, "Request body too large.")
         : new AppError(400, ErrorCode.BAD_REQUEST, "Malformed request body.");
+  } else if (isConcurrencyConflict(err)) {
+    // Postgres aborted one of two transactions racing for the same rows; the data is intact.
+    req.log.warn({ err }, "concurrent update conflict");
+    appError = new AppError(409, ErrorCode.CONFLICT, "Someone else changed this at the same time. Please try again.");
   } else {
     // Unknown errors (SQL, hashing, programming errors) are logged server-side only.
     req.log.error({ err }, "unhandled error");
@@ -92,6 +103,13 @@ export const errorHandler: ErrorRequestHandler = (err: unknown, req, res, _next)
   };
   res.status(appError.status).json(body);
 };
+
+/** Deadlock (40P01) or serialization failure (40001), as Prisma reports them (P2034, or P2010 for raw SQL). */
+function isConcurrencyConflict(err: unknown): boolean {
+  if (typeof err !== "object" || err === null || !("code" in err)) return false;
+  const message = "message" in err ? String(err.message) : "";
+  return err.code === "P2034" || (err.code === "P2010" && /\b(40P01|40001)\b/.test(message));
+}
 
 function isBodyParserError(err: unknown): err is { type: string } {
   return typeof err === "object" && err !== null && "type" in err && typeof err.type === "string" && "status" in err;

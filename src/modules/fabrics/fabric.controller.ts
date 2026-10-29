@@ -1,11 +1,11 @@
 import type { Request, RequestHandler, Response } from "express";
 
+import { factoryToday } from "../../lib/business-date";
 import { errors } from "../../lib/errors";
-import { clientMeta } from "../../lib/request";
+import { can, clientMeta } from "../../lib/request";
 import { toCsv } from "../../lib/list-query";
 import {
   adjustmentSchema,
-  createFabricSchema,
   createInwardSchema,
   fabricListQuerySchema,
   idParamsSchema,
@@ -17,6 +17,7 @@ import {
   type InwardListQuery,
   type MovementListQuery,
 } from "./fabric.schema";
+import type { FabricDto, InwardDto } from "./fabric.repository";
 import { fabricService, inwardService } from "./fabric.service";
 
 function actorOf(req: Request) {
@@ -32,7 +33,7 @@ function idOf(req: Request): string {
 const EXPORT_LIMIT = 10_000;
 
 function sendCsv(res: Response, name: string, header: string[], rows: (string | number | null)[][]) {
-  const stamp = new Date().toISOString().slice(0, 10);
+  const stamp = factoryToday();
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="${name}-${stamp}.csv"`);
   res.setHeader("Cache-Control", "no-store");
@@ -40,33 +41,37 @@ function sendCsv(res: Response, name: string, header: string[], rows: (string | 
   res.send(`\uFEFF${toCsv(header, rows)}`);
 }
 
+// Fabric cost (rates, amounts, stock value) is only returned to users with costing.view.
+const showCost = (req: Request) => can(req, "costing.view");
+
+const hideFabricCost = (fabric: FabricDto): FabricDto => ({ ...fabric, avgRate: null, stockValue: null });
+const hideInwardCost = (inward: InwardDto): InwardDto => ({ ...inward, rate: null, amount: null });
+
+/** Drops filters and sorts on money columns, which would otherwise reveal values by elimination. */
+function withoutMoney<Q extends Record<string, unknown>>(req: Request, query: Q, keys: string[]): Q {
+  if (showCost(req)) return query;
+  const hidden = new Set(keys.flatMap((key) => [`${key}Min`, `${key}Max`]));
+  const kept = Object.entries(query).filter(
+    ([name, value]) => !hidden.has(name) && !(name === "sort" && keys.includes(String(value))),
+  );
+  return Object.fromEntries(kept) as Q;
+}
+
 // Column params are validated by the schema; their keys are dynamic, hence the casts.
-const fabricQuery = (req: Request) => fabricListQuerySchema.parse(req.query) as FabricListQuery;
-const inwardQuery = (req: Request) => inwardListQuerySchema.parse(req.query) as InwardListQuery;
+const fabricQuery = (req: Request) =>
+  withoutMoney(req, fabricListQuerySchema.parse(req.query) as FabricListQuery, ["avgRate", "stockValue"]);
+const inwardQuery = (req: Request) =>
+  withoutMoney(req, inwardListQuerySchema.parse(req.query) as InwardListQuery, ["rate", "amount"]);
 const movementQuery = (req: Request) => movementListQuerySchema.parse(req.query) as MovementListQuery;
 
 export const fabricController = {
   list: (async (req, res) => {
-    res.json({ success: true, data: await fabricService.list(fabricQuery(req)) });
-  }) satisfies RequestHandler,
-
-  exportCsv: (async (req, res) => {
-    const { fabrics } = await fabricService.list({ ...fabricQuery(req), page: 1, pageSize: EXPORT_LIMIT });
-    sendCsv(
-      res,
-      "fabrics",
-      ["Code", "Name", "Unit", "In stock", "Reorder at", "Avg rate", "Stock value", "Description"],
-      fabrics.map((f) => [
-        f.code,
-        f.name,
-        f.unit,
-        f.balance,
-        f.lowStockThreshold,
-        f.avgRate === null ? null : Math.round(f.avgRate * 100) / 100,
-        f.stockValue,
-        f.description,
-      ]),
-    );
+    const data = await fabricService.list(fabricQuery(req));
+    if (showCost(req)) return void res.json({ success: true, data });
+    res.json({
+      success: true,
+      data: { ...data, fabrics: data.fabrics.map(hideFabricCost), summary: { ...data.summary, stockValue: null } },
+    });
   }) satisfies RequestHandler,
 
   options: (async (_req, res) => {
@@ -74,22 +79,14 @@ export const fabricController = {
   }) satisfies RequestHandler,
 
   get: (async (req, res) => {
-    res.json({ success: true, data: { fabric: await fabricService.get(idOf(req)) } });
-  }) satisfies RequestHandler,
-
-  create: (async (req, res) => {
-    const fabric = await fabricService.create(actorOf(req), createFabricSchema.parse(req.body), clientMeta(req));
-    res.status(201).json({ success: true, data: { fabric } });
+    const fabric = await fabricService.get(idOf(req));
+    res.json({ success: true, data: { fabric: showCost(req) ? fabric : hideFabricCost(fabric) } });
   }) satisfies RequestHandler,
 
   update: (async (req, res) => {
-    const fabric = await fabricService.update(
-      actorOf(req),
-      idOf(req),
-      updateFabricSchema.parse(req.body),
-      clientMeta(req),
-    );
-    res.json({ success: true, data: { fabric } });
+    const input = updateFabricSchema.parse(req.body);
+    const fabric = await fabricService.update(actorOf(req), idOf(req), input, clientMeta(req));
+    res.json({ success: true, data: { fabric: showCost(req) ? fabric : hideFabricCost(fabric) } });
   }) satisfies RequestHandler,
 
   adjust: (async (req, res) => {
@@ -142,11 +139,14 @@ export const fabricController = {
   }) satisfies RequestHandler,
 
   inwards: (async (req, res) => {
-    res.json({ success: true, data: await inwardService.list(inwardQuery(req)) });
+    const data = await inwardService.list(inwardQuery(req));
+    if (showCost(req)) return void res.json({ success: true, data });
+    res.json({ success: true, data: { ...data, inwards: data.inwards.map(hideInwardCost), totalAmount: null } });
   }) satisfies RequestHandler,
 
   exportInwards: (async (req, res) => {
     const { inwards } = await inwardService.list({ ...inwardQuery(req), page: 1, pageSize: EXPORT_LIMIT });
+    const cost = showCost(req);
     sendCsv(
       res,
       "fabric-purchases",
@@ -157,8 +157,7 @@ export const fabricController = {
         "Fabric",
         "Unit",
         "Quantity",
-        "Rate",
-        "Amount",
+        ...(cost ? ["Rate", "Amount"] : []),
         "Supplier",
         "Invoice",
         "Status",
@@ -171,8 +170,7 @@ export const fabricController = {
         i.fabric.name,
         i.fabric.unit,
         i.quantity,
-        i.rate,
-        i.amount,
+        ...(cost ? [i.rate, i.amount] : []),
         i.supplier,
         i.invoiceRef,
         i.reversal ? "Reversed" : "Posted",
@@ -187,12 +185,12 @@ export const fabricController = {
 
   createInward: (async (req, res) => {
     const inward = await inwardService.create(actorOf(req), createInwardSchema.parse(req.body), clientMeta(req));
-    res.status(201).json({ success: true, data: { inward } });
+    res.status(201).json({ success: true, data: { inward: showCost(req) ? inward : hideInwardCost(inward) } });
   }) satisfies RequestHandler,
 
   reverseInward: (async (req, res) => {
     const { reason } = reverseInwardSchema.parse(req.body);
     const inward = await inwardService.reverse(actorOf(req), idOf(req), reason, clientMeta(req));
-    res.json({ success: true, data: { inward } });
+    res.json({ success: true, data: { inward: showCost(req) ? inward : hideInwardCost(inward) } });
   }) satisfies RequestHandler,
 };

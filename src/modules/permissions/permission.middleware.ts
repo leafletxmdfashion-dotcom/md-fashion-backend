@@ -17,6 +17,18 @@ export function requirePermission(...permissions: Permission[]): RequestHandler 
   };
 }
 
+/** Passes when the user holds at least one of the permissions (e.g. a picker several screens use). */
+export function requireAnyPermission(...permissions: Permission[]): RequestHandler {
+  return (req, _res, next) => {
+    const user = req.auth?.user;
+    if (!user) {
+      next(errors.unauthenticated());
+      return;
+    }
+    next(permissions.some((permission) => hasPermission(user, permission)) ? undefined : errors.forbidden());
+  };
+}
+
 export function requireRole(...roleKeys: string[]): RequestHandler {
   return (req, _res, next) => {
     const user = req.auth?.user;

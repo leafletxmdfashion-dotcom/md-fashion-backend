@@ -1,10 +1,11 @@
 import { createApp } from "./app";
 import { env } from "./config/env";
-import { prisma } from "./db/prisma";
+import { prisma, warmUp } from "./db/prisma";
 import { logger } from "./lib/logger";
 
 const server = createApp().listen(env.PORT, () => {
   logger.info({ port: env.PORT, env: env.NODE_ENV }, "API listening");
+  warmUp().catch((error: unknown) => logger.warn({ err: error }, "database warm-up failed"));
 });
 
 const shutdown = (signal: string) => {

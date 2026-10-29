@@ -4,11 +4,13 @@ import type { RateLimiters } from "../lib/rate-limit";
 import { loadSession } from "../modules/auth/auth.middleware";
 import { authRoutes } from "../modules/auth/auth.routes";
 import { csrfProtection } from "../modules/auth/csrf";
-import { articleRoutes, sizeTemplateRoutes } from "../modules/articles/article.routes";
+import { articleRoutes } from "../modules/articles/article.routes";
 import { cuttingRoutes, lotRoutes } from "../modules/cutting/cutting.routes";
 import { fabricRoutes } from "../modules/fabrics/fabric.routes";
+import { jogadiRoutes } from "../modules/jogadi/jogadi";
 import { karigarRoutes } from "../modules/karigars/karigar.routes";
 import { roleRoutes } from "../modules/permissions/permission.routes";
+import { stitchingRoutes } from "../modules/stitching/stitching.routes";
 import { userRoutes } from "../modules/users/user.routes";
 
 export function apiRouter(limiters: RateLimiters): Router {
@@ -30,9 +32,10 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use("/fabrics", fabricRoutes());
   router.use("/karigars", karigarRoutes());
   router.use("/articles", articleRoutes());
-  router.use("/size-templates", sizeTemplateRoutes());
   router.use("/production-lots", lotRoutes());
   router.use("/cutting-batches", cuttingRoutes());
+  router.use("/jogadi", jogadiRoutes());
+  router.use("/stitching", stitchingRoutes());
 
   return router;
 }

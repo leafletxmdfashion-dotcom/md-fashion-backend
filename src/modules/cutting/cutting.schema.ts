@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { businessDate } from "../../lib/business-date";
 import { columnQueryFields, type ColumnQuery, type ColumnSpecs } from "../../lib/list-query";
 import { parseScaled } from "./cutting.calc";
 
@@ -41,9 +42,9 @@ const positiveDecimal = (places: number, max: number, label: string) =>
   decimal(places, max, label).refine((text) => parseScaled(text, places)! > 0n, `Enter ${label} above zero.`);
 
 const optionalDecimal = (places: number, max: number, label: string) =>
-  z.preprocess((value) => (value === "" ? null : value), positiveDecimal(places, max, label).nullish()).transform(
-    (value) => value ?? null,
-  );
+  z
+    .preprocess((value) => (value === "" ? null : value), positiveDecimal(places, max, label).nullish())
+    .transform((value) => value ?? null);
 
 const optionalText = (max: number) =>
   z
@@ -52,13 +53,6 @@ const optionalText = (max: number) =>
     .max(max, `Keep this under ${max} characters.`)
     .nullish()
     .transform((value) => value || null);
-
-const businessDate = z.iso
-  .date("Enter a valid date.")
-  .refine(
-    (value) => value <= new Date(Date.now() + 86_400_000).toISOString().slice(0, 10),
-    "Date cannot be in the future.",
-  );
 
 const label = (max: number, what: string) =>
   z.string().trim().min(1, `Enter the ${what}.`).max(max, `Keep the ${what} under ${max} characters.`);
@@ -75,17 +69,28 @@ export const markerSchema = z.strictObject({
   gsm: optionalDecimal(2, 10_000, "the GSM"),
   measuredPalaKg: optionalDecimal(6, 10_000, "the Pala weight in kg"),
   weightSource: z.enum(["MEASURED", "CALCULATED"]).default("MEASURED"),
-  repetitionsPerLayer: z.number().int("Use a whole number.").min(1).max(50).default(1),
+  repetitionsPerLayer: z
+    .number({ error: "Use a whole number from 1 to 50." })
+    .int("Use a whole number from 1 to 50.")
+    .min(1, "Use a whole number from 1 to 50.")
+    .max(50, "Use a whole number from 1 to 50.")
+    .default(1),
 });
 
 /** Labels that must be unique within a list, compared case-insensitively. */
-function uniqueBy<T>(items: T[], key: (item: T) => string, path: (index: number) => (string | number)[], ctx: z.RefinementCtx) {
+function uniqueBy<T>(
+  items: T[],
+  key: (item: T) => string,
+  path: (index: number) => (string | number)[],
+  ctx: z.RefinementCtx,
+) {
   const seen = new Set<string>();
 
   items.forEach((item, index) => {
     const value = key(item).trim().toLowerCase();
 
-    if (seen.has(value)) ctx.addIssue({ code: "custom", path: path(index), message: `${key(item).trim()} is listed twice.` });
+    if (seen.has(value))
+      ctx.addIssue({ code: "custom", path: path(index), message: `${key(item).trim()} is listed twice.` });
 
     seen.add(value);
   });
@@ -96,7 +101,12 @@ const sizesSchema = z
   .min(1, "Add at least one size.")
   .max(30, "Use at most 30 sizes.")
   .superRefine((sizes, ctx) => {
-    uniqueBy(sizes, (size) => size.label, (index) => [index, "label"], ctx);
+    uniqueBy(
+      sizes,
+      (size) => size.label,
+      (index) => [index, "label"],
+      ctx,
+    );
 
     // Single sizes may be 0 (left out of this marker), but the Pala must yield something.
     if (sizes.length > 0 && sizes.every((size) => size.piecesPerPala === 0)) {
@@ -107,11 +117,31 @@ const sizesSchema = z
 // Fabric store quantities are kept to the gram, so issued and returned weights are too.
 const rollSchema = z.strictObject({
   id: z.uuid().optional(),
-  thaan: label(50, "Thaan number"),
+  // Blank on a new Thaan: numbered when the draft is parsed (see numberThaan).
+  thaan: z
+    .string()
+    .trim()
+    .max(50, "Keep the Thaan number under 50 characters.")
+    .nullish()
+    .transform((value) => value ?? ""),
   issuedKg: positiveDecimal(3, 99_999, "the issued weight in kg"),
-  returnedKg: z.preprocess((value) => (value === "" || value === null || value === undefined ? "0" : value), decimal(3, 99_999, "the returned weight in kg")),
+  // Blank means "work it out" (see calculateRoll).
+  returnedKg: z
+    .preprocess((value) => (value === "" ? null : value), decimal(3, 99_999, "the returned weight in kg").nullish())
+    .transform((value) => value ?? null),
   confirmedLayers: z.number().int("Use a whole number.").min(0).max(100_000).nullable().default(null),
-});
+  // Optional: why the Pala differ from the estimate.
+  note: z
+    .string()
+    .trim()
+    .max(200, "Keep the note under 200 characters.")
+    .nullish()
+    .transform((value) => value || null),
+}).refine(
+  // Same rule as the calculator; the database CHECK would otherwise turn it into a 500.
+  (roll) => roll.returnedKg === null || parseScaled(roll.returnedKg, 3)! <= parseScaled(roll.issuedKg, 3)!,
+  { path: ["returnedKg"], message: "Returned weight cannot be more than the issued weight." },
+);
 
 const colourSchema = z.strictObject({
   id: z.uuid().optional(),
@@ -132,14 +162,47 @@ export const cuttingDraftSchema = z
     saveAsDefault: z.boolean().default(false),
   })
   .superRefine((draft, ctx) => {
-    uniqueBy(draft.colours, (colour) => colour.name, (index) => ["colours", index, "name"], ctx);
-
-    const rolls = draft.colours.flatMap((colour, colourIndex) =>
-      colour.rolls.map((roll, rollIndex) => ({ thaan: roll.thaan, path: ["colours", colourIndex, "rolls", rollIndex, "thaan"] })),
+    uniqueBy(
+      draft.colours,
+      (colour) => colour.name,
+      (index) => ["colours", index, "name"],
+      ctx,
     );
 
-    uniqueBy(rolls, (roll) => roll.thaan, (index) => rolls[index]!.path, ctx);
-  });
+    const rolls = draft.colours.flatMap((colour, colourIndex) =>
+      colour.rolls.flatMap((roll, rollIndex) =>
+        roll.thaan ? [{ thaan: roll.thaan, path: ["colours", colourIndex, "rolls", rollIndex, "thaan"] }] : [],
+      ),
+    );
+
+    uniqueBy(
+      rolls,
+      (roll) => roll.thaan,
+      (index) => rolls[index]!.path,
+      ctx,
+    );
+  })
+  .transform(numberThaan);
+
+/**
+ * Gives every unnumbered Thaan the next free number in the batch ("1", "2", …).
+ * The draft always carries every Thaan of its batch, so numbers stay unique per batch.
+ */
+function numberThaan<T extends { colours: { rolls: { thaan: string }[] }[] }>(draft: T): T {
+  const taken = new Set(draft.colours.flatMap((colour) => colour.rolls.map((roll) => roll.thaan.toLowerCase())));
+  let next = 1;
+
+  for (const roll of draft.colours.flatMap((colour) => colour.rolls)) {
+    if (roll.thaan) continue;
+
+    while (taken.has(String(next))) next += 1;
+
+    roll.thaan = String(next);
+    taken.add(roll.thaan);
+  }
+
+  return draft;
+}
 
 /** What an article remembers as its cutting defaults. */
 export const markerDefaultsSchema = markerSchema.extend({ sizes: sizesSchema });
@@ -167,7 +230,12 @@ export const createLotSchema = z.strictObject({
   targetQuantity: z.number().int("Use whole pieces.").min(1).max(10_000_000).nullable().default(null),
   notes: optionalText(500),
   cutting: cuttingDraftSchema.optional(),
-});
+  /** Also post the new cutting in the same request: issue its fabric, or finalize it. */
+  action: z.enum(["issue", "finalize"]).optional(),
+}).refine((input) => !input.action || input.cutting, { path: ["action"], message: "Add the cutting to post." });
+
+/** Issue or finalize, optionally saving the form's unsaved edits first in the same transaction. */
+export const postBatchSchema = z.strictObject({ cutting: cuttingDraftSchema.optional() }).default({});
 
 export const updateLotSchema = z.strictObject({
   fabricId: z.uuid("Choose a fabric.").optional(),

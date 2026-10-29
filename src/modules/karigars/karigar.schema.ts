@@ -29,7 +29,9 @@ const optionalText = (max: number) =>
 
 export const karigarSchema = z.strictObject({
   name: z.string().trim().min(1, "Name is required.").max(100, "Keep the name under 100 characters."),
-  phone: optionalText(20),
+  phone: optionalText(20).refine((value) => value === null || /^\+?[\d\s()-]{7,}$/.test(value), {
+    message: "Enter a phone number, digits only.",
+  }),
   category: z.enum(KARIGAR_CATEGORIES, { error: "Choose a category." }),
   payMode: z.enum(PAY_MODES, { error: "Choose how they are paid." }),
   payRate: z

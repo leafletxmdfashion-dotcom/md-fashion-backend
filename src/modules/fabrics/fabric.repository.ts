@@ -2,13 +2,11 @@ import { prisma, Prisma, type Db } from "../../db/prisma";
 import { columnFilters, contains, orderBy, page, where } from "../../lib/list-query";
 import { AVG_RATE, FABRIC_COLUMNS, INWARD_COLUMNS, MOVEMENT_COLUMNS, STOCK_VALUE } from "./fabric.columns";
 import type {
-  CreateFabricInput,
   CreateInwardInput,
   FabricListQuery,
   InwardListQuery,
   MovementListQuery,
   MovementType,
-  UpdateFabricInput,
 } from "./fabric.schema";
 
 // Writes go through Prisma Client. Reads that join the stock projection, compute
@@ -26,7 +24,8 @@ export interface FabricDto {
   description: string | null;
   balance: number;
   avgRate: number | null;
-  stockValue: number;
+  /** Null for users without costing.view, as are rate and amount figures below. */
+  stockValue: number | null;
   movementCount: number;
   createdAt: Date;
 }
@@ -37,10 +36,13 @@ export interface FabricOptionDto {
   name: string;
   unit: "KG" | "METER";
   balance: number;
+  /** The purchase form fills these in when its fabric name matches. */
+  lowStockThreshold: number | null;
+  description: string | null;
 }
 
 export interface FabricSummary {
-  stockValue: number;
+  stockValue: number | null;
   fabrics: number;
   inStock: number;
   reorder: number;
@@ -52,8 +54,8 @@ export interface InwardDto {
   fabric: { id: string; code: string; name: string; unit: string };
   inwardDate: string;
   quantity: number;
-  rate: number;
-  amount: number;
+  rate: number | null;
+  amount: number | null;
   supplier: string | null;
   invoiceRef: string | null;
   notes: string | null;
@@ -255,13 +257,22 @@ export const fabricRepository = {
   /** Lightweight id/name list for pickers and the command palette. */
   async options(): Promise<FabricOptionDto[]> {
     const fabrics = await prisma.fabric.findMany({
-      select: { id: true, code: true, name: true, unit: true, stock: { select: { balance: true } } },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        unit: true,
+        lowStockThreshold: true,
+        description: true,
+        stock: { select: { balance: true } },
+      },
       orderBy: [{ name: "asc" }, { code: "asc" }],
     });
-    return fabrics.map(({ stock, unit, ...fabric }) => ({
+    return fabrics.map(({ stock, unit, lowStockThreshold, ...fabric }) => ({
       ...fabric,
       unit: unit as FabricOptionDto["unit"],
       balance: stock ? stock.balance.toNumber() : 0,
+      lowStockThreshold: lowStockThreshold === null ? null : lowStockThreshold.toNumber(),
     }));
   },
 
@@ -273,16 +284,56 @@ export const fabricRepository = {
   /** Row lock that serializes every stock-changing write for one fabric. */
   async lock(db: Db, id: string): Promise<{ unit: string; balance: number } | null> {
     const [row] = await db.$queryRaw<{ unit: string; balance: number }[]>`
-      SELECT f.unit, s.balance::float8 AS balance ${FABRIC_FROM} WHERE f.id = ${id}::uuid FOR UPDATE OF f`;
+      SELECT f.unit, s.balance::float8 AS balance ${FABRIC_FROM} WHERE f.id = ${id}::uuid FOR UPDATE OF f, s`;
     return row ?? null;
   },
 
-  async create(db: Db, input: CreateFabricInput, createdBy: string): Promise<string> {
-    const fabric = await db.fabric.create({ data: { ...input, createdById: createdBy }, select: { id: true } });
-    return fabric.id;
+  /** The fabric with this name (any case), row-locked like `lock`. */
+  async lockByName(
+    db: Db,
+    name: string,
+  ): Promise<{
+    id: string;
+    name: string;
+    unit: string;
+    lowStockThreshold: number | null;
+    description: string | null;
+  } | null> {
+    const [row] = await db.$queryRaw<
+      { id: string; name: string; unit: string; low_stock_threshold: number | null; description: string | null }[]
+    >`
+      SELECT id, name, unit, low_stock_threshold::float8 AS low_stock_threshold, description
+      FROM fabrics WHERE lower(name) = lower(${name}) FOR UPDATE`;
+    return row
+      ? {
+          id: row.id,
+          name: row.name,
+          unit: row.unit,
+          lowStockThreshold: row.low_stock_threshold,
+          description: row.description,
+        }
+      : null;
   },
 
-  async update(db: Db, id: string, input: UpdateFabricInput): Promise<void> {
+  /**
+   * Inserts a fabric with a generated code. Null when a concurrent transaction
+   * created the same name first (the unique name index decides, it never errors).
+   */
+  async create(db: Db, input: CreateInwardInput, createdBy: string): Promise<{ id: string; code: string } | null> {
+    const [row] = await db.$queryRaw<{ id: string; code: string }[]>`
+      INSERT INTO fabrics (name, unit, low_stock_threshold, description, created_by)
+      VALUES (${input.fabricName}, ${input.unit}, ${input.lowStockThreshold ?? null}::numeric, ${input.description ?? null},
+              ${createdBy}::uuid)
+      ON CONFLICT ((lower(name))) DO NOTHING
+      RETURNING id, code`;
+    return row ?? null;
+  },
+
+  async updateDetails(
+    db: Db,
+    id: string,
+    input: { name?: string; unit?: string; lowStockThreshold: number | null; description: string | null },
+  ): Promise<void> {
     await db.fabric.update({ where: { id }, data: input });
   },
 
@@ -394,7 +445,7 @@ export const inwardRepository = {
 
   async list(
     query: InwardListQuery,
-  ): Promise<{ inwards: InwardDto[]; total: number; totalAmount: number; totalQuantity: Record<string, number> }> {
+  ): Promise<{ inwards: InwardDto[]; total: number; totalAmount: number | null; totalQuantity: Record<string, number> }> {
     const filter = where(this.filterClauses(query));
     const order = orderBy(INWARD_COLUMNS, query, "i.inward_date DESC", "i.number DESC");
     const [rows, summary] = await Promise.all([
@@ -422,9 +473,18 @@ export const inwardRepository = {
     return row ? toInward(row) : null;
   },
 
-  async create(db: Db, { fabricId, inwardDate, ...input }: CreateInwardInput, createdBy: string): Promise<string> {
+  async create(db: Db, fabricId: string, input: CreateInwardInput, createdBy: string): Promise<string> {
     const inward = await db.fabricInward.create({
-      data: { ...input, fabricId, inwardDate: new Date(inwardDate), createdById: createdBy },
+      data: {
+        fabricId,
+        inwardDate: new Date(input.inwardDate),
+        quantity: input.quantity,
+        rate: input.rate,
+        supplier: input.supplier,
+        invoiceRef: input.invoiceRef,
+        notes: input.notes,
+        createdById: createdBy,
+      },
       select: { id: true },
     });
     return inward.id;

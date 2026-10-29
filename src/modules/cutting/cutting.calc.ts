@@ -7,7 +7,8 @@
 // live preview; cutting.calc.test.ts fails if the two drift apart. The backend
 // recalculates everything itself before posting and never trusts client totals.
 
-export const CALCULATION_VERSION = 1;
+// 2: Pala may be entered above the estimate, and the return is worked out unless entered.
+export const CALCULATION_VERSION = 2;
 
 export const WASTAGE_TYPE = "AUTO_PALA_REMAINDER";
 
@@ -41,9 +42,14 @@ export interface MarkerInput {
 }
 
 export interface RollInput {
+  /** Blank on a new Thaan; the API numbers it on save. */
   thaan: string;
   issuedKg: string;
-  returnedKg: string;
+  /**
+   * Null or blank: worked out. Fabric left after cutting goes back to the store in
+   * whole-Pala pieces; the part under one Pala is wastage.
+   */
+  returnedKg: string | null;
   /** Null means "accept the estimate". Pala = layers × repetitions per layer. */
   confirmedLayers: number | null;
 }
@@ -68,6 +74,7 @@ export interface MarkerResult {
 
 export interface RollResult {
   issuedKg: bigint;
+  /** As entered, or worked out when left blank. */
   returnedKg: bigint;
   /** Issued minus returned: what the cutting floor actually used. */
   netKg: bigint;
@@ -245,7 +252,12 @@ function calculateMarker(input: MarkerInput, issues: Issue[]): MarkerResult {
   };
 }
 
-/** One roll: whole Pala only, never rounded up; the unreturned remainder is wastage. */
+/**
+ * One roll, in whole Pala. The estimate is how many Pala of the marker weight fit
+ * in what stayed on the cutting table; the operator may enter more or fewer, since
+ * a Thaan is thicker in some places and thinner in others. Consumption never
+ * exceeds what the Thaan held, and whatever is left and not returned is wastage.
+ */
 export function calculateRoll(
   roll: RollInput,
   marker: MarkerResult,
@@ -254,25 +266,28 @@ export function calculateRoll(
   issues: Issue[],
 ): RollResult {
   const issued = parseScaled(roll.issuedKg, 6);
-  const returned = roll.returnedKg.trim() === "" ? 0n : parseScaled(roll.returnedKg, 6);
+  const returnText = roll.returnedKg?.trim() ?? "";
+  const entered = returnText === "" ? null : parseScaled(returnText, 6);
 
   if (issued === null) issues.push({ path: `${path}.issuedKg`, message: "Enter the issued weight in kg." });
   else if (issued === 0n) issues.push({ path: `${path}.issuedKg`, message: "Issued weight must be more than zero." });
 
-  if (returned === null) issues.push({ path: `${path}.returnedKg`, message: "Enter the returned weight in kg." });
-
-  const issuedKg = issued ?? 0n;
-  let returnedKg = returned ?? 0n;
-
-  if (returnedKg > issuedKg) {
-    issues.push({ path: `${path}.returnedKg`, message: "Returned weight cannot be more than the issued weight." });
-    returnedKg = issuedKg;
+  if (returnText !== "" && entered === null) {
+    issues.push({ path: `${path}.returnedKg`, message: "Enter the returned weight in kg." });
   }
 
-  const netKg = issuedKg - returnedKg;
+  const issuedKg = issued ?? 0n;
+  let enteredKg = entered ?? 0n;
+
+  if (enteredKg > issuedKg) {
+    issues.push({ path: `${path}.returnedKg`, message: "Returned weight cannot be more than the issued weight." });
+    enteredKg = issuedKg;
+  }
+
+  const onTable = issuedKg - enteredKg;
   const pala = marker.activePalaKg ?? 0n;
   const repetitions = Math.max(1, repetitionsPerLayer || 1);
-  const estimatedPala = pala > 0n ? Number(netKg / pala) : 0;
+  const estimatedPala = pala > 0n ? Number(onTable / pala) : 0;
   const estimatedLayers = Math.floor(estimatedPala / repetitions);
   let confirmedLayers = roll.confirmedLayers ?? estimatedLayers;
 
@@ -281,28 +296,22 @@ export function calculateRoll(
     confirmedLayers = 0;
   }
 
-  let confirmedPala = confirmedLayers * repetitions;
-
-  if (confirmedPala > estimatedPala) {
-    issues.push({
-      path: `${path}.confirmedLayers`,
-      message: `${confirmedPala} Pala is more than this Thaan can give (${estimatedPala}). Re-measure the Pala weight first.`,
-    });
-    confirmedPala = estimatedPala;
-  }
-
-  const consumedKg = BigInt(confirmedPala) * pala;
+  const confirmedPala = confirmedLayers * repetitions;
+  const needed = BigInt(confirmedPala) * pala;
+  const consumedKg = needed < onTable ? needed : onTable;
+  const leftover = onTable - consumedKg;
+  const returnedKg = entered === null ? (pala > 0n ? leftover - (leftover % pala) : 0n) : enteredKg;
 
   return {
     issuedKg,
     returnedKg,
-    netKg,
+    netKg: issuedKg - returnedKg,
     estimatedPala,
     estimatedLayers,
     confirmedLayers,
     confirmedPala,
     consumedKg,
-    wastageKg: netKg - consumedKg,
+    wastageKg: issuedKg - returnedKg - consumedKg,
     pieces: confirmedPala * marker.piecesPerPala,
   };
 }
@@ -350,7 +359,8 @@ export function calculateBatch(markerInput: MarkerInput, colourInputs: ColourInp
     const name = colour.name.trim();
 
     if (!name) issues.push({ path: `${path}.name`, message: "Enter the colour." });
-    else if (colourNames.has(name.toLowerCase())) issues.push({ path: `${path}.name`, message: `${name} is listed twice.` });
+    else if (colourNames.has(name.toLowerCase()))
+      issues.push({ path: `${path}.name`, message: `${name} is listed twice.` });
 
     colourNames.add(name.toLowerCase());
 
@@ -362,17 +372,29 @@ export function calculateBatch(markerInput: MarkerInput, colourInputs: ColourInp
       const rollPath = `${path}.rolls.${rollIndex}`;
       const thaan = roll.thaan.trim();
 
-      if (!thaan) issues.push({ path: `${rollPath}.thaan`, message: "Enter the Thaan number." });
-      else if (thaans.has(thaan.toLowerCase())) issues.push({ path: `${rollPath}.thaan`, message: `Thaan ${thaan} is listed twice.` });
+      if (thaan && thaans.has(thaan.toLowerCase()))
+        issues.push({ path: `${rollPath}.thaan`, message: `Thaan ${thaan} is listed twice.` });
 
-      thaans.add(thaan.toLowerCase());
+      if (thaan) thaans.add(thaan.toLowerCase());
 
       const result = calculateRoll(roll, marker, markerInput.repetitionsPerLayer, rollPath, issues);
+
+      const label = `${name || `Colour ${colourIndex + 1}`} Thaan ${thaan || rollIndex + 1}`;
 
       if (marker.activePalaKg && result.netKg > 0n && result.estimatedPala === 0) {
         warnings.push({
           path: `${rollPath}.issuedKg`,
-          message: `Less than one Pala: all ${formatKg(result.netKg)} kg of Thaan ${thaan || rollIndex + 1} becomes wastage unless returned.`,
+          message: `Less than one Pala: all ${formatKg(result.netKg)} kg of ${label} becomes wastage unless returned.`,
+        });
+      }
+
+      // Typed Pala that differ from the estimate are allowed (fabric weight varies); they are flagged.
+      if (marker.activePalaKg && roll.confirmedLayers !== null && result.confirmedLayers !== result.estimatedLayers) {
+        const fit = result.estimatedLayers * Math.max(1, markerInput.repetitionsPerLayer || 1);
+
+        warnings.push({
+          path: `${rollPath}.confirmedLayers`,
+          message: `${label}: ${result.confirmedPala} Pala entered, ${fit} fit by the marker weight.`,
         });
       }
 
@@ -412,6 +434,29 @@ export function costOf(micro: bigint, ratePerKg: string): bigint {
 
   // 6 + 4 decimals → keep 2.
   return divideRounded(micro * rate, 10n ** 8n);
+}
+
+/**
+ * A batch's consumed and wasted fabric cost in paisa. Thaan may carry different rates,
+ * so their exact costs are summed and rounded once; wastage takes the rounding
+ * remainder, so consumed + wastage always equals the batch's total kg × rate.
+ */
+export function fabricCosts(rolls: { consumedKg: bigint; wastageKg: bigint; rate: string }[]): {
+  consumed: bigint;
+  wastage: bigint;
+} {
+  let consumed = 0n;
+  let total = 0n;
+
+  for (const roll of rolls) {
+    const rate = parseScaled(roll.rate, 4) ?? 0n;
+    consumed += roll.consumedKg * rate;
+    total += (roll.consumedKg + roll.wastageKg) * rate;
+  }
+
+  const consumedPaisa = divideRounded(consumed, 10n ** 8n);
+
+  return { consumed: consumedPaisa, wastage: divideRounded(total, 10n ** 8n) - consumedPaisa };
 }
 
 export interface Earning {

@@ -14,87 +14,203 @@ async function setup() {
   return { owner };
 }
 
-async function createFabric(client: TestClient, overrides: object = {}) {
-  const res = await client.send("post", "/api/v1/fabrics", {
-    code: "fb-ctj",
-    name: "Cotton Jersey",
-    unit: "KG",
-    lowStockThreshold: 50,
-    ...overrides,
-  });
-  expect(res.status).toBe(201);
-  return res.body.data.fabric as { id: string; code: string };
+interface Fabric {
+  id: string;
+  code: string;
+  name: string;
+  unit: "KG" | "METER";
 }
 
-async function postInward(client: TestClient, fabricId: string, quantity: number, rate: number, extra: object = {}) {
+/** A fabric with no stock yet. In the app fabrics come from their first purchase. */
+async function createFabric(
+  overrides: { name?: string; unit?: "KG" | "METER"; lowStockThreshold?: number | null; description?: string } = {},
+) {
+  const fabric = { name: "Cotton Jersey", unit: "KG", lowStockThreshold: 50, description: null, ...overrides };
+  const { rows } = await sql(
+    `INSERT INTO fabrics (name, unit, low_stock_threshold, description) VALUES ($1, $2, $3, $4)
+     RETURNING id::text, code, name, unit`,
+    [fabric.name, fabric.unit, fabric.lowStockThreshold, fabric.description],
+  );
+  return rows[0] as Fabric;
+}
+
+async function postInward(client: TestClient, fabric: Fabric, quantity: number, rate: number, extra: object = {}) {
   const res = await client.send("post", "/api/v1/fabrics/inwards", {
-    fabricId,
+    fabricName: fabric.name,
+    unit: fabric.unit,
     inwardDate: today,
     quantity,
     rate,
     ...extra,
   });
   expect(res.status).toBe(201);
-  return res.body.data.inward as { id: string; number: number; amount: number };
+  return res.body.data.inward as { id: string; number: number; amount: number; fabric: Fabric };
 }
 
 async function fabricOf(client: TestClient, id: string) {
   return (await client.get(`/api/v1/fabrics/${id}`)).body.data.fabric as {
+    lowStockThreshold: number | null;
+    description: string | null;
     balance: number;
     avgRate: number | null;
     stockValue: number;
   };
 }
 
-describe("fabric master", () => {
-  it("normalizes the code and rejects a duplicate with a field error", async () => {
-    const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    expect(fabric.code).toBe("FB-CTJ");
+describe("fabrics from purchases", () => {
+  const buy = (client: TestClient, body: object) =>
+    client.send("post", "/api/v1/fabrics/inwards", { inwardDate: today, quantity: 10, rate: 100, ...body });
 
-    const dup = await owner.send("post", "/api/v1/fabrics", {
-      code: "FB-CTJ",
-      name: "Other",
-      unit: "METER",
-    });
-    expect(dup.status).toBe(409);
-    expect(dup.body.error.details.code).toBeDefined();
+  it("creates a fabric with a generated code, then adds later purchases of that name to it", async () => {
+    const { owner } = await setup();
+    const first = await buy(owner, { fabricName: "  Cotton   Jersey ", unit: "KG", lowStockThreshold: 25 });
+    expect(first.status).toBe(201);
+    const fabric = first.body.data.inward.fabric as Fabric;
+    expect(fabric).toMatchObject({ code: "FAB-0001", name: "Cotton Jersey", unit: "KG" });
+
+    // Same name in any case: same fabric, same code; the reorder level stays unless sent.
+    const again = await buy(owner, { fabricName: "cotton jersey", unit: "KG", quantity: 5 });
+    expect(again.body.data.inward.fabric).toMatchObject({ id: fabric.id, code: "FAB-0001" });
+    expect(await fabricOf(owner, fabric.id)).toMatchObject({ balance: 15, lowStockThreshold: 25 });
+
+    await buy(owner, { fabricName: "Cotton Jersey", unit: "KG", lowStockThreshold: 40, description: "Knit, 180 GSM" });
+    expect(await fabricOf(owner, fabric.id)).toMatchObject({ lowStockThreshold: 40, description: "Knit, 180 GSM" });
+
+    const other = await buy(owner, { fabricName: "Poplin", unit: "METER" });
+    expect(other.body.data.inward.fabric.code).toBe("FAB-0002");
   });
 
-  it("locks the unit once stock has been posted", async () => {
+  it("refuses a different unit for an existing fabric, with a field error", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    const body = { code: "FB-CTJ", name: "Cotton Jersey", unit: "METER" };
-    expect((await owner.send("put", `/api/v1/fabrics/${fabric.id}`, body)).status).toBe(200);
-
-    await postInward(owner, fabric.id, 10, 100);
-    const res = await owner.send("put", `/api/v1/fabrics/${fabric.id}`, { ...body, unit: "KG" });
+    await buy(owner, { fabricName: "Cotton Jersey", unit: "KG" });
+    const res = await buy(owner, { fabricName: "COTTON JERSEY", unit: "METER" });
     expect(res.status).toBe(400);
-    expect(res.body.error.details.unit).toBeDefined();
+    expect(res.body.error.details.unit[0]).toMatch(/bought in kilograms/);
+    expect((await buy(owner, { unit: "KG" })).body.error.details.fabricName).toBeDefined();
+  });
+
+  it("gives simultaneous first purchases of one name a single fabric and unique codes", async () => {
+    const { owner } = await setup();
+    const results = await Promise.all([
+      buy(owner, { fabricName: "Rib", unit: "KG" }),
+      buy(owner, { fabricName: "rib", unit: "KG" }),
+      buy(owner, { fabricName: "Lycra", unit: "KG" }),
+      buy(owner, { fabricName: "Denim", unit: "METER" }),
+    ]);
+    expect(results.map((res) => res.status)).toEqual([201, 201, 201, 201]);
+    // SAFETY: the SELECT list defines exactly these columns.
+    const rows = (await sql("SELECT lower(name) AS name, code FROM fabrics ORDER BY code")).rows as Record<
+      string,
+      string
+    >[];
+    expect(rows.map((row) => row.name).sort()).toEqual(["denim", "lycra", "rib"]);
+    expect(new Set(rows.map((row) => row.code)).size).toBe(3);
+  });
+
+  it("continues codes after existing FAB numbers and never truncates them", async () => {
+    const { owner } = await setup();
+    await createFabric({ name: "Old" });
+    await sql("UPDATE fabrics SET code = 'FAB-9999'");
+    await sql("SELECT setval('fabric_code_seq', 9999)");
+    const res = await buy(owner, { fabricName: "New", unit: "KG" });
+    expect(res.body.data.inward.fabric.code).toBe("FAB-10000");
+  });
+
+  it("fixes a fabric's name and details, but not a duplicate name or the unit once stocked", async () => {
+    const { owner } = await setup();
+    const typo = await createFabric({ name: "Coton Jersy" });
+    const other = await createFabric({ name: "Rib", unit: "METER" });
+    const put = (id: string, body: object) =>
+      owner.send("put", `/api/v1/fabrics/${id}`, { name: "Cotton Jersey", unit: "KG", ...body });
+
+    const fixed = await put(typo.id, { lowStockThreshold: 30, description: "Knit" });
+    expect(fixed.status).toBe(200);
+    expect(fixed.body.data.fabric).toMatchObject({ code: typo.code, name: "Cotton Jersey", lowStockThreshold: 30 });
+    // Purchases of the corrected name now add to it.
+    expect((await postInward(owner, { ...typo, name: "cotton jersey" }, 5, 10)).fabric.id).toBe(typo.id);
+
+    const duplicate = await put(other.id, { name: "COTTON JERSEY", unit: "METER" });
+    expect(duplicate.status).toBe(409);
+    expect(duplicate.body.error.details.name).toBeDefined();
+
+    expect((await put(other.id, { name: "Rib", unit: "KG" })).status).toBe(200);
+    const locked = await put(typo.id, { unit: "METER" });
+    expect(locked.status).toBe(400);
+    expect(locked.body.error.details.unit).toBeDefined();
+    expect((await put(typo.id, { code: "X" })).status).toBe(400);
   });
 
   it("enforces fabric permissions per role", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
+    const fabric = await createFabric();
     const staff = await loggedInClient("staff@garment.test");
     const viewer = await loggedInClient("viewer@garment.test");
 
     expect((await viewer.get("/api/v1/fabrics")).status).toBe(200);
-    expect((await viewer.send("post", "/api/v1/fabrics/inwards", { fabricId: fabric.id })).status).toBe(403);
-    expect((await staff.send("post", "/api/v1/fabrics", { code: "X" })).status).toBe(403);
+    expect((await buy(viewer, { fabricName: "X", unit: "KG" })).status).toBe(403);
     expect((await staff.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {})).status).toBe(403);
-    await postInward(staff, fabric.id, 5, 10);
+    await postInward(staff, fabric, 5, 10);
+    expect((await owner.send("post", "/api/v1/fabrics", { name: "X", unit: "KG" })).status).toBe(404);
+    expect((await staff.send("put", `/api/v1/fabrics/${fabric.id}`, { name: "X", unit: "KG" })).status).toBe(403);
+  });
+
+  it("hides rates, amounts and stock value from roles without costing.view", async () => {
+    const { owner } = await setup();
+    const fabric = await createFabric();
+    const inward = await postInward(owner, fabric, 10, 400);
+    await postInward(owner, fabric, 5, 100);
+    const staff = await loggedInClient("staff@garment.test");
+    const viewer = await loggedInClient("viewer@garment.test");
+
+    const ownList = (await owner.get("/api/v1/fabrics/inwards")).body.data;
+    expect(ownList.totalAmount).toBe(4_500);
+    expect(ownList.inwards[0].amount).toBeGreaterThan(0);
+
+    for (const client of [staff, viewer]) {
+      const list = (await client.get("/api/v1/fabrics")).body.data;
+      expect(list.summary.stockValue).toBeNull();
+      expect(list.fabrics[0]).toMatchObject({ balance: 15, avgRate: null, stockValue: null });
+      expect((await client.get(`/api/v1/fabrics/${fabric.id}`)).body.data.fabric).toMatchObject({
+        avgRate: null,
+        stockValue: null,
+      });
+
+      const inwards = (await client.get("/api/v1/fabrics/inwards")).body.data;
+      expect(inwards.totalAmount).toBeNull();
+      expect(inwards.inwards[0]).toMatchObject({ quantity: expect.any(Number), rate: null, amount: null });
+
+      // Money filters and sorts would leak values by elimination, so they are ignored.
+      expect((await client.get("/api/v1/fabrics/inwards?amountMin=4000")).body.data.total).toBe(2);
+      expect((await client.get("/api/v1/fabrics?stockValueMin=1000000")).body.data.total).toBe(1);
+
+      const csv = (await client.get("/api/v1/fabrics/inwards/export")).text;
+      expect(csv.split("\r\n")[0]).not.toMatch(/Rate|Amount/);
+      expect(csv).not.toContain("4000");
+    }
+
+    // Staff may add purchases; the response does not echo stock value either.
+    const posted = await staff.send("post", "/api/v1/fabrics/inwards", {
+      fabricName: fabric.name,
+      unit: fabric.unit,
+      inwardDate: today,
+      quantity: 1,
+      rate: 50,
+    });
+    expect(posted.status).toBe(201);
+    expect(posted.body.data.inward).toMatchObject({ rate: null, amount: null });
+    const reversed = await owner.send("post", `/api/v1/fabrics/inwards/${inward.id}/reverse`, { reason: "wrong rate" });
+    expect(reversed.body.data.inward.amount).toBe(4_000);
   });
 });
 
 describe("fabric list", () => {
   it("filters, searches and pages on the server with workspace-wide summary figures", async () => {
     const { owner } = await setup();
-    const low = await createFabric(owner, { code: "FB-INT", name: "Interlock", lowStockThreshold: 50 });
-    await postInward(owner, low.id, 20, 100);
-    const ok = await createFabric(owner, { code: "FB-PPL", name: "Poplin", unit: "METER" });
-    await postInward(owner, ok.id, 300, 10);
-    await createFabric(owner, { code: "FB-CRD", name: "Corduroy" });
+    const low = await createFabric({ name: "Interlock", lowStockThreshold: 50 });
+    await postInward(owner, low, 20, 100);
+    const ok = await createFabric({ name: "Poplin", unit: "METER" });
+    await postInward(owner, ok, 300, 10);
+    await createFabric({ name: "Corduroy" });
 
     const all = (await owner.get("/api/v1/fabrics")).body.data;
     expect(all.total).toBe(3);
@@ -104,8 +220,8 @@ describe("fabric list", () => {
     expect(page2.total).toBe(3);
     expect(page2.fabrics.map((f: { name: string }) => f.name)).toEqual(["Poplin"]);
 
-    const search = (await owner.get("/api/v1/fabrics?search=ppl")).body.data;
-    expect(search.fabrics.map((f: { code: string }) => f.code)).toEqual(["FB-PPL"]);
+    const search = (await owner.get("/api/v1/fabrics?search=popl")).body.data;
+    expect(search.fabrics.map((f: { name: string }) => f.name)).toEqual(["Poplin"]);
     const literal = (await owner.get("/api/v1/fabrics?search=%25")).body.data;
     expect(literal.total).toBe(0);
 
@@ -118,18 +234,20 @@ describe("fabric list", () => {
     expect(options).toHaveLength(3);
     expect(options[0]).toEqual({
       id: expect.any(String),
-      code: "FB-CRD",
+      code: expect.stringMatching(/^FAB-\d{4}$/),
       name: "Corduroy",
       unit: "KG",
       balance: 0,
+      lowStockThreshold: 50,
+      description: null,
     });
   });
 
   it("finds purchases by register number", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    await postInward(owner, fabric.id, 1, 1);
-    const second = await postInward(owner, fabric.id, 2, 1);
+    const fabric = await createFabric();
+    await postInward(owner, fabric, 1, 1);
+    const second = await postInward(owner, fabric, 2, 1);
     for (const term of [`FI-${String(second.number).padStart(4, "0")}`, `fi${second.number}`]) {
       const res = (await owner.get(`/api/v1/fabrics/inwards?search=${term}`)).body.data;
       expect(res.inwards.map((i: { id: string }) => i.id)).toEqual([second.id]);
@@ -139,16 +257,16 @@ describe("fabric list", () => {
 
 describe("column filters, sorting and export", () => {
   async function seed(owner: TestClient) {
-    const a = await createFabric(owner, { code: "FB-A", name: "Alpha Knit", lowStockThreshold: 10 });
-    const b = await createFabric(owner, { code: "FB-B", name: "Beta Woven", unit: "METER" });
-    const c = await createFabric(owner, { code: "FB-C", name: "Gamma", description: "=SUM(1)" });
-    await postInward(owner, a.id, 100, 10, { inwardDate: "2026-01-05", supplier: "Sunrise Knits" });
-    await postInward(owner, b.id, 40, 50, {
+    const a = await createFabric({ name: "Alpha Knit", lowStockThreshold: 10 });
+    const b = await createFabric({ name: "Beta Woven", unit: "METER" });
+    const c = await createFabric({ name: "Gamma", description: "=SUM(1)" });
+    await postInward(owner, a, 100, 10, { inwardDate: "2026-01-05", supplier: "Sunrise Knits" });
+    await postInward(owner, b, 40, 50, {
       inwardDate: "2026-02-10",
       supplier: "Nepal Fabrics",
       invoiceRef: "INV-77",
     });
-    await postInward(owner, c.id, 5, 200, { inwardDate: "2026-03-15", supplier: "=HYPERLINK(1)" });
+    await postInward(owner, c, 5, 200, { inwardDate: "2026-03-15", supplier: "=HYPERLINK(1)" });
     return { a, b, c };
   }
 
@@ -196,9 +314,6 @@ describe("column filters, sorting and export", () => {
     expect(lines).toHaveLength(3);
     expect(lines[0]).toMatch(/^No\.,Date,Fabric code/);
     expect(res.text).toContain("'=HYPERLINK(1)");
-
-    const fabrics = await owner.get("/api/v1/fabrics/export?fabric=gam");
-    expect(fabrics.text.replace(/^\uFEFF/, "").split("\r\n")).toHaveLength(2);
     expect((await owner.get("/api/v1/fabrics/movements/export")).status).toBe(200);
   });
 });
@@ -206,9 +321,9 @@ describe("column filters, sorting and export", () => {
 describe("purchases and stock ledger", () => {
   it("derives balance, weighted rate and value from posted purchases", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    const first = await postInward(owner, fabric.id, 100, 400, { supplier: "Sunrise Knits" });
-    await postInward(owner, fabric.id, 50, 520);
+    const fabric = await createFabric();
+    const first = await postInward(owner, fabric, 100, 400, { supplier: "Sunrise Knits" });
+    await postInward(owner, fabric, 50, 520);
     expect(first.amount).toBe(40_000);
 
     expect(await fabricOf(owner, fabric.id)).toMatchObject({ balance: 150, avgRate: 440, stockValue: 66_000 });
@@ -221,21 +336,81 @@ describe("purchases and stock ledger", () => {
 
   it("rejects purchases with a future date", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
+    const fabric = await createFabric();
     const future = await owner.send("post", "/api/v1/fabrics/inwards", {
-      fabricId: fabric.id,
+      fabricName: fabric.name,
+      unit: fabric.unit,
       inwardDate: "2999-01-01",
       quantity: 1,
       rate: 1,
     });
     expect(future.status).toBe(400);
     expect(future.body.error.details.inwardDate).toBeDefined();
+
+    // "Today" is the factory's day in Nepal, with no extra day of slack.
+    const nepal = (offsetDays: number) =>
+      new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kathmandu" }).format(Date.now() + offsetDays * 86_400_000);
+    const post = (inwardDate: string) =>
+      owner.send("post", "/api/v1/fabrics/inwards", {
+        fabricName: fabric.name,
+        unit: fabric.unit,
+        inwardDate,
+        quantity: 1,
+        rate: 1,
+      });
+    expect((await post(nepal(1))).status).toBe(400);
+    expect((await post(nepal(0))).status).toBe(201);
+  });
+
+  it("rejects quantities and rates with more decimals than are stored, and amounts too large to store", async () => {
+    const { owner } = await setup();
+    const fabric = await createFabric();
+    const post = (quantity: number, rate: number) =>
+      owner.send("post", "/api/v1/fabrics/inwards", {
+        fabricName: fabric.name,
+        unit: fabric.unit,
+        inwardDate: today,
+        quantity,
+        rate,
+      });
+
+    const qty = await post(1.2345, 10);
+    expect(qty.status).toBe(400);
+    expect(qty.body.error.details.quantity[0]).toMatch(/3 decimals/);
+    expect((await post(0.0004, 10)).body.error.details.quantity).toBeDefined();
+    const rate = await post(1, 2.345);
+    expect(rate.status).toBe(400);
+    expect(rate.body.error.details.rate[0]).toMatch(/2 decimals/);
+
+    const before = await post(1, 1);
+    const overflow = await post(999_999_999, 99_999_999);
+    expect(overflow.status).toBe(400);
+    expect(overflow.body.error.details.rate[0]).toMatch(/too large/);
+
+    // Floats that are exact at the stored precision still pass, and no register number was burned.
+    const ok = await post(125.375, 412.5);
+    expect(ok.status).toBe(201);
+    expect(ok.body.data.inward).toMatchObject({
+      number: Number(before.body.data.inward.number) + 1,
+      quantity: 125.375,
+      rate: 412.5,
+      amount: 51_717.19,
+    });
+    expect((await post(0.1, 0.29)).status).toBe(201);
+
+    const adjust = await owner.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {
+      direction: "OUT",
+      quantity: 1.0005,
+      reason: "Count",
+    });
+    expect(adjust.status).toBe(400);
+    expect(adjust.body.error.details.quantity[0]).toMatch(/3 decimals/);
   });
 
   it("never lets an adjustment or reversal drive stock negative", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    const inward = await postInward(owner, fabric.id, 100, 400);
+    const fabric = await createFabric();
+    const inward = await postInward(owner, fabric, 100, 400);
 
     const tooMuch = await owner.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {
       direction: "OUT",
@@ -272,15 +447,31 @@ describe("purchases and stock ledger", () => {
     );
 
     expect(await fabricOf(owner, fabric.id)).toMatchObject({ balance: 0, avgRate: null });
+
     const totals = (await owner.get("/api/v1/fabrics/inwards")).body.data;
     expect(totals).toMatchObject({ total: 1, totalAmount: 0 });
+
+    // A reduction racing a reversal for the last stock: one wins, the other gets a clear 4xx, never a 500.
+    for (let round = 0; round < 5; round += 1) {
+      const last = await postInward(owner, fabric, 1, 10);
+      const [cut, back] = await Promise.all([
+        owner.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {
+          direction: "OUT",
+          quantity: 1,
+          reason: "Count",
+        }),
+        owner.send("post", `/api/v1/fabrics/inwards/${last.id}/reverse`, { reason: "Wrong fabric" }),
+      ]);
+      expect([cut.status, back.status].sort()).toEqual(cut.status === 201 ? [201, 409] : [200, 400]);
+      expect((await fabricOf(owner, fabric.id)).balance).toBe(0);
+    }
   });
 
   it("returns newest-first movements with running balances and a period summary", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    await postInward(owner, fabric.id, 100, 400, { inwardDate: "2026-01-10" });
-    await postInward(owner, fabric.id, 20, 400, { inwardDate: "2026-02-10" });
+    const fabric = await createFabric();
+    await postInward(owner, fabric, 100, 400, { inwardDate: "2026-01-10" });
+    await postInward(owner, fabric, 20, 400, { inwardDate: "2026-02-10" });
     await owner.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {
       direction: "OUT",
       quantity: 5,
@@ -303,8 +494,8 @@ describe("purchases and stock ledger", () => {
     expect(feb.byUnit).toEqual({ KG: { in: 20, out: 0 } });
 
     // Across fabrics, kilograms and metres are totalled separately.
-    const meters = await createFabric(owner, { code: "FB-SAT", name: "Satin", unit: "METER" });
-    await postInward(owner, meters.id, 40, 90, { inwardDate: "2026-02-12" });
+    const meters = await createFabric({ name: "Satin", unit: "METER" });
+    await postInward(owner, meters, 40, 90, { inwardDate: "2026-02-12" });
     const everything = (await owner.get("/api/v1/fabrics/movements")).body.data;
     expect(everything.total).toBe(4);
     expect(everything.summary).toBeNull();
@@ -314,9 +505,9 @@ describe("purchases and stock ledger", () => {
 
   it("orders the ledger by business date, so a backdated purchase gets the right running balance", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    await postInward(owner, fabric.id, 10, 1, { inwardDate: "2026-03-01" });
-    await postInward(owner, fabric.id, 5, 1, { inwardDate: "2026-01-01" });
+    const fabric = await createFabric();
+    await postInward(owner, fabric, 10, 1, { inwardDate: "2026-03-01" });
+    await postInward(owner, fabric, 5, 1, { inwardDate: "2026-01-01" });
     const rows = (await owner.get(`/api/v1/fabrics/movements?fabricId=${fabric.id}`)).body.data.movements;
     expect(rows.map((m: { date: string; balance: number }) => [m.date, m.balance])).toEqual([
       ["2026-03-01", 15],
@@ -326,8 +517,8 @@ describe("purchases and stock ledger", () => {
 
   it("keeps the stock projection equal to the ledger sum", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    const inward = await postInward(owner, fabric.id, 40, 100);
+    const fabric = await createFabric();
+    const inward = await postInward(owner, fabric, 40, 100);
     await owner.send("post", `/api/v1/fabrics/${fabric.id}/adjustments`, {
       direction: "OUT",
       quantity: 15,
@@ -338,7 +529,7 @@ describe("purchases and stock ledger", () => {
       quantity: 5,
       reason: "Found",
     });
-    await postInward(owner, fabric.id, 30, 100);
+    await postInward(owner, fabric, 30, 100);
     await owner.send("post", `/api/v1/fabrics/inwards/${inward.id}/reverse`, { reason: "Wrong fabric" });
     const { rows } = await sql(
       `SELECT s.balance AS projected, s.purchased_qty AS purchased,
@@ -356,10 +547,11 @@ describe("purchases and stock ledger", () => {
 
   it("rejects colour or roll on purchases and adjustments", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
+    const fabric = await createFabric();
 
     const purchase = await owner.send("post", "/api/v1/fabrics/inwards", {
-      fabricId: fabric.id,
+      fabricName: fabric.name,
+      unit: fabric.unit,
       inwardDate: "2026-01-05",
       quantity: 1,
       rate: 1,
@@ -379,34 +571,9 @@ describe("purchases and stock ledger", () => {
 
   it("keeps the ledger append-only at the database level", async () => {
     const { owner } = await setup();
-    const fabric = await createFabric(owner);
-    await postInward(owner, fabric.id, 10, 1);
+    const fabric = await createFabric();
+    await postInward(owner, fabric, 10, 1);
     await expect(sql("UPDATE fabric_movements SET qty_in = 999")).rejects.toThrow(/append-only/);
     await expect(sql("DELETE FROM fabric_movements")).rejects.toThrow(/append-only/);
-  });
-});
-
-describe("removed features", () => {
-  it("no longer accepts category or deactivation, and has no bulk status or import endpoints", async () => {
-    const { owner } = await setup();
-    const withCategory = await owner.send("post", "/api/v1/fabrics", {
-      code: "X-1",
-      name: "X",
-      unit: "KG",
-      category: "Knit",
-    });
-    expect(withCategory.status).toBe(400);
-    expect((await owner.send("post", "/api/v1/fabrics/bulk-status", { ids: [], isActive: false })).status).toBe(404);
-    expect((await owner.send("post", "/api/v1/fabrics/import", { rows: [] })).status).toBe(404);
-    // Fabrics cannot be deactivated.
-    const fabric = await createFabric(owner, { code: "ACT-1", name: "Always On" });
-    const deactivate = await owner.send("put", `/api/v1/fabrics/${fabric.id}`, {
-      code: "ACT-1",
-      name: "Always On",
-      unit: "KG",
-      isActive: false,
-    });
-    expect(deactivate.status).toBe(400);
-    expect((await owner.get(`/api/v1/fabrics/${fabric.id}`)).body.data.fabric).not.toHaveProperty("isActive");
   });
 });

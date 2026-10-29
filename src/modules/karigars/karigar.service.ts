@@ -12,8 +12,9 @@ export interface KarigarDto {
   phone: string | null;
   category: string;
   payMode: string;
-  /** Pay details are hidden from users without costing.view or karigar.manage. */
+  /** Null without costing.view or karigar.manage (who sets rates). */
   payRate: number | null;
+  /** Lifetime earnings are payroll data: null without costing.view. */
   earned: number | null;
   active: boolean;
   notes: string | null;
@@ -51,7 +52,13 @@ const FROM = Prisma.raw(`
   LEFT JOIN (SELECT karigar_id, sum(amount) AS earned FROM karigar_ledger GROUP BY karigar_id) e
     ON e.karigar_id = k.id`);
 
-function toKarigar(row: KarigarRow, showPay: boolean): KarigarDto {
+/** Which pay figures the caller may see. */
+export interface PayVisibility {
+  rate: boolean;
+  earned: boolean;
+}
+
+function toKarigar(row: KarigarRow, pay: PayVisibility): KarigarDto {
   return {
     id: row.id,
     number: row.number,
@@ -59,18 +66,18 @@ function toKarigar(row: KarigarRow, showPay: boolean): KarigarDto {
     phone: row.phone,
     category: row.category,
     payMode: row.pay_mode,
-    payRate: showPay ? row.pay_rate : null,
-    earned: showPay ? row.earned : null,
+    payRate: pay.rate ? row.pay_rate : null,
+    earned: pay.earned ? row.earned : null,
     active: row.active,
     notes: row.notes,
     createdAt: row.created_at,
   };
 }
 
-async function findById(id: string, showPay: boolean): Promise<KarigarDto | null> {
+async function findById(id: string, pay: PayVisibility): Promise<KarigarDto | null> {
   const [row] = await prisma.$queryRaw<KarigarRow[]>`SELECT ${SELECT} ${FROM} WHERE k.id = ${id}::uuid`;
 
-  return row ? toKarigar(row, showPay) : null;
+  return row ? toKarigar(row, pay) : null;
 }
 
 function audit(actor: AuthContext, meta: ClientMeta) {
@@ -78,26 +85,29 @@ function audit(actor: AuthContext, meta: ClientMeta) {
 }
 
 export const karigarService = {
-  async list(query: KarigarListQuery, showPay: boolean): Promise<{ karigars: KarigarDto[]; total: number }> {
+  async list(query: KarigarListQuery, pay: PayVisibility): Promise<{ karigars: KarigarDto[]; total: number }> {
     const clauses = columnFilters(KARIGAR_COLUMNS, query);
 
     if (query.search) clauses.push(Prisma.sql`k.search_text LIKE ${contains(query.search)}`);
 
     // Rates and earnings must not leak through filters or sort order either.
-    if (!showPay && (query.payRateMin ?? query.payRateMax ?? query.earnedMin ?? query.earnedMax) !== undefined) {
+    if (
+      (!pay.rate && (query.payRateMin ?? query.payRateMax) !== undefined) ||
+      (!pay.earned && (query.earnedMin ?? query.earnedMax) !== undefined)
+    ) {
       throw errors.forbidden();
     }
 
     const filter = where(clauses);
-    const paySort = query.sort === "payRate" || query.sort === "earned";
-    const order = orderBy(KARIGAR_COLUMNS, showPay || !paySort ? query : { ...query, sort: undefined }, "k.active DESC, k.name", "k.id");
+    const hiddenSort = (query.sort === "payRate" && !pay.rate) || (query.sort === "earned" && !pay.earned);
+    const order = orderBy(KARIGAR_COLUMNS, hiddenSort ? { ...query, sort: undefined } : query, "k.active DESC, k.name", "k.id");
 
     const [rows, [count]] = await Promise.all([
       prisma.$queryRaw<KarigarRow[]>`SELECT ${SELECT} ${FROM} ${filter} ${order} ${page(query)}`,
       prisma.$queryRaw<{ total: number }[]>`SELECT count(*)::int AS total ${FROM} ${filter}`,
     ]);
 
-    return { karigars: rows.map((row) => toKarigar(row, showPay)), total: count!.total };
+    return { karigars: rows.map((row) => toKarigar(row, pay)), total: count!.total };
   },
 
   /** Active workers for pickers, e.g. choosing a cutting master. */
@@ -109,15 +119,15 @@ export const karigarService = {
     });
   },
 
-  async get(id: string, showPay: boolean): Promise<KarigarDto> {
-    const karigar = await findById(id, showPay);
+  async get(id: string, pay: PayVisibility): Promise<KarigarDto> {
+    const karigar = await findById(id, pay);
 
     if (!karigar) throw errors.notFound("Karigar");
 
     return karigar;
   },
 
-  async create(actor: AuthContext, input: KarigarInput, meta: ClientMeta): Promise<KarigarDto> {
+  async create(actor: AuthContext, input: KarigarInput, meta: ClientMeta, pay: PayVisibility): Promise<KarigarDto> {
     const id = await transaction(async (tx) => {
       const { id } = await tx.karigar.create({ data: { ...input, createdById: actor.user.id }, select: { id: true } });
 
@@ -126,10 +136,16 @@ export const karigarService = {
       return id;
     });
 
-    return (await findById(id, true))!;
+    return (await findById(id, pay))!;
   },
 
-  async update(actor: AuthContext, id: string, input: KarigarInput, meta: ClientMeta): Promise<KarigarDto> {
+  async update(
+    actor: AuthContext,
+    id: string,
+    input: KarigarInput,
+    meta: ClientMeta,
+    pay: PayVisibility,
+  ): Promise<KarigarDto> {
     await transaction(async (tx) => {
       const existing = await tx.karigar.findUnique({ where: { id }, select: { id: true } });
 
@@ -144,6 +160,6 @@ export const karigarService = {
       });
     });
 
-    return (await findById(id, true))!;
+    return (await findById(id, pay))!;
   },
 };

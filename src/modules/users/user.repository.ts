@@ -40,8 +40,12 @@ export const userRepository = {
     });
     return users.map(({ _count, invitations, ...user }) => {
       const invitation = invitations[0];
+      // Locks expire on their own; the row only flips back on the next sign-in.
+      const lockOver = user.status === "LOCKED" && user.lockedUntil !== null && user.lockedUntil <= now;
       return {
         ...user,
+        status: lockOver ? "ACTIVE" : user.status,
+        lockedUntil: lockOver ? null : user.lockedUntil,
         activeSessionCount: _count.sessions,
         invitation: invitation ? { ...invitation, expired: invitation.expiresAt <= now } : null,
       };
@@ -50,6 +54,14 @@ export const userRepository = {
 
   /** Call inside a transaction: the row lock serializes concurrent admin changes to one user. */
   async findForUpdate(db: Db, userId: string): Promise<ManagedUserRecord | null> {
+    // An owner target means the owner count is checked next: lock every owner first,
+    // in id order, so two owners changing each other at once queue instead of deadlocking.
+    await db.$queryRaw`
+      SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id
+      WHERE r.key = 'OWNER'
+        AND EXISTS (SELECT 1 FROM users t JOIN roles tr ON tr.id = t.role_id WHERE t.id = ${userId}::uuid AND tr.key = 'OWNER')
+      ORDER BY u.id
+      FOR UPDATE OF u`;
     const [row] = await db.$queryRaw<LockedUserRow[]>`
       SELECT u.id, u.email, u.name, u.status::text AS status,
              r.key AS role_key, r.name AS role_name, r.rank AS role_rank

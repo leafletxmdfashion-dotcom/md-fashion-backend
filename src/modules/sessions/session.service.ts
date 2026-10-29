@@ -1,7 +1,7 @@
 import { env } from "../../config/env";
 import type { Db } from "../../db/prisma";
 import { generateToken, hashToken } from "../../lib/crypto";
-import { isPermission, type Permission } from "../permissions/permission.types";
+import { isPermission, OWNER_ROLE, PERMISSIONS, type Permission } from "../permissions/permission.types";
 import { sessionRepository } from "./session.repository";
 import type { AuthContext, ClientMeta, SessionRevokeReason, SessionSummary } from "./session.types";
 
@@ -11,6 +11,16 @@ const TOUCH_INTERVAL_MS = 60_000;
 
 // Opaque tokens are base64url of 32 bytes (43 chars). Anything else is rejected before hashing.
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+// Every authenticated request resolves its session, and against a remote database
+// that lookup is a full round trip. A verified session is reused for a few seconds.
+// Revoking sessions or changing a role or user in this process clears the cache, so
+// those take effect at once here; another API instance may still honour the old
+// state for up to AUTH_CACHE_MS. The key is the token's hash, never the token.
+// Off in tests, which edit users and roles straight in the database.
+const AUTH_CACHE_MS = env.isTest ? 0 : 10_000;
+const AUTH_CACHE_MAX = 5_000;
+const authCache = new Map<string, { auth: AuthContext; until: number }>();
 
 export interface IssuedSession {
   sessionId: string;
@@ -29,15 +39,27 @@ export const sessionService = {
   async authenticate(token: string | undefined): Promise<AuthContext | null> {
     if (!token || !TOKEN_PATTERN.test(token)) return null;
 
-    const row = await sessionRepository.findValidByTokenHash(hashToken(token), env.sessionIdleTimeoutMs);
-    if (!row) return null;
+    const tokenHash = hashToken(token);
+    const key = Buffer.from(tokenHash).toString("base64");
+    const cached = authCache.get(key);
+    const now = Date.now();
+    if (cached && cached.until > now && cached.auth.expiresAt.getTime() > now) return cached.auth;
+
+    const row = await sessionRepository.findValidByTokenHash(tokenHash, env.sessionIdleTimeoutMs);
+    if (!row) {
+      authCache.delete(key);
+      return null;
+    }
 
     if (Date.now() - row.last_seen_at.getTime() > TOUCH_INTERVAL_MS) {
       await sessionRepository.touch(row.session_id);
     }
 
-    const permissions = new Set<Permission>(row.permissions.filter(isPermission));
-    return {
+    // Owners hold every permission, including ones added to the catalog later.
+    const permissions = new Set<Permission>(
+      row.role_key === OWNER_ROLE ? PERMISSIONS : row.permissions.filter(isPermission),
+    );
+    const auth: AuthContext = {
       sessionId: row.session_id,
       expiresAt: row.expires_at,
       user: {
@@ -49,13 +71,24 @@ export const sessionService = {
         permissions,
       },
     };
+    // ponytail: clearing the whole map when full is crude; an LRU only if thousands of sessions are live.
+    if (authCache.size >= AUTH_CACHE_MAX) authCache.clear();
+    authCache.set(key, { auth, until: now + AUTH_CACHE_MS });
+    return auth;
+  },
+
+  /** Drops every cached session, after anything that changes who may do what. */
+  forgetCached(): void {
+    authCache.clear();
   },
 
   revoke(db: Db, sessionId: string, reason: SessionRevokeReason): Promise<boolean> {
+    authCache.clear();
     return sessionRepository.revokeById(db, sessionId, reason);
   },
 
   revokeOwned(db: Db, sessionId: string, userId: string, reason: SessionRevokeReason): Promise<boolean> {
+    authCache.clear();
     return sessionRepository.revokeOwnedById(db, sessionId, userId, reason);
   },
 
@@ -63,11 +96,13 @@ export const sessionService = {
   // expired one, so a pre-login token can never be carried into the new session.
   async revokePresentedToken(db: Db, token: string | undefined, reason: SessionRevokeReason): Promise<void> {
     if (token && TOKEN_PATTERN.test(token)) {
+      authCache.clear();
       await sessionRepository.revokeByTokenHash(db, hashToken(token), reason);
     }
   },
 
   revokeAllForUser(db: Db, userId: string, reason: SessionRevokeReason): Promise<number> {
+    authCache.clear();
     return sessionRepository.revokeAllForUser(db, userId, reason);
   },
 
