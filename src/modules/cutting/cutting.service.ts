@@ -1,4 +1,5 @@
 import { prisma, Prisma, transaction } from "../../db/prisma";
+import { factoryToday } from "../../lib/business-date";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { articleService } from "../articles/article.service";
 import { recordAudit } from "../audit/audit.service";
@@ -6,7 +7,7 @@ import type { AuthContext, ClientMeta } from "../sessions/session.types";
 import {
   CALCULATION_VERSION,
   calculateBatch,
-  costOf,
+  fabricCosts,
   cuttingEarning,
   formatKg,
   parseScaled,
@@ -147,7 +148,7 @@ async function saveDefaultsIf(tx: Tx, draft: CuttingDraft, articleId: string): P
   if (draft.saveAsDefault) await articleService.saveDefaults(tx, articleId, { ...draft.marker, sizes: draft.sizes });
 }
 
-const today = () => new Date(new Date().toISOString().slice(0, 10));
+const today = () => new Date(factoryToday());
 
 /** Average rate per kg (4 decimals) of an amount spread over a quantity. */
 function ratePerKg(paisa: bigint, micro: bigint): string {
@@ -325,8 +326,9 @@ function toBatchDto(batch: BatchRecord, showCost: boolean) {
         id: roll.id,
         thaan: roll.thaan,
         issuedKg: roll.issuedKg.toFixed(),
-        returnedKg: roll.returnedKg.toFixed(),
+        returnedKg: dec(roll.returnedKg),
         confirmedLayers: roll.confirmedLayers,
+        note: roll.note,
         status: roll.status,
         estimatedPala: roll.estimatedPala,
         confirmedPala: roll.confirmedPala,
@@ -397,6 +399,21 @@ async function createBatch(
   return id;
 }
 
+/** Issues or finalizes a just-created cutting in the same transaction, when asked to. */
+async function postNew(
+  tx: Tx,
+  actor: AuthContext,
+  batchId: string | null,
+  action: "issue" | "finalize" | undefined,
+  meta: ClientMeta,
+): Promise<void> {
+  if (!batchId || !action) return;
+
+  const { lot, batch } = await lockBatch(tx, batchId);
+
+  await (action === "issue" ? issueLocked : finalizeLocked)(tx, actor, lot, batch, meta);
+}
+
 async function lotDetail(id: string, showCost: boolean) {
   const lot = await prisma.productionLot.findUnique({
     where: { id },
@@ -464,7 +481,7 @@ async function lotDetail(id: string, showCost: boolean) {
             entries: costs.map((cost) => ({
               id: cost.id,
               kind: cost.kind,
-              batchNumber: cost.batch.number,
+              batchNumber: cost.batch?.number ?? null,
               date: cost.entryDate.toISOString().slice(0, 10),
               quantity: cost.quantity.toFixed(),
               rate: cost.rate.toFixed(),
@@ -544,6 +561,8 @@ export const lotService = {
 
         const batchId = input.cutting ? await createBatch(tx, actor, existing, input.cutting, meta) : null;
 
+        await postNew(tx, actor, batchId, input.action, meta);
+
         return { lotId: existing.id, batchId };
       }
 
@@ -580,10 +599,14 @@ export const lotService = {
         ? await createBatch(tx, actor, { id: lot.id, article_id: article.id }, input.cutting, meta)
         : null;
 
+      await postNew(tx, actor, batchId, input.action, meta);
+
       return { lotId: lot.id, batchId };
     });
 
-    return { lot: await lotDetail(lotId, showCost), batch: batchId ? await batchDto(batchId, showCost) : null };
+    const [lot, batch] = await Promise.all([lotDetail(lotId, showCost), batchId ? batchDto(batchId, showCost) : null]);
+
+    return { lot, batch };
   },
 
   async update(actor: AuthContext, id: string, input: UpdateLotInput, meta: ClientMeta, showCost: boolean) {
@@ -601,6 +624,14 @@ export const lotService = {
 
         if (count("ISSUED", "FINALIZED") > 0) {
           throw errors.conflict(`${lot.lot_number} has fabric issued or cut. Reverse its cutting before cancelling.`);
+        }
+
+        // Drafts hold no stock or cost; left behind they could never be finalized.
+        const drafts = await tx.cuttingBatch.findMany({ where: { lotId: id, status: "DRAFT" }, select: { id: true } });
+
+        for (const draft of drafts) {
+          await tx.cuttingBatch.delete({ where: { id: draft.id } });
+          await recordAudit(tx, { type: "CUTTING_DRAFT_DELETED", ...audit(actor, meta), metadata: { batchId: draft.id, lotId: id } });
         }
       } else if (input.status === "COMPLETED") {
         if (lot.status !== "ACTIVE") throw errors.conflict("Only an active lot can be completed.");
@@ -645,6 +676,268 @@ export const lotService = {
   },
 };
 
+/** The batch's own cutting master, already loaded with it: posting needs an active one. */
+function assertLoadedMaster(batch: BatchRecord): void {
+  if (!batch.cuttingMaster) throw fieldError("cuttingMasterId", "Choose the cutting master.");
+
+  if (!batch.cuttingMaster.active) throw fieldError("cuttingMasterId", "Choose an active cutting master.");
+}
+
+/** Writes a submitted draft onto a locked, still open batch; returns the batch as now stored. */
+async function applyDraft(
+  tx: Tx,
+  actor: AuthContext,
+  { lot, batch }: { lot: LockedLot; batch: BatchRecord },
+  draft: CuttingDraft,
+  meta: ClientMeta,
+): Promise<BatchRecord> {
+  if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
+    throw errors.conflict(`${cutNumber(batch.number)} is ${batch.status.toLowerCase()}; it can no longer be edited.`);
+  }
+
+  assertLotOpen(lot);
+  await assertMaster(tx, draft.cuttingMasterId, batch.status === "ISSUED");
+  await tx.cuttingBatch.update({ where: { id: batch.id }, data: batchFields(draft) });
+  await writeDraft(tx, batch, batch.id, draft);
+  await saveDefaultsIf(tx, draft, lot.article_id);
+  await recordAudit(tx, { type: "CUTTING_DRAFT_SAVED", ...audit(actor, meta), metadata: { batchId: batch.id, lotId: lot.id } });
+
+  return (await loadBatch(tx, batch.id))!;
+}
+
+/** The locked batch, with the form's unsaved edits applied first when they were sent along. */
+function withDraft(
+  tx: Tx,
+  actor: AuthContext,
+  locked: { lot: LockedLot; batch: BatchRecord },
+  draft: CuttingDraft | undefined,
+  meta: ClientMeta,
+): Promise<BatchRecord> {
+  return draft ? applyDraft(tx, actor, locked, draft, meta) : Promise.resolve(locked.batch);
+}
+
+/** Issues every Thaan still in the store, inside the caller's transaction. */
+async function issueLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch: BatchRecord, meta: ClientMeta): Promise<void> {
+  const id = batch.id;
+
+  if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
+    throw errors.conflict(`${cutNumber(batch.number)} is already ${batch.status.toLowerCase()}.`);
+  }
+
+  assertLotOpen(lot);
+  assertLoadedMaster(batch);
+
+  const { count } = await issueRolls(tx, actor, lot, batch);
+
+  if (count === 0) throw errors.conflict(`Every Thaan in ${cutNumber(batch.number)} has already been issued.`);
+
+  await recordAudit(tx, {
+    type: "CUTTING_FABRIC_ISSUED",
+    ...audit(actor, meta),
+    metadata: { batchId: id, lotId: lot.id, rolls: count },
+  });
+}
+
+/**
+ * Posts a locked batch inside the caller's transaction: see cuttingService.finalize.
+ */
+async function finalizeLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch: BatchRecord, meta: ClientMeta): Promise<void> {
+  const id = batch.id;
+
+  if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
+    throw errors.conflict(`${cutNumber(batch.number)} is already ${batch.status.toLowerCase()}.`);
+  }
+
+  assertLotOpen(lot);
+
+  assertLoadedMaster(batch);
+
+  const inputs = calcInputsOf(batch);
+  const result = calculateBatch(inputs.marker, inputs.colours);
+
+  if (result.issues.length > 0) throw validationError(result.issues);
+
+  const issued = await issueRolls(tx, actor, lot, batch);
+  const master = batch.cuttingMaster!;
+  const reference = `${cutNumber(batch.number)} · ${lot.lot_number}`;
+  const movements: Prisma.CuttingMovementCreateManyInput[] = [];
+  const returns: Prisma.FabricMovementCreateManyInput[] = [];
+  const rollRows: Prisma.Sql[] = [];
+  const rollCosts: { consumedKg: bigint; wastageKg: bigint; rate: string }[] = [];
+
+  for (const [colourIndex, colour] of batch.colours.entries()) {
+    for (const [rollIndex, roll] of colour.rolls.entries()) {
+      const calc = result.colours[colourIndex]!.rolls[rollIndex]!;
+      // Thaan issued just now carry the rate snapshotted by issueRolls.
+      const rate = roll.fabricRate?.toFixed() ?? issued.rate ?? "0";
+
+      const base = {
+        batchId: id,
+        lotId: lot.id,
+        fabricId: lot.fabric_id,
+        rollId: roll.id,
+        colour: colour.name,
+        thaan: roll.thaan,
+        movementDate: batch.cuttingDate,
+        createdById: actor.user.id,
+      };
+
+      if (calc.returnedKg > 0n) {
+        movements.push({ ...base, type: "RETURN", fromState: "CUTTING", toState: "STORE", quantity: kg(calc.returnedKg) });
+        returns.push({
+          fabricId: lot.fabric_id,
+          movementDate: batch.cuttingDate,
+          type: "CUTTING_RETURN",
+          qtyIn: kg(calc.returnedKg),
+          reason: `Returned from cutting ${reference} · ${colour.name} · Thaan ${roll.thaan}`,
+          cuttingBatchId: id,
+          createdById: actor.user.id,
+        });
+      }
+
+      if (calc.consumedKg > 0n) {
+        movements.push({ ...base, type: "CONSUME", fromState: "CUTTING", toState: "CONSUMED", quantity: kg(calc.consumedKg) });
+      }
+
+      if (calc.wastageKg > 0n) {
+        movements.push({
+          ...base,
+          type: "WASTAGE",
+          fromState: "CUTTING",
+          toState: "WASTAGE",
+          quantity: kg(calc.wastageKg),
+          wastageType: WASTAGE_TYPE,
+        });
+      }
+
+      rollRows.push(
+        Prisma.sql`(${roll.id}::uuid, ${calc.estimatedPala}::int, ${calc.confirmedPala}::int,
+          ${calc.confirmedLayers}::int, ${kg(calc.returnedKg)}::numeric, ${kg(calc.consumedKg)}::numeric,
+          ${kg(calc.wastageKg)}::numeric)`,
+      );
+      rollCosts.push({ consumedKg: calc.consumedKg, wastageKg: calc.wastageKg, rate });
+    }
+  }
+
+  const { consumed: consumedCost, wastage: wastageCost } = fabricCosts(rollCosts);
+
+  // A fixed handful of statements however many Thaan the batch has.
+  if (movements.length > 0) await tx.cuttingMovement.createMany({ data: movements });
+
+  if (returns.length > 0) await tx.fabricMovement.createMany({ data: returns });
+
+  await tx.$executeRaw`
+    UPDATE cutting_rolls r
+    SET status = 'FINALIZED', estimated_pala = v.estimated, confirmed_pala = v.pala, confirmed_layers = v.layers,
+        returned_kg = v.returned, consumed_kg = v.consumed, wastage_kg = v.wastage
+    FROM (VALUES ${Prisma.join(rollRows)}) AS v (id, estimated, pala, layers, returned, consumed, wastage)
+    WHERE r.id = v.id`;
+
+  await tx.cuttingOutput.createMany({
+    data: batch.colours.flatMap((colour, colourIndex) =>
+      result.colours[colourIndex]!.sizes.map((size, position) => ({
+        batchId: id,
+        lotId: lot.id,
+        colourId: colour.id,
+        colourName: colour.name,
+        sizeLabel: size.label,
+        position,
+        plannedQuantity: size.planned,
+        acceptedQuantity: size.accepted,
+        availableForStitching: size.accepted,
+      })),
+    ),
+  });
+
+  // SAFETY: the column's CHECK constraint allows only the PayMode values.
+  const payMode = master.payMode as PayMode;
+  const payRate = master.payRate.toFixed(2);
+  const pay = cuttingEarning(payMode, payRate, result.totals);
+  // Salaried masters and zero rates earn nothing per job, so no ledger row.
+  const earning = pay && pay.amount > 0n ? pay : null;
+  const entryDate = batch.cuttingDate;
+
+  const costs = [
+    { kind: "FABRIC_CONSUMED", quantity: result.totals.consumedKg, paisa: consumedCost, rate: ratePerKg(consumedCost, result.totals.consumedKg) },
+    { kind: "FABRIC_WASTAGE", quantity: result.totals.wastageKg, paisa: wastageCost, rate: ratePerKg(wastageCost, result.totals.wastageKg) },
+    ...(earning ? [{ kind: "CUTTING_LABOUR", quantity: earning.quantity, paisa: earning.amount, rate: payRate }] : []),
+  ];
+
+  await tx.lotCost.createMany({
+    data: costs.flatMap((cost) =>
+      cost.quantity > 0n
+        ? [
+            {
+              lotId: lot.id,
+              batchId: id,
+              sourceId: id,
+              kind: cost.kind,
+              entryDate,
+              quantity: kg(cost.quantity),
+              rate: cost.rate,
+              amount: toDecimal(cost.paisa, 2),
+              createdById: actor.user.id,
+            },
+          ]
+        : [],
+    ),
+  });
+
+  if (earning) {
+    await tx.karigarLedgerEntry.create({
+      data: {
+        karigarId: master.id,
+        entryDate,
+        type: "EARNING",
+        payMode,
+        quantity: kg(earning.quantity),
+        rate: payRate,
+        amount: toDecimal(earning.amount, 2),
+        sourceType: "CUTTING",
+        sourceId: id,
+        description: `Cutting ${reference} · ${result.totals.acceptedPieces} pieces, ${result.totals.confirmedPala} Pala`,
+        createdById: actor.user.id,
+      },
+    });
+  }
+
+  await tx.cuttingBatch.update({
+    where: { id },
+    data: {
+      status: "FINALIZED",
+      calculationVersion: CALCULATION_VERSION,
+      calculatedPalaKg: result.marker.calculatedPalaKg === null ? null : kg(result.marker.calculatedPalaKg),
+      activePalaKg: kg(result.marker.activePalaKg!),
+      totalIssuedKg: kg(result.totals.issuedKg),
+      totalReturnedKg: kg(result.totals.returnedKg),
+      totalConsumedKg: kg(result.totals.consumedKg),
+      totalWastageKg: kg(result.totals.wastageKg),
+      totalPala: result.totals.confirmedPala,
+      totalPlannedPieces: result.totals.plannedPieces,
+      totalAcceptedPieces: result.totals.acceptedPieces,
+      fabricCost: toDecimal(consumedCost + wastageCost, 2),
+      earningAmount: earning ? toDecimal(earning.amount, 2) : null,
+      finalizedById: actor.user.id,
+      finalizedAt: new Date(),
+    },
+  });
+
+  if (lot.status === "DRAFT") await tx.productionLot.update({ where: { id: lot.id }, data: { status: "ACTIVE" } });
+
+  await recordAudit(tx, {
+    type: "CUTTING_FINALIZED",
+    ...audit(actor, meta),
+    metadata: {
+      batchId: id,
+      lotId: lot.id,
+      issuedKg: kg(result.totals.issuedKg),
+      consumedKg: kg(result.totals.consumedKg),
+      wastageKg: kg(result.totals.wastageKg),
+      pieces: result.totals.acceptedPieces,
+    },
+  });
+}
+
 export const cuttingService = {
   list: listBatches,
 
@@ -664,22 +957,10 @@ export const cuttingService = {
 
   /** Saves the editable state of an open batch (draft or issued). */
   async save(actor: AuthContext, id: string, draft: CuttingDraft, meta: ClientMeta, showCost: boolean) {
-    await transaction(async (tx) => {
-      const { lot, batch } = await lockBatch(tx, id);
+    // The batch as saved, read inside the transaction: no extra query after it.
+    const saved = await transaction(async (tx) => applyDraft(tx, actor, await lockBatch(tx, id), draft, meta));
 
-      if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
-        throw errors.conflict(`${cutNumber(batch.number)} is ${batch.status.toLowerCase()}; it can no longer be edited.`);
-      }
-
-      assertLotOpen(lot);
-      await assertMaster(tx, draft.cuttingMasterId, batch.status === "ISSUED");
-      await tx.cuttingBatch.update({ where: { id }, data: batchFields(draft) });
-      await writeDraft(tx, batch, id, draft);
-      await saveDefaultsIf(tx, draft, lot.article_id);
-      await recordAudit(tx, { type: "CUTTING_DRAFT_SAVED", ...audit(actor, meta), metadata: { batchId: id, lotId: lot.id } });
-    });
-
-    return batchDto(id, showCost);
+    return toBatchDto(saved, showCost);
   },
 
   async remove(actor: AuthContext, id: string, meta: ClientMeta): Promise<void> {
@@ -723,26 +1004,11 @@ export const cuttingService = {
     };
   },
 
-  async issue(actor: AuthContext, id: string, meta: ClientMeta, showCost: boolean) {
+  async issue(actor: AuthContext, id: string, meta: ClientMeta, showCost: boolean, draft?: CuttingDraft) {
     await transaction(async (tx) => {
-      const { lot, batch } = await lockBatch(tx, id);
+      const locked = await lockBatch(tx, id);
 
-      if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
-        throw errors.conflict(`${cutNumber(batch.number)} is already ${batch.status.toLowerCase()}.`);
-      }
-
-      assertLotOpen(lot);
-      await assertMaster(tx, batch.cuttingMasterId, true);
-
-      const { count } = await issueRolls(tx, actor, lot, batch);
-
-      if (count === 0) throw errors.conflict(`Every Thaan in ${cutNumber(batch.number)} has already been issued.`);
-
-      await recordAudit(tx, {
-        type: "CUTTING_FABRIC_ISSUED",
-        ...audit(actor, meta),
-        metadata: { batchId: id, lotId: lot.id, rolls: count },
-      });
+      await issueLocked(tx, actor, locked.lot, await withDraft(tx, actor, locked, draft, meta), meta);
     });
 
     return batchDto(id, showCost);
@@ -750,210 +1016,17 @@ export const cuttingService = {
 
   /**
    * Posts a batch in one transaction: issues any Thaan still in the store, then per
-   * Thaan moves returns back to the store, consumed weight to CONSUMED and the
+   * Thaan moves returns (as entered, or worked out) back to the store, consumed weight to CONSUMED and the
    * unreturned remainder to WASTAGE (AUTO_PALA_REMAINDER); writes size-wise output,
    * fabric and labour cost and the cutting master's earning, and locks the batch.
    * Everything is recalculated here from stored inputs. The batch row lock and the
    * once-only unique keys make a repeated request a conflict, never a second posting.
    */
-  async finalize(actor: AuthContext, id: string, meta: ClientMeta, showCost: boolean) {
+  async finalize(actor: AuthContext, id: string, meta: ClientMeta, showCost: boolean, draft?: CuttingDraft) {
     await transaction(async (tx) => {
-      const { lot, batch } = await lockBatch(tx, id);
+      const locked = await lockBatch(tx, id);
 
-      if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
-        throw errors.conflict(`${cutNumber(batch.number)} is already ${batch.status.toLowerCase()}.`);
-      }
-
-      assertLotOpen(lot);
-
-      if (lot.target_quantity === null) {
-        throw fieldError("targetQuantity", `Confirm the target quantity of ${lot.lot_number} before finalizing its cutting.`);
-      }
-
-      await assertMaster(tx, batch.cuttingMasterId, true);
-
-      const inputs = calcInputsOf(batch);
-      const result = calculateBatch(inputs.marker, inputs.colours);
-
-      if (result.issues.length > 0) throw validationError(result.issues);
-
-      const issued = await issueRolls(tx, actor, lot, batch);
-      const master = batch.cuttingMaster!;
-      const reference = `${cutNumber(batch.number)} · ${lot.lot_number}`;
-      const movements: Prisma.CuttingMovementCreateManyInput[] = [];
-      const returns: Prisma.FabricMovementCreateManyInput[] = [];
-      const rollRows: Prisma.Sql[] = [];
-      let consumedCost = 0n;
-      let wastageCost = 0n;
-
-      for (const [colourIndex, colour] of batch.colours.entries()) {
-        for (const [rollIndex, roll] of colour.rolls.entries()) {
-          const calc = result.colours[colourIndex]!.rolls[rollIndex]!;
-          // Thaan issued just now carry the rate snapshotted by issueRolls.
-          const rate = roll.fabricRate?.toFixed() ?? issued.rate ?? "0";
-
-          const base = {
-            batchId: id,
-            lotId: lot.id,
-            fabricId: lot.fabric_id,
-            rollId: roll.id,
-            colour: colour.name,
-            thaan: roll.thaan,
-            movementDate: batch.cuttingDate,
-            createdById: actor.user.id,
-          };
-
-          if (calc.returnedKg > 0n) {
-            movements.push({ ...base, type: "RETURN", fromState: "CUTTING", toState: "STORE", quantity: kg(calc.returnedKg) });
-            returns.push({
-              fabricId: lot.fabric_id,
-              movementDate: batch.cuttingDate,
-              type: "CUTTING_RETURN",
-              qtyIn: kg(calc.returnedKg),
-              reason: `Returned from cutting ${reference} · ${colour.name} · Thaan ${roll.thaan}`,
-              cuttingBatchId: id,
-              createdById: actor.user.id,
-            });
-          }
-
-          if (calc.consumedKg > 0n) {
-            movements.push({ ...base, type: "CONSUME", fromState: "CUTTING", toState: "CONSUMED", quantity: kg(calc.consumedKg) });
-          }
-
-          if (calc.wastageKg > 0n) {
-            movements.push({
-              ...base,
-              type: "WASTAGE",
-              fromState: "CUTTING",
-              toState: "WASTAGE",
-              quantity: kg(calc.wastageKg),
-              wastageType: WASTAGE_TYPE,
-            });
-          }
-
-          rollRows.push(
-            Prisma.sql`(${roll.id}::uuid, ${calc.estimatedPala}::int, ${calc.confirmedPala}::int,
-              ${calc.confirmedLayers}::int, ${kg(calc.consumedKg)}::numeric, ${kg(calc.wastageKg)}::numeric)`,
-          );
-          consumedCost += costOf(calc.consumedKg, rate);
-          wastageCost += costOf(calc.wastageKg, rate);
-        }
-      }
-
-      // A fixed handful of statements however many Thaan the batch has.
-      if (movements.length > 0) await tx.cuttingMovement.createMany({ data: movements });
-
-      if (returns.length > 0) await tx.fabricMovement.createMany({ data: returns });
-
-      await tx.$executeRaw`
-        UPDATE cutting_rolls r
-        SET status = 'FINALIZED', estimated_pala = v.estimated, confirmed_pala = v.pala, confirmed_layers = v.layers,
-            consumed_kg = v.consumed, wastage_kg = v.wastage
-        FROM (VALUES ${Prisma.join(rollRows)}) AS v (id, estimated, pala, layers, consumed, wastage)
-        WHERE r.id = v.id`;
-
-      await tx.cuttingOutput.createMany({
-        data: batch.colours.flatMap((colour, colourIndex) =>
-          result.colours[colourIndex]!.sizes.map((size, position) => ({
-            batchId: id,
-            lotId: lot.id,
-            colourId: colour.id,
-            colourName: colour.name,
-            sizeLabel: size.label,
-            position,
-            plannedQuantity: size.planned,
-            acceptedQuantity: size.accepted,
-            availableForStitching: size.accepted,
-          })),
-        ),
-      });
-
-      // SAFETY: the column's CHECK constraint allows only the PayMode values.
-      const payMode = master.payMode as PayMode;
-      const payRate = master.payRate.toFixed(2);
-      const pay = cuttingEarning(payMode, payRate, result.totals);
-      // Salaried masters and zero rates earn nothing per job, so no ledger row.
-      const earning = pay && pay.amount > 0n ? pay : null;
-      const entryDate = batch.cuttingDate;
-
-      const costs = [
-        { kind: "FABRIC_CONSUMED", quantity: result.totals.consumedKg, paisa: consumedCost, rate: ratePerKg(consumedCost, result.totals.consumedKg) },
-        { kind: "FABRIC_WASTAGE", quantity: result.totals.wastageKg, paisa: wastageCost, rate: ratePerKg(wastageCost, result.totals.wastageKg) },
-        ...(earning ? [{ kind: "CUTTING_LABOUR", quantity: earning.quantity, paisa: earning.amount, rate: payRate }] : []),
-      ];
-
-      await tx.lotCost.createMany({
-        data: costs.flatMap((cost) =>
-          cost.quantity > 0n
-            ? [
-                {
-                  lotId: lot.id,
-                  batchId: id,
-                  kind: cost.kind,
-                  entryDate,
-                  quantity: kg(cost.quantity),
-                  rate: cost.rate,
-                  amount: toDecimal(cost.paisa, 2),
-                  createdById: actor.user.id,
-                },
-              ]
-            : [],
-        ),
-      });
-
-      if (earning) {
-        await tx.karigarLedgerEntry.create({
-          data: {
-            karigarId: master.id,
-            entryDate,
-            type: "EARNING",
-            payMode,
-            quantity: kg(earning.quantity),
-            rate: payRate,
-            amount: toDecimal(earning.amount, 2),
-            sourceType: "CUTTING",
-            sourceId: id,
-            description: `Cutting ${reference} · ${result.totals.acceptedPieces} pieces, ${result.totals.confirmedPala} Pala`,
-            createdById: actor.user.id,
-          },
-        });
-      }
-
-      await tx.cuttingBatch.update({
-        where: { id },
-        data: {
-          status: "FINALIZED",
-          calculationVersion: CALCULATION_VERSION,
-          calculatedPalaKg: result.marker.calculatedPalaKg === null ? null : kg(result.marker.calculatedPalaKg),
-          activePalaKg: kg(result.marker.activePalaKg!),
-          totalIssuedKg: kg(result.totals.issuedKg),
-          totalReturnedKg: kg(result.totals.returnedKg),
-          totalConsumedKg: kg(result.totals.consumedKg),
-          totalWastageKg: kg(result.totals.wastageKg),
-          totalPala: result.totals.confirmedPala,
-          totalPlannedPieces: result.totals.plannedPieces,
-          totalAcceptedPieces: result.totals.acceptedPieces,
-          fabricCost: toDecimal(consumedCost + wastageCost, 2),
-          earningAmount: earning ? toDecimal(earning.amount, 2) : null,
-          finalizedById: actor.user.id,
-          finalizedAt: new Date(),
-        },
-      });
-
-      if (lot.status === "DRAFT") await tx.productionLot.update({ where: { id: lot.id }, data: { status: "ACTIVE" } });
-
-      await recordAudit(tx, {
-        type: "CUTTING_FINALIZED",
-        ...audit(actor, meta),
-        metadata: {
-          batchId: id,
-          lotId: lot.id,
-          issuedKg: kg(result.totals.issuedKg),
-          consumedKg: kg(result.totals.consumedKg),
-          wastageKg: kg(result.totals.wastageKg),
-          pieces: result.totals.acceptedPieces,
-        },
-      });
+      await finalizeLocked(tx, actor, locked.lot, await withDraft(tx, actor, locked, draft, meta), meta);
     });
 
     return batchDto(id, showCost);
@@ -991,7 +1064,8 @@ export const cuttingService = {
 
       const returns = batch.colours.flatMap((colour) =>
         colour.rolls.flatMap((roll) => {
-          const held = roll.issuedKg.minus(roll.returnedKg);
+          // Finalize stored every return, so it is never null here.
+          const held = roll.issuedKg.minus(roll.returnedKg ?? 0);
 
           return held.gt(0) ? [{ colour, roll, held }] : [];
         }),
@@ -1056,6 +1130,7 @@ export const cuttingService = {
         data: costs.map((cost) => ({
           lotId: cost.lotId,
           batchId: id,
+          sourceId: id,
           kind: cost.kind,
           entryDate: date,
           quantity: cost.quantity.negated(),
@@ -1066,8 +1141,8 @@ export const cuttingService = {
         })),
       });
 
-      const earning = await tx.karigarLedgerEntry.findUnique({
-        where: { sourceType_sourceId_type: { sourceType: "CUTTING", sourceId: id, type: "EARNING" } },
+      const earning = await tx.karigarLedgerEntry.findFirst({
+        where: { sourceType: "CUTTING", sourceId: id, type: "EARNING" },
       });
 
       if (earning) {

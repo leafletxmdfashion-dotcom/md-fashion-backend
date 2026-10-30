@@ -41,6 +41,19 @@ describe("invitations", () => {
     expect(res.body.data.invitation).toMatchObject({ email: INVITEE, roleName: "Staff" });
   });
 
+  it("limits only failed token attempts, so one office can onboard many staff", async () => {
+    const { token } = await invite();
+    const office = new TestClient();
+    for (let i = 0; i < 25; i++) {
+      expect((await office.send("post", "/api/v1/auth/invitations/inspect", { token })).status).toBe(200);
+    }
+    const guesses = [];
+    for (let i = 0; i < 21; i++) {
+      guesses.push((await office.send("post", "/api/v1/auth/invitations/inspect", { token: "x".repeat(43) })).status);
+    }
+    expect(guesses.at(-1)).toBe(429);
+  });
+
   it("does not let an invited user sign in before accepting", async () => {
     await invite();
     const res = await new TestClient().login(INVITEE, PASSPHRASE);

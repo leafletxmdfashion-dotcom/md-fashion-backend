@@ -31,13 +31,12 @@ export function canAssignRole(
   return role.rank < actor.role.rank && role.permissions.every((permission) => actor.permissions.has(permission));
 }
 
-/** Role permission sets are editable only below the actor's rank and within its own grants; OWNER is immutable. */
-export function canEditRolePermissions(
-  actor: AuthenticatedUser,
-  role: RoleRef,
-  nextPermissions: readonly Permission[],
-): boolean {
-  if (isOwner(role) || !hasPermission(actor, "settings.manage")) return false;
-  if (!isOwner(actor.role) && role.rank >= actor.role.rank) return false;
-  return nextPermissions.every((permission) => actor.permissions.has(permission));
+/**
+ * Roles are editable by holders of roles.manage when ranked below them (owners may
+ * edit any role but their own). The Owner role always holds everything.
+ */
+export function canEditRole(actor: AuthenticatedUser, role: RoleRef): boolean {
+  if (isOwner(role) || !hasPermission(actor, "roles.manage")) return false;
+
+  return isOwner(actor.role) || role.rank < actor.role.rank;
 }

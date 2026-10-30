@@ -1,5 +1,5 @@
 import type { Request } from "express";
-import { ipKeyGenerator, rateLimit, type Options } from "express-rate-limit";
+import { ipKeyGenerator, rateLimit, type AugmentedRequest, type Options } from "express-rate-limit";
 
 import { env } from "../config/env";
 import { errors } from "./errors";
@@ -30,7 +30,11 @@ function limiter(
     standardHeaders: "draft-8",
     legacyHeaders: false,
     keyGenerator: ipKey,
-    handler: (_req, _res, next) => next(errors.rateLimited()),
+    // Tells people how long to wait (also in the Retry-After header).
+    handler: (req, _res, next) => {
+      const reset = (req as AugmentedRequest).rateLimit?.resetTime;
+      next(errors.rateLimited(reset ? Math.max(1, Math.ceil((reset.getTime() - Date.now()) / MINUTE)) : undefined));
+    },
     ...options,
   });
 }
@@ -39,7 +43,9 @@ export function createRateLimiters() {
   return {
     api: limiter({ windowMs: MINUTE, limit: env.API_RATE_LIMIT_PER_MINUTE }),
     // Failed attempts only: credential stuffing from one address, and guessing against one account.
-    loginByIp: limiter({ windowMs: 15 * MINUTE, limit: 20, skipSuccessfulRequests: true }),
+    // The whole factory floor may share one address, so the per-IP cap is loose; the
+    // per-account limit and the account lockout stop guessing at any one password.
+    loginByIp: limiter({ windowMs: 15 * MINUTE, limit: 100, skipSuccessfulRequests: true }),
     loginByAccount: limiter({
       windowMs: 15 * MINUTE,
       limit: 10,
@@ -48,8 +54,9 @@ export function createRateLimiters() {
     }),
     forgotByIp: limiter({ windowMs: 15 * MINUTE, limit: 10 }),
     forgotByAccount: limiter({ windowMs: 60 * MINUTE, limit: 3, keyGenerator: accountKey }),
-    // Reset-password and invitation endpoints: token guessing.
-    tokenByIp: limiter({ windowMs: 15 * MINUTE, limit: 20 }),
+    // Reset-password and invitation endpoints: token guessing. Only failures count, so an
+    // office onboarding many staff from one address is never blocked by valid links.
+    tokenByIp: limiter({ windowMs: 15 * MINUTE, limit: 20, skipSuccessfulRequests: true }),
     // Authenticated re-verification (change password).
     sensitive: limiter({ windowMs: 15 * MINUTE, limit: 10, keyGenerator: (req) => req.auth?.user.id ?? ipKey(req) }),
   };

@@ -102,6 +102,16 @@ describe("POST /auth/login", () => {
     const limited = await client.login("ghost@garment.test", "wrong-password-x");
     expect(limited.status).toBe(429);
     expect(limited.body.error.code).toBe("RATE_LIMITED");
+    expect(limited.body.error.message).toMatch(/^Too many attempts\. Try again in 1[45] minutes\.$/);
+  });
+
+  it("a shared factory connection is not blocked by a few dozen typos across different staff", async () => {
+    await createUser({ email: EMAIL });
+    const client = new TestClient();
+    for (let i = 0; i < 25; i++) {
+      expect((await client.login(`staff${i % 5}@garment.test`, `wrong-password-${i}`)).status).toBe(401);
+    }
+    expect((await client.login(EMAIL)).status).toBe(200);
   });
 
   it("temporarily locks an account after repeated failures, then recovers", async () => {

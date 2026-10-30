@@ -1,5 +1,6 @@
 import { Router, type Request, type RequestHandler } from "express";
 
+import { errors } from "../../lib/errors";
 import { actorOf, can, clientMeta } from "../../lib/request";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
@@ -9,6 +10,7 @@ import {
   cuttingDraftSchema,
   idParamsSchema,
   lotListQuerySchema,
+  postBatchSchema,
   previewSchema,
   reverseSchema,
   updateLotSchema,
@@ -42,7 +44,12 @@ export function lotRoutes(): Router {
   }) satisfies RequestHandler);
 
   router.post("/", manage, (async (req, res) => {
-    const data = await lotService.create(actorOf(req), createLotSchema.parse(req.body), clientMeta(req), showCost(req));
+    const input = createLotSchema.parse(req.body);
+
+    // Posting the new cutting needs the same right as the separate issue / finalize request.
+    if (input.action && !can(req, input.action === "issue" ? "cutting.issue" : "cutting.finalize")) throw errors.forbidden();
+
+    const data = await lotService.create(actorOf(req), input, clientMeta(req), showCost(req));
 
     res.status(201).json({ success: true, data });
   }) satisfies RequestHandler);
@@ -110,13 +117,23 @@ export function cuttingRoutes(): Router {
   }) satisfies RequestHandler);
 
   router.post("/:id/issue", requirePermission("cutting.issue"), (async (req, res) => {
-    const batch = await cuttingService.issue(actorOf(req), idOf(req), clientMeta(req), showCost(req));
+    const { cutting } = postBatchSchema.parse(req.body ?? {});
+
+    // Saving edits along with it needs the right to save them on their own.
+    if (cutting && !can(req, "production.manage")) throw errors.forbidden();
+
+    const batch = await cuttingService.issue(actorOf(req), idOf(req), clientMeta(req), showCost(req), cutting);
 
     res.status(201).json({ success: true, data: { batch } });
   }) satisfies RequestHandler);
 
   router.post("/:id/finalize", requirePermission("cutting.finalize"), (async (req, res) => {
-    const batch = await cuttingService.finalize(actorOf(req), idOf(req), clientMeta(req), showCost(req));
+    const { cutting } = postBatchSchema.parse(req.body ?? {});
+
+    // Saving edits along with it needs the right to save them on their own.
+    if (cutting && !can(req, "production.manage")) throw errors.forbidden();
+
+    const batch = await cuttingService.finalize(actorOf(req), idOf(req), clientMeta(req), showCost(req), cutting);
 
     res.status(201).json({ success: true, data: { batch } });
   }) satisfies RequestHandler);

@@ -1,10 +1,8 @@
-import { isUniqueViolation, prisma, Prisma, transaction, type Db } from "../../db/prisma";
-import { AppError, ErrorCode, errors } from "../../lib/errors";
-import { columnFilters, contains, orderBy, page, where } from "../../lib/list-query";
+import { prisma, Prisma, type Db } from "../../db/prisma";
+import { AppError, ErrorCode } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
 import { markerDefaultsSchema, type MarkerDefaults } from "../cutting/cutting.schema";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
-import { ARTICLE_COLUMNS, type ArticleInput, type ArticleListQuery, type SizeTemplateInput } from "./article.schema";
 
 export interface ArticleDto {
   id: string;
@@ -15,12 +13,6 @@ export interface ArticleDto {
   defaultMarker: MarkerDefaults | null;
   lots: number;
   createdAt: Date;
-}
-
-export interface SizeTemplateDto {
-  id: string;
-  name: string;
-  sizes: string[];
 }
 
 interface ArticleRow {
@@ -79,12 +71,6 @@ function audit(actor: AuthContext, meta: ClientMeta) {
   return { actorUserId: actor.user.id, sessionId: actor.sessionId, meta };
 }
 
-async function findById(db: Db, id: string): Promise<ArticleDto | null> {
-  const [row] = await db.$queryRaw<ArticleRow[]>`SELECT ${SELECT} ${FROM} WHERE a.id = ${id}::uuid`;
-
-  return row ? toArticle(row) : null;
-}
-
 /** The article whose name matches once case, spacing and punctuation are ignored. */
 async function findByName(db: Db, name: string): Promise<{ id: string; code: string; name: string } | null> {
   const [row] = await db.$queryRaw<{ id: string; code: string; name: string }[]>`
@@ -103,113 +89,14 @@ async function nextCode(db: Db): Promise<string> {
   return `ART-${String(row!.next).padStart(4, "0")}`;
 }
 
-async function assertFabric(db: Db, fabricId: string | null): Promise<void> {
-  if (!fabricId) return;
-
-  const fabric = await db.fabric.findUnique({ where: { id: fabricId }, select: { id: true } });
-
-  if (!fabric) throw fieldError("defaultFabricId", "Choose a fabric.");
-}
-
-async function save(db: Db, actor: AuthContext, input: ArticleInput, id: string | null): Promise<string> {
-  const sameName = await findByName(db, input.name);
-
-  if (sameName && sameName.id !== id) {
-    throw fieldError("name", `${sameName.name} (${sameName.code}) already exists. Use it instead.`, 409);
-  }
-
-  await assertFabric(db, input.defaultFabricId);
-
-  const data = {
-    name: input.name,
-    // Updates always pass the current code, so only creations draw a new one.
-    code: input.code ?? (await nextCode(db)),
-    defaultFabricId: input.defaultFabricId,
-    defaultMarker: input.defaultMarker ?? Prisma.DbNull,
-    active: input.active,
-  };
-
-  if (id) {
-    await db.article.update({ where: { id }, data });
-
-    return id;
-  }
-
-  const created = await db.article.create({
-    data: { ...data, createdById: actor.user.id },
-    select: { id: true },
-  });
-
-  return created.id;
-}
-
-
 export const articleService = {
-  async list(query: ArticleListQuery): Promise<{ articles: ArticleDto[]; total: number }> {
-    const clauses = columnFilters(ARTICLE_COLUMNS, query);
-
-    if (query.search) clauses.push(Prisma.sql`a.search_text LIKE ${contains(query.search)}`);
-
-    const filter = where(clauses);
-    const order = orderBy(ARTICLE_COLUMNS, query, "a.active DESC, a.name", "a.id");
-
-    const [rows, [count]] = await Promise.all([
-      prisma.$queryRaw<ArticleRow[]>`SELECT ${SELECT} ${FROM} ${filter} ${order} ${page(query)}`,
-      prisma.$queryRaw<{ total: number }[]>`SELECT count(*)::int AS total ${FROM} ${filter}`,
-    ]);
-
-    return { articles: rows.map(toArticle), total: count!.total };
-  },
-
   /** Active articles for the production form's search-or-create picker. */
   async options(): Promise<ArticleDto[]> {
-    const rows = await prisma.$queryRaw<ArticleRow[]>`SELECT ${SELECT} ${FROM} WHERE a.active ORDER BY a.name LIMIT 1000`;
+    const rows = await prisma.$queryRaw<
+      ArticleRow[]
+    >`SELECT ${SELECT} ${FROM} WHERE a.active ORDER BY a.name LIMIT 1000`;
 
     return rows.map(toArticle);
-  },
-
-  async get(id: string): Promise<ArticleDto> {
-    const article = await findById(prisma, id);
-
-    if (!article) throw errors.notFound("Item");
-
-    return article;
-  },
-
-  async create(actor: AuthContext, input: ArticleInput, meta: ClientMeta): Promise<ArticleDto> {
-    try {
-      return await transaction(async (tx) => {
-        const id = await save(tx, actor, input, null);
-
-        await recordAudit(tx, { type: "ARTICLE_CREATED", ...audit(actor, meta), metadata: { articleId: id } });
-
-        return (await findById(tx, id))!;
-      });
-    } catch (error) {
-      if (isUniqueViolation(error)) throw fieldError("code", "Another item already uses this code.", 409);
-
-      throw error;
-    }
-  },
-
-  async update(actor: AuthContext, id: string, input: ArticleInput, meta: ClientMeta): Promise<ArticleDto> {
-    try {
-      return await transaction(async (tx) => {
-        const existing = await tx.article.findUnique({ where: { id }, select: { code: true } });
-
-        if (!existing) throw errors.notFound("Item");
-
-        // Lots keep their own snapshot of code and name, so renaming never rewrites history.
-        await save(tx, actor, { ...input, code: input.code ?? existing.code }, id);
-        await recordAudit(tx, { type: "ARTICLE_UPDATED", ...audit(actor, meta), metadata: { articleId: id } });
-
-        return (await findById(tx, id))!;
-      });
-    } catch (error) {
-      if (isUniqueViolation(error)) throw fieldError("code", "Another item already uses this code.", 409);
-
-      throw error;
-    }
   },
 
   /**
@@ -225,7 +112,10 @@ export const articleService = {
     meta: ClientMeta,
   ): Promise<{ id: string; code: string; name: string }> {
     if ("id" in ref) {
-      const article = await tx.article.findUnique({ where: { id: ref.id }, select: { id: true, code: true, name: true, active: true } });
+      const article = await tx.article.findUnique({
+        where: { id: ref.id },
+        select: { id: true, code: true, name: true, active: true },
+      });
 
       if (!article?.active) throw fieldError("article", "Choose an active item.");
 
@@ -236,53 +126,31 @@ export const articleService = {
 
     if (existing) return existing;
 
-    const id = await save(tx, actor, { name: ref.name, code: ref.code, defaultFabricId, defaultMarker: null, active: true }, null);
+    // The name was just found to be free and the caller has checked the fabric, so save()'s
+    // checks would only repeat those round trips.
+    const article = await tx.article.create({
+      data: {
+        name: ref.name,
+        code: ref.code ?? (await nextCode(tx)),
+        defaultFabricId,
+        defaultMarker: Prisma.DbNull,
+        active: true,
+        createdById: actor.user.id,
+      },
+      select: { id: true, code: true, name: true },
+    });
 
-    await recordAudit(tx, { type: "ARTICLE_CREATED", ...audit(actor, meta), metadata: { articleId: id, inline: true } });
+    await recordAudit(tx, {
+      type: "ARTICLE_CREATED",
+      ...audit(actor, meta),
+      metadata: { articleId: article.id, inline: true },
+    });
 
-    return (await tx.article.findUnique({ where: { id }, select: { id: true, code: true, name: true } }))!;
+    return article;
   },
 
   /** Remembers a batch's marker and ratio as the article's default for its next lot. */
   async saveDefaults(tx: Prisma.TransactionClient, articleId: string, marker: MarkerDefaults): Promise<void> {
     await tx.article.update({ where: { id: articleId }, data: { defaultMarker: marker } });
-  },
-};
-
-export const sizeTemplateService = {
-  async list(): Promise<SizeTemplateDto[]> {
-    return prisma.sizeTemplate.findMany({ select: { id: true, name: true, sizes: true }, orderBy: { name: "asc" } });
-  },
-
-  async save(actor: AuthContext, id: string | null, input: SizeTemplateInput, meta: ClientMeta): Promise<SizeTemplateDto> {
-    try {
-      return await transaction(async (tx) => {
-        const select = { id: true, name: true, sizes: true };
-
-        const template = id
-          ? await tx.sizeTemplate.update({ where: { id }, data: input, select })
-          : await tx.sizeTemplate.create({ data: { ...input, createdById: actor.user.id }, select });
-
-        await recordAudit(tx, { type: "SIZE_TEMPLATE_SAVED", ...audit(actor, meta), metadata: { templateId: template.id } });
-
-        return template;
-      });
-    } catch (error) {
-      if (isUniqueViolation(error)) throw fieldError("name", "Another template already uses this name.", 409);
-
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") throw errors.notFound("Size template");
-
-      throw error;
-    }
-  },
-
-  async remove(actor: AuthContext, id: string, meta: ClientMeta): Promise<void> {
-    await transaction(async (tx) => {
-      const { count } = await tx.sizeTemplate.deleteMany({ where: { id } });
-
-      if (count === 0) throw errors.notFound("Size template");
-
-      await recordAudit(tx, { type: "SIZE_TEMPLATE_DELETED", ...audit(actor, meta), metadata: { templateId: id } });
-    });
   },
 };

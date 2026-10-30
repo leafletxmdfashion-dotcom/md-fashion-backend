@@ -51,18 +51,8 @@ describe("authorization", () => {
     const { staffId } = await setup();
     const staff = await loggedInClient("staff@garment.test");
     expect((await staff.get("/api/v1/users")).status).toBe(403);
-    await sql("UPDATE users SET role_id = (SELECT id FROM roles WHERE key = 'MANAGER') WHERE id = $1", [
-      staffId,
-    ]);
+    await sql("UPDATE users SET role_id = (SELECT id FROM roles WHERE key = 'MANAGER') WHERE id = $1", [staffId]);
     expect((await staff.get("/api/v1/users")).status).toBe(200);
-  });
-
-  it("restricts role permission editing to owners", async () => {
-    await setup();
-    const admin = await loggedInClient("admin@garment.test");
-    expect(
-      (await admin.send("put", "/api/v1/roles/STAFF/permissions", { permissions: ["dashboard.view"] })).status,
-    ).toBe(403);
   });
 });
 
@@ -129,6 +119,42 @@ describe("account administration", () => {
     expect(await auditTypes(staffId)).toEqual(expect.arrayContaining(["USER_DISABLED", "USER_ENABLED"]));
   });
 
+  it("two owners demoting each other at once: one wins, the other gets a clear refusal", async () => {
+    const { ownerId } = await setup();
+    const secondId = await createUser({ email: "owner2@garment.test", role: "OWNER" });
+    const first = await loggedInClient("owner@garment.test");
+    const second = await loggedInClient("owner2@garment.test");
+
+    for (let round = 0; round < 3; round += 1) {
+      const results = await Promise.all([
+        first.send("put", `/api/v1/users/${secondId}/role`, { roleKey: "ADMIN" }),
+        second.send("put", `/api/v1/users/${ownerId}/role`, { roleKey: "ADMIN" }),
+      ]);
+      // The loser is no longer an owner (403) or would leave none (409); never a deadlock 500.
+      const [won, lost] = results.map((res) => res.status).sort();
+      expect(won).toBe(200);
+      expect([403, 409]).toContain(lost);
+      await sql(
+        "UPDATE users SET role_id = (SELECT id FROM roles WHERE key = 'OWNER') WHERE id IN ($1::uuid, $2::uuid)",
+        [ownerId, secondId],
+      );
+    }
+  });
+
+  it("lists a lock that has run out as active, since the user can already sign in", async () => {
+    const { staffId, managerId } = await setup();
+    await sql("UPDATE users SET status = 'LOCKED', locked_until = now() - interval '1 minute' WHERE id = $1", [
+      staffId,
+    ]);
+    await sql("UPDATE users SET status = 'LOCKED', locked_until = now() + interval '5 minutes' WHERE id = $1", [
+      managerId,
+    ]);
+    const owner = await loggedInClient("owner@garment.test");
+    const users = (await owner.get("/api/v1/users")).body.data.users as { id: string; status: string }[];
+    expect(users.find((user) => user.id === staffId)?.status).toBe("ACTIVE");
+    expect(users.find((user) => user.id === managerId)?.status).toBe("LOCKED");
+  });
+
   it("changes roles with an audit record", async () => {
     const { staffId } = await setup();
     const admin = await loggedInClient("admin@garment.test");
@@ -147,28 +173,5 @@ describe("account administration", () => {
     const res = await owner.send("post", `/api/v1/users/${staffId}/sessions/revoke`);
     expect(res.body.data.revokedSessions).toBe(1);
     expect((await staff.get("/api/v1/auth/me")).status).toBe(401);
-  });
-
-  it("owners can edit lower role permissions, audited, but never the OWNER role", async () => {
-    await setup();
-    const owner = await loggedInClient("owner@garment.test");
-    const before = await owner.get("/api/v1/roles");
-    const staffRole = before.body.data.roles.find((role: { key: string }) => role.key === "STAFF");
-
-    try {
-      const res = await owner.send("put", "/api/v1/roles/STAFF/permissions", {
-        permissions: ["dashboard.view", "orders.view"],
-      });
-      expect(res.status).toBe(200);
-      expect(res.body.data.role.permissions).toEqual(["dashboard.view", "orders.view"]);
-      const audit = await sql("SELECT metadata FROM audit_events WHERE event_type = 'PERMISSION_CHANGED'");
-      expect(audit.rows[0].metadata.role).toBe("STAFF");
-
-      const unknown = await owner.send("put", "/api/v1/roles/STAFF/permissions", { permissions: ["root.everything"] });
-      expect(unknown.status).toBe(400);
-      expect((await owner.send("put", "/api/v1/roles/OWNER/permissions", { permissions: [] })).status).toBe(403);
-    } finally {
-      await owner.send("put", "/api/v1/roles/STAFF/permissions", { permissions: staffRole.permissions });
-    }
   });
 });

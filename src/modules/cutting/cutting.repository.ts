@@ -71,7 +71,7 @@ export function calcInputsOf(batch: BatchRecord): CalcInputs {
       rolls: colour.rolls.map((roll) => ({
         thaan: roll.thaan,
         issuedKg: roll.issuedKg.toFixed(),
-        returnedKg: roll.returnedKg.toFixed(),
+        returnedKg: dec(roll.returnedKg),
         confirmedLayers: roll.confirmedLayers,
       })),
     })),
@@ -193,15 +193,18 @@ export async function writeDraft(tx: Prisma.TransactionClient, batch: BatchRecor
 
   const issued = rolls.flatMap(({ roll, position, stored }) =>
     stored && stored.status !== "DRAFT"
-      ? [Prisma.sql`(${stored.id}::uuid, ${position}::int, ${roll.returnedKg}::numeric, ${roll.confirmedLayers}::int)`]
+      ? [
+          Prisma.sql`(${stored.id}::uuid, ${position}::int, ${roll.returnedKg}::numeric, ${roll.confirmedLayers}::int,
+            ${roll.note}::text)`,
+        ]
       : [],
   );
 
   if (issued.length > 0) {
-    // Issued Thaan keep colour, number and weight; only the return and layers change.
+    // Issued Thaan keep colour, number and weight; only the return, layers and note change.
     await tx.$executeRaw`
-      UPDATE cutting_rolls r SET position = v.position, returned_kg = v.returned, confirmed_layers = v.layers
-      FROM (VALUES ${Prisma.join(issued)}) AS v (id, position, returned, layers) WHERE r.id = v.id`;
+      UPDATE cutting_rolls r SET position = v.position, returned_kg = v.returned, confirmed_layers = v.layers, note = v.note
+      FROM (VALUES ${Prisma.join(issued)}) AS v (id, position, returned, layers, note) WHERE r.id = v.id`;
   }
 
   const fresh = rolls.filter(({ stored }) => !stored || stored.status === "DRAFT");
@@ -217,6 +220,7 @@ export async function writeDraft(tx: Prisma.TransactionClient, batch: BatchRecor
         issuedKg: roll.issuedKg,
         returnedKg: roll.returnedKg,
         confirmedLayers: roll.confirmedLayers,
+        note: roll.note,
       })),
     });
   }

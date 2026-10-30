@@ -10,11 +10,7 @@ export function fabricRoutes(): Router {
 
   const view = requirePermission("fabric.view");
 
-  const manage = requirePermission("fabric.manage");
-
   router.get("/", view, fabricController.list);
-  router.get("/export", view, fabricController.exportCsv);
-  router.post("/", manage, fabricController.create);
 
   router.get("/options", view, fabricController.options);
   router.get("/movements", view, fabricController.movements);
@@ -24,10 +20,10 @@ export function fabricRoutes(): Router {
   router.get("/inwards/export", view, fabricController.exportInwards);
   router.get("/inwards/suppliers", view, fabricController.suppliers);
   router.post("/inwards", requirePermission("fabric.inward"), fabricController.createInward);
-  router.post("/inwards/:id/reverse", requirePermission("fabric.adjust"), fabricController.reverseInward);
+  router.post("/inwards/:id/reverse", requirePermission("fabric.reverse"), fabricController.reverseInward);
 
   router.get("/:id", view, fabricController.get);
-  router.put("/:id", manage, fabricController.update);
+  router.put("/:id", requirePermission("fabric.manage"), fabricController.update);
   router.post("/:id/adjustments", requirePermission("fabric.adjust"), fabricController.adjust);
 
   return router;

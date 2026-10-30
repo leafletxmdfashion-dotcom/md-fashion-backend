@@ -156,6 +156,7 @@ export const authService = {
   async updateProfile(auth: AuthContext, input: { name: string }, meta: ClientMeta): Promise<CurrentUserDto> {
     await transaction(async (tx) => {
       await authRepository.updateName(tx, auth.user.id, input.name);
+      sessionService.forgetCached();
       await recordAudit(tx, {
         type: "USER_UPDATED",
         actorUserId: auth.user.id,

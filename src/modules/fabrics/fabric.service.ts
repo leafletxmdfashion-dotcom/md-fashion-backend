@@ -1,11 +1,10 @@
-import { isUniqueViolation, prisma, transaction } from "../../db/prisma";
+import { isUniqueViolation, prisma, transaction, type Db } from "../../db/prisma";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
 import { fabricRepository, inwardRepository, type FabricDto, type InwardDto } from "./fabric.repository";
 import type {
   AdjustmentInput,
-  CreateFabricInput,
   CreateInwardInput,
   FabricListQuery,
   InwardListQuery,
@@ -17,16 +16,54 @@ function fieldError(field: string, message: string): AppError {
   return new AppError(400, ErrorCode.VALIDATION_ERROR, message, { [field]: [message] });
 }
 
-const duplicateCode = () =>
-  new AppError(409, ErrorCode.CONFLICT, "Another fabric already uses this code.", {
-    code: ["Another fabric already uses this code."],
-  });
-
 const formatQty = (quantity: number, unit: string) =>
   `${quantity.toLocaleString("en-IN", { maximumFractionDigits: 3 })} ${unit === "KG" ? "kg" : "m"}`;
 
 function audit(actor: AuthContext, meta: ClientMeta) {
   return { actorUserId: actor.user.id, sessionId: actor.sessionId, meta };
+}
+
+/**
+ * The purchase's fabric by name (ignoring case), locked for the stock write; created
+ * with a generated code when new. A reorder level or description sent with the
+ * purchase becomes the fabric's; one left out keeps the fabric's own.
+ */
+async function resolveFabric(tx: Db, actor: AuthContext, input: CreateInwardInput, meta: ClientMeta): Promise<string> {
+  let found = await fabricRepository.lockByName(tx, input.fabricName);
+  if (!found) {
+    const created = await fabricRepository.create(tx, input, actor.user.id);
+    if (created) {
+      await recordAudit(tx, {
+        type: "FABRIC_CREATED",
+        ...audit(actor, meta),
+        metadata: { fabricId: created.id, code: created.code },
+      });
+      return created.id;
+    }
+    // Another purchase created this name a moment ago; add to that fabric.
+    found = (await fabricRepository.lockByName(tx, input.fabricName))!;
+  }
+
+  const fabric = found;
+  if (fabric.unit !== input.unit) {
+    const unit = fabric.unit === "KG" ? "kilograms" : "metres";
+    throw fieldError("unit", `${fabric.name} is bought in ${unit}. Use the same unit, or a new fabric name.`);
+  }
+
+  const details = {
+    lowStockThreshold: input.lowStockThreshold === undefined ? fabric.lowStockThreshold : input.lowStockThreshold,
+    description: input.description === undefined ? fabric.description : input.description,
+  };
+  const changed = (["lowStockThreshold", "description"] as const).filter((field) => details[field] !== fabric[field]);
+  if (changed.length > 0) {
+    await fabricRepository.updateDetails(tx, fabric.id, details);
+    await recordAudit(tx, {
+      type: "FABRIC_UPDATED",
+      ...audit(actor, meta),
+      metadata: { fabricId: fabric.id, fields: changed },
+    });
+  }
+  return fabric.id;
 }
 
 export const fabricService = {
@@ -44,41 +81,30 @@ export const fabricService = {
     return fabric;
   },
 
-  async create(actor: AuthContext, input: CreateFabricInput, meta: ClientMeta): Promise<FabricDto> {
-    try {
-      return await transaction(async (tx) => {
-        const id = await fabricRepository.create(tx, input, actor.user.id);
-        await recordAudit(tx, {
-          type: "FABRIC_CREATED",
-          ...audit(actor, meta),
-          metadata: { fabricId: id, code: input.code },
-        });
-        return (await fabricRepository.findById(tx, id))!;
-      });
-    } catch (error) {
-      throw isUniqueViolation(error) ? duplicateCode() : error;
-    }
-  },
-
+  /** Fixes a fabric's name, unit, reorder level or description. */
   async update(actor: AuthContext, id: string, input: UpdateFabricInput, meta: ClientMeta): Promise<FabricDto> {
     try {
       return await transaction(async (tx) => {
-        const current = await fabricRepository.lock(tx, id);
-        if (!current) throw errors.notFound("Fabric");
+        if (!(await fabricRepository.lock(tx, id))) throw errors.notFound("Fabric");
         const before = (await fabricRepository.findById(tx, id))!;
         // Posted quantities are in the old unit; changing it would silently rescale history.
-        if (input.unit !== current.unit && before.movementCount > 0) {
+        if (input.unit !== before.unit && before.movementCount > 0) {
           throw fieldError("unit", "The unit cannot change once stock has been posted for this fabric.");
         }
-        await fabricRepository.update(tx, id, input);
-        const fields = (["code", "name", "unit", "lowStockThreshold", "description"] as const).filter(
+        const fields = (["name", "unit", "lowStockThreshold", "description"] as const).filter(
           (field) => input[field] !== before[field],
         );
-        await recordAudit(tx, { type: "FABRIC_UPDATED", ...audit(actor, meta), metadata: { fabricId: id, fields } });
+        if (fields.length > 0) {
+          await fabricRepository.updateDetails(tx, id, input);
+          await recordAudit(tx, { type: "FABRIC_UPDATED", ...audit(actor, meta), metadata: { fabricId: id, fields } });
+        }
         return (await fabricRepository.findById(tx, id))!;
       });
     } catch (error) {
-      throw isUniqueViolation(error) ? duplicateCode() : error;
+      if (!isUniqueViolation(error)) throw error;
+      throw new AppError(409, ErrorCode.CONFLICT, "Another fabric already has this name.", {
+        name: ["Another fabric already has this name."],
+      });
     }
   },
 
@@ -124,12 +150,10 @@ export const inwardService = {
 
   async create(actor: AuthContext, input: CreateInwardInput, meta: ClientMeta): Promise<InwardDto> {
     return transaction(async (tx) => {
-      const fabric = await fabricRepository.lock(tx, input.fabricId);
-      if (!fabric) throw fieldError("fabricId", "Choose a fabric.");
-
-      const id = await inwardRepository.create(tx, input, actor.user.id);
+      const fabricId = await resolveFabric(tx, actor, input, meta);
+      const id = await inwardRepository.create(tx, fabricId, input, actor.user.id);
       await fabricRepository.addMovement(tx, {
-        fabricId: input.fabricId,
+        fabricId,
         date: input.inwardDate,
         type: "PURCHASE_IN",
         quantity: input.quantity,
@@ -139,7 +163,7 @@ export const inwardService = {
       await recordAudit(tx, {
         type: "FABRIC_INWARD_POSTED",
         ...audit(actor, meta),
-        metadata: { inwardId: id, fabricId: input.fabricId, quantity: input.quantity, rate: input.rate },
+        metadata: { inwardId: id, fabricId, quantity: input.quantity, rate: input.rate },
       });
       return (await inwardRepository.findById(tx, id))!;
     });
