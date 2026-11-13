@@ -4,11 +4,15 @@ export type UserStatus = "ACTIVE" | "INVITED" | "DISABLED" | "LOCKED";
 
 export interface AuthenticatedUser {
   id: string;
-  email: string;
+  email: string | null;
+  phone: string | null;
   name: string;
   status: UserStatus;
   role: RoleRef;
   permissions: ReadonlySet<Permission>;
+  mustChangePassword: boolean;
+  /** The staff / karigar record linked to this login, if any. */
+  karigarId: string | null;
 }
 
 export interface AuthContext {

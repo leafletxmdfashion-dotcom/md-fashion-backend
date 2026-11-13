@@ -1,5 +1,5 @@
-import { prisma, Prisma, type Db } from "../../db/prisma";
-import { AppError, ErrorCode } from "../../lib/errors";
+import { prisma, Prisma, transaction, type Db } from "../../db/prisma";
+import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
 import { markerDefaultsSchema, type MarkerDefaults } from "../cutting/cutting.schema";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
@@ -147,6 +147,92 @@ export const articleService = {
     });
 
     return article;
+  },
+
+  /** Deletes an item typed by mistake. One used by a lot or the godown is merged instead. */
+  async remove(actor: AuthContext, id: string, meta: ClientMeta): Promise<void> {
+    await transaction(async (tx) => {
+      const [article] = await tx.$queryRaw<{ name: string; lots: number; moves: number }[]>`
+        SELECT a.name,
+               (SELECT count(*)::int FROM production_lots WHERE article_id = a.id) AS lots,
+               (SELECT count(*)::int FROM godown_movements WHERE article_id = a.id) AS moves
+        FROM articles a WHERE a.id = ${id}::uuid FOR UPDATE`;
+
+      if (!article) throw errors.notFound("Item");
+
+      if (article.lots > 0 || article.moves > 0) {
+        throw errors.conflict(
+          `${article.name} is used by ${article.lots} lot${article.lots === 1 ? "" : "s"}. Merge it into another item instead of deleting.`,
+        );
+      }
+
+      await tx.article.delete({ where: { id } });
+      await recordAudit(tx, {
+        type: "ARTICLE_DELETED",
+        ...audit(actor, meta),
+        metadata: { articleId: id, name: article.name },
+      });
+    });
+  },
+
+  /**
+   * Merges near-duplicate items ("trouser", "Trousers", "Black trouser") into one: their lots
+   * and godown stock move to the item kept, then they are removed. One transaction.
+   */
+  async merge(actor: AuthContext, input: { targetId: string; sourceIds: string[] }, meta: ClientMeta) {
+    const sourceIds = [...new Set(input.sourceIds)];
+
+    if (sourceIds.length === 0) throw fieldError("sourceIds", "Choose the items to merge.");
+
+    if (sourceIds.includes(input.targetId)) throw fieldError("sourceIds", "An item cannot be merged into itself.");
+
+    return transaction(async (tx) => {
+      const ids = [input.targetId, ...sourceIds];
+
+      // Stock rows first, the order dispatch, count and reversal lock them in: a dispatch running
+      // now finishes first, and one waiting finds the merged item's stock afterwards.
+      await tx.$queryRaw`
+        SELECT 1 FROM godown_stock WHERE article_id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
+        ORDER BY article_id, size_label FOR UPDATE`;
+
+      const locked = await tx.$queryRaw<{ id: string; code: string; name: string }[]>`
+        SELECT id, code, name FROM articles WHERE id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
+        ORDER BY id FOR UPDATE`;
+      const target = locked.find((article) => article.id === input.targetId);
+
+      if (!target) throw fieldError("targetId", "Choose the item to keep.");
+
+      if (locked.length !== ids.length)
+        throw fieldError("sourceIds", "An item to merge no longer exists. Reload and try again.");
+
+      const sources = Prisma.join(sourceIds.map((id) => Prisma.sql`${id}::uuid`));
+
+      const lots = await tx.$executeRaw`
+        UPDATE production_lots SET article_id = ${target.id}::uuid, article_code = ${target.code},
+               article_name = ${target.name}, updated_at = now()
+        WHERE article_id IN (${sources})`;
+
+      // The godown ledger keeps every row; only the item it counts moves. The stock projection is rebuilt.
+      await tx.$executeRaw`UPDATE godown_movements SET article_id = ${target.id}::uuid WHERE article_id IN (${sources})`;
+      await tx.$executeRaw`
+        DELETE FROM godown_stock WHERE article_id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})`;
+      await tx.$executeRaw`
+        INSERT INTO godown_stock (article_id, size_label, qty_in, qty_out, balance, last_movement_at)
+        SELECT article_id, size_label, sum(qty_in), sum(qty_out), sum(qty_in) - sum(qty_out), max(created_at)
+        FROM godown_movements WHERE article_id = ${target.id}::uuid GROUP BY 1, 2`;
+      await tx.$executeRaw`DELETE FROM articles WHERE id IN (${sources})`;
+      await recordAudit(tx, {
+        type: "ARTICLES_MERGED",
+        ...audit(actor, meta),
+        metadata: {
+          targetId: target.id,
+          merged: locked.filter((article) => article.id !== target.id).map((article) => article.name),
+          lots,
+        },
+      });
+
+      return { article: { id: target.id, code: target.code, name: target.name }, lots, removed: sourceIds.length };
+    });
   },
 
   /** Remembers a batch's marker and ratio as the article's default for its next lot. */

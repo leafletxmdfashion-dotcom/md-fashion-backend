@@ -20,7 +20,7 @@ import {
 import { cookieNames, sessionCookieOptions } from "./auth.cookies";
 
 const EMAIL = "ada@garment.test";
-const GENERIC = { code: "AUTH_INVALID_CREDENTIALS", message: "Invalid email or password." };
+const GENERIC = { code: "AUTH_INVALID_CREDENTIALS", message: "Invalid email, phone or password." };
 
 beforeEach(resetDatabase);
 
@@ -34,7 +34,10 @@ describe("POST /auth/login", () => {
     expect(res.status).toBe(200);
     expect(res.body.data.user).toMatchObject({ id: userId, email: EMAIL, status: "ACTIVE", role: { key: "MANAGER" } });
     expect(res.body.data.user.permissions).toContain("users.view");
-    expect(JSON.stringify(res.body)).not.toMatch(/argon2|password|hash/i);
+    // mustChangePassword is a flag, not a secret; nothing else may mention passwords or hashes.
+    const { mustChangePassword, ...rest } = res.body.data.user;
+    expect(mustChangePassword).toBe(false);
+    expect(JSON.stringify(rest)).not.toMatch(/argon2|password|hash/i);
 
     const cookie = sessionCookie(res);
     expect(cookie).toMatch(/HttpOnly/);
@@ -75,11 +78,17 @@ describe("POST /auth/login", () => {
     expect(res.body.error).toEqual(GENERIC);
   });
 
-  it("validates a malformed email", async () => {
-    const res = await new TestClient().login("not-an-email");
+  it("validates a missing login id", async () => {
+    const res = await new TestClient().send("post", "/api/v1/auth/login", { identifier: "  ", password: "x" });
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("VALIDATION_ERROR");
-    expect(res.body.error.details.email).toBeDefined();
+    expect(res.body.error.details.identifier).toBeDefined();
+  });
+
+  it("treats a login id without @ as a phone number and still fails generically", async () => {
+    const res = await new TestClient().login("not-an-email");
+    expect(res.status).toBe(401);
+    expect(res.body.error).toEqual(GENERIC);
   });
 
   it("validates a missing password", async () => {
@@ -177,8 +186,11 @@ describe("GET /auth/me and session validity", () => {
     expect(Object.keys(res.body.data.user).sort()).toEqual([
       "email",
       "id",
+      "karigarId",
+      "mustChangePassword",
       "name",
       "permissions",
+      "phone",
       "role",
       "session",
       "status",

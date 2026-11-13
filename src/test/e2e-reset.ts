@@ -20,6 +20,11 @@ try {
       { email: "owner@garment.test", name: "Olivia Owner", role: "OWNER" },
       { email: "staff@garment.test", name: "Sam Staff", role: "STAFF" },
       { email: "reset@garment.test", name: "Riley Reset", role: "STAFF" },
+      { email: "admin@garment.test", name: "Ada Admin", role: "ADMIN" },
+      { email: "packer@garment.test", name: "Puja Packer", role: "PACKING_STAFF" },
+      { email: "godown@garment.test", name: "Gopal Godown", role: "GODOWN_STAFF" },
+      { email: "accounts@garment.test", name: "Anil Accounts", role: "ACCOUNTANT" },
+      { email: "karigar@garment.test", name: "Ram Tailor", role: "KARIGAR" },
     ].map(({ role, ...user }) => ({ ...user, passwordHash, status: "ACTIVE" as const, roleId: roles.get(role)! })),
   });
 } finally {

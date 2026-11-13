@@ -70,7 +70,10 @@ function normalize(password: string): string {
   return password.normalize("NFKC");
 }
 
-export function assertPasswordPolicy(password: string, context: { email?: string; name?: string } = {}): void {
+export function assertPasswordPolicy(
+  password: string,
+  context: { email?: string | null; phone?: string | null; name?: string } = {},
+): void {
   const candidate = normalize(password);
   const lowered = candidate.toLowerCase();
   const reasons: string[] = [];
@@ -85,6 +88,10 @@ export function assertPasswordPolicy(password: string, context: { email?: string
   const localPart = email?.split("@")[0];
   if (email && (lowered === email || (localPart && localPart.length >= 4 && lowered === localPart))) {
     reasons.push("Password must not match your email address.");
+  }
+  const phoneDigits = context.phone?.replace(/\D/g, "");
+  if (phoneDigits && candidate.replace(/\D/g, "") === phoneDigits && /^[\d\s+()-]+$/.test(candidate)) {
+    reasons.push("Password must not match your phone number.");
   }
   if (context.name && lowered === context.name.trim().toLowerCase()) {
     reasons.push("Password must not match your name.");

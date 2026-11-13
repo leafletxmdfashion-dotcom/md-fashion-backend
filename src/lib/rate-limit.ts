@@ -3,7 +3,7 @@ import { ipKeyGenerator, rateLimit, type AugmentedRequest, type Options } from "
 
 import { env } from "../config/env";
 import { errors } from "./errors";
-import { normalizeEmail } from "./request";
+import { loginLookup } from "./request";
 
 // chisle: in-memory stores are per process. Running several API instances needs a
 // shared store (Redis/Postgres) for these limits; the DB-backed account lockout
@@ -15,12 +15,16 @@ function ipKey(req: Request): string {
   return ipKeyGenerator(req.ip ?? "unknown");
 }
 
-// Keyed by the submitted (normalized) email. Unknown emails are limited exactly like
-// real ones, so a 429 never reveals whether an account exists.
+// Keyed by the submitted (normalized) login id: `identifier` first, as the login schema reads it,
+// then the older `email` field. Unknown ids are limited exactly like real ones, so a 429 never
+// reveals whether an account exists.
 function accountKey(req: Request): string {
-  const body: unknown = req.body;
-  const email = typeof body === "object" && body !== null && "email" in body ? body.email : undefined;
-  return typeof email === "string" && email.length <= 254 ? `email:${normalizeEmail(email)}` : `ip:${ipKey(req)}`;
+  const body = (typeof req.body === "object" && req.body !== null ? req.body : {}) as Record<string, unknown>;
+  const id = body.identifier ?? body.email;
+  if (typeof id !== "string" || id.trim() === "" || id.length > 254) return `ip:${ipKey(req)}`;
+
+  const lookup = loginLookup(id);
+  return "email" in lookup ? `email:${lookup.email}` : `phone:${lookup.phone}`;
 }
 
 function limiter(

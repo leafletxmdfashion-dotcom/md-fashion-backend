@@ -48,7 +48,9 @@ model RolePermission {
 
 model User {
   id                   String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  email                String               @unique
+  /// Login id: email or phone, at least one (CHECK constraint). Email lower-cased, phone digits with optional leading +.
+  email                String?              @unique
+  phone                String?              @unique
   name                 String
   passwordHash         String?              @map("password_hash")
   status               UserStatus           @default(INVITED)
@@ -58,6 +60,8 @@ model User {
   lockedUntil          DateTime?            @map("locked_until") @db.Timestamptz(6)
   lastLoginAt          DateTime?            @map("last_login_at") @db.Timestamptz(6)
   passwordChangedAt    DateTime?            @map("password_changed_at") @db.Timestamptz(6)
+  /// Set when an admin chose the password; every API call except changing it is refused until it is changed.
+  mustChangePassword   Boolean              @default(false) @map("must_change_password")
   createdById          String?              @map("created_by") @db.Uuid
   createdAt            DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt            DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
@@ -89,6 +93,12 @@ model User {
   stitchingReceipts    StitchingReceipt[]   @relation("ReceiptCreatedBy")
   stitchingReceiptsRev StitchingReceipt[]   @relation("ReceiptReversedBy")
   reworkResolutions    ReworkResolution[]
+  karigar              Karigar?             @relation("KarigarLogin")
+  packingCreated       PackingEntry[]       @relation("PackingCreatedBy")
+  packingReversed      PackingEntry[]       @relation("PackingReversedBy")
+  dispatchesCreated    Dispatch[]           @relation("DispatchCreatedBy")
+  dispatchesReversed   Dispatch[]           @relation("DispatchReversedBy")
+  godownMovements      GodownMovement[]
 
   @@index([roleId, status], map: "users_role_status_idx")
   @@map("users")
@@ -264,7 +274,7 @@ model Karigar {
   number            Int                    @unique @default(autoincrement())
   name              String
   phone             String?
-  /// CUTTING_MASTER | TAILOR | HELPER | OTHER (CHECK constraint)
+  /// CUTTING_MASTER | TAILOR | HELPER | PACKER | STAFF | OTHER (CHECK constraint)
   category          String
   /// PER_PIECE | PER_PALA | PER_KG | FIXED_JOB | SALARY (CHECK constraint)
   payMode           String                 @map("pay_mode")
@@ -282,6 +292,10 @@ model Karigar {
   jogadiMemberships JogadiMember[]
   issueMemberships  StitchingIssueMember[]
   reworkAssigned    ReworkItem[]
+  packingEntries    PackingEntry[]
+  /// The login this person uses to see their own ledger.
+  userId            String?                @unique @map("user_id") @db.Uuid
+  user              User?                  @relation("KarigarLogin", fields: [userId], references: [id], onUpdate: NoAction)
 
   @@index([searchText(ops: raw("gin_trgm_ops"))], map: "karigars_search_idx", type: Gin)
   @@map("karigars")
@@ -293,16 +307,23 @@ model KarigarLedgerEntry {
   seq         BigInt   @unique @default(autoincrement())
   karigarId   String   @map("karigar_id") @db.Uuid
   entryDate   DateTime @map("entry_date") @db.Date
-  /// EARNING | EARNING_REVERSAL (CHECK constraint)
+  /// EARNING | EARNING_REVERSAL | PAYMENT | ADVANCE | EXPENSE | CREDIT | RECOVERY | ENTRY_REVERSAL (CHECK constraint)
   type        String
   payMode     String   @map("pay_mode")
   quantity    Decimal  @db.Decimal(18, 6)
   rate        Decimal  @db.Decimal(12, 2)
+  /// Effect on the balance: + the business owes the person, − the person owes the business.
   amount      Decimal  @db.Decimal(14, 2)
-  /// CUTTING | STITCHING | REWORK (CHECK constraint)
+  /// CUTTING | STITCHING | REWORK | PACKING | MANUAL (CHECK constraint)
   sourceType  String   @map("source_type")
   sourceId    String   @map("source_id") @db.Uuid
   description String
+  /// CASH | BANK | WALLET, for money paid or received (CHECK constraint).
+  method      String?
+  /// Expense or credit kind, e.g. Food, Festival, Bonus.
+  category    String?
+  /// Voucher, cheque or transaction number.
+  reference   String?
   createdById String   @map("created_by") @db.Uuid
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   karigar     Karigar  @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
@@ -310,28 +331,31 @@ model KarigarLedgerEntry {
 
   @@unique([sourceType, sourceId, karigarId, type], map: "karigar_ledger_once")
   @@index([karigarId, entryDate], map: "karigar_ledger_karigar_idx")
+  @@index([entryDate(sort: Desc), seq(sort: Desc)], map: "karigar_ledger_date_idx")
   @@map("karigar_ledger")
 }
 
 /// An item / design. name_key blocks names that differ only by case, spacing or punctuation.
 model Article {
-  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  code            String          @unique
+  id              String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code            String           @unique
   name            String
   /// Generated: name lower-cased with every non-alphanumeric removed; unique.
-  nameKey         String?         @unique(map: "articles_name_key_unique") @default(dbgenerated("lower(regexp_replace(name, '[^[:alnum:]]+'::text, ''::text, 'g'::text))")) @map("name_key")
-  defaultFabricId String?         @map("default_fabric_id") @db.Uuid
+  nameKey         String?          @unique(map: "articles_name_key_unique") @default(dbgenerated("lower(regexp_replace(name, '[^[:alnum:]]+'::text, ''::text, 'g'::text))")) @map("name_key")
+  defaultFabricId String?          @map("default_fabric_id") @db.Uuid
   /// Cutting defaults (measurements and size ratio); validated by the API.
-  defaultMarker   Json?           @map("default_marker")
-  active          Boolean         @default(true)
+  defaultMarker   Json?            @map("default_marker")
+  active          Boolean          @default(true)
   /// Generated: lower(code || ' ' || name), trigram-indexed for search.
-  searchText      String?         @default(dbgenerated("lower(((code || ' '::text) || name))")) @map("search_text")
-  createdById     String          @map("created_by") @db.Uuid
-  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  defaultFabric   Fabric?         @relation(fields: [defaultFabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  createdBy       User            @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  searchText      String?          @default(dbgenerated("lower(((code || ' '::text) || name))")) @map("search_text")
+  createdById     String           @map("created_by") @db.Uuid
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  defaultFabric   Fabric?          @relation(fields: [defaultFabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy       User             @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   lots            ProductionLot[]
+  godownMovements GodownMovement[]
+  godownStock     GodownStock[]
 
   @@index([searchText(ops: raw("gin_trgm_ops"))], map: "articles_search_idx", type: Gin)
   @@map("articles")
@@ -368,6 +392,8 @@ model ProductionLot {
   stitchingIssues   StitchingIssue[]
   stitchingReceipts StitchingReceipt[]
   reworkItems       ReworkItem[]
+  packingEntries    PackingEntry[]
+  godownMovements   GodownMovement[]
 
   @@index([productionDate(sort: Desc), createdAt(sort: Desc)], map: "production_lots_date_idx")
   @@index([searchText(ops: raw("gin_trgm_ops"))], map: "production_lots_search_idx", type: Gin)
@@ -384,10 +410,16 @@ model CuttingBatch {
   /// DRAFT | ISSUED | FINALIZED | REVERSED (CHECK constraint)
   status              String            @default("DRAFT")
   notes               String?
-  widthM              Decimal?          @map("width_m") @db.Decimal(10, 4)
-  lengthM             Decimal?          @map("length_m") @db.Decimal(10, 4)
+  widthM              Decimal?          @map("width_m") @db.Decimal(12, 6)
+  lengthM             Decimal?          @map("length_m") @db.Decimal(12, 6)
+  /// M | IN: the unit Panaha was typed in (stored in metres). CHECK constraint.
+  widthUnit           String            @default("M") @map("width_unit")
+  /// M | IN: the unit the layer length was typed in (stored in metres). CHECK constraint.
+  lengthUnit          String            @default("M") @map("length_unit")
   gsm                 Decimal?          @db.Decimal(10, 2)
   measuredPalaKg      Decimal?          @map("measured_pala_kg") @db.Decimal(18, 6)
+  /// The Pala also measured in the other unit (metres for kg fabric, kg for metre fabric). Recorded only; cutting uses measuredPalaKg.
+  palaAltValue        Decimal?          @map("pala_alt_value") @db.Decimal(18, 6)
   /// MEASURED | CALCULATED (CHECK constraint)
   weightSource        String            @default("MEASURED") @map("weight_source")
   repetitionsPerLayer Int               @default(1) @map("repetitions_per_layer")
@@ -763,4 +795,114 @@ model ReworkResolution {
 
   @@index([reworkId], map: "rework_resolutions_rework_idx")
   @@map("rework_resolutions")
+}
+
+/// Good pieces of a lot packed by one person, per size. Paid per piece. POSTED | REVERSED (CHECK constraint).
+model PackingEntry {
+  id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number         Int              @unique @default(autoincrement())
+  lotId          String           @map("lot_id") @db.Uuid
+  packerId       String           @map("packer_id") @db.Uuid
+  packerName     String           @map("packer_name")
+  packDate       DateTime         @map("pack_date") @db.Date
+  pieces         Int
+  rate           Decimal          @db.Decimal(12, 2)
+  earning        Decimal          @db.Decimal(14, 2)
+  notes          String?
+  status         String           @default("POSTED")
+  reversedAt     DateTime?        @map("reversed_at") @db.Timestamptz(6)
+  reversedById   String?          @map("reversed_by") @db.Uuid
+  reversalReason String?          @map("reversal_reason")
+  createdById    String           @map("created_by") @db.Uuid
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  lot            ProductionLot    @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  packer         Karigar          @relation(fields: [packerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy      User             @relation("PackingCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy     User?            @relation("PackingReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lines          PackingLine[]
+  movements      GodownMovement[]
+
+  @@index([packDate(sort: Desc), number(sort: Desc)], map: "packing_entries_date_idx")
+  @@index([lotId], map: "packing_entries_lot_idx")
+  @@index([packerId, packDate], map: "packing_entries_packer_idx")
+  @@map("packing_entries")
+}
+
+model PackingLine {
+  id        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entryId   String       @map("entry_id") @db.Uuid
+  sizeLabel String       @map("size_label")
+  position  Int
+  quantity  Int
+  entry     PackingEntry @relation(fields: [entryId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([entryId, sizeLabel], map: "packing_lines_once")
+  @@map("packing_lines")
+}
+
+/// Finished goods sent out of the godown; its lines are godown movements. POSTED | REVERSED (CHECK constraint).
+model Dispatch {
+  id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number         Int              @unique @default(autoincrement())
+  dispatchDate   DateTime         @map("dispatch_date") @db.Date
+  party          String
+  challan        String?
+  pieces         Int
+  notes          String?
+  status         String           @default("POSTED")
+  reversedAt     DateTime?        @map("reversed_at") @db.Timestamptz(6)
+  reversedById   String?          @map("reversed_by") @db.Uuid
+  reversalReason String?          @map("reversal_reason")
+  createdById    String           @map("created_by") @db.Uuid
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy      User             @relation("DispatchCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversedBy     User?            @relation("DispatchReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  movements      GodownMovement[]
+
+  @@index([dispatchDate(sort: Desc), number(sort: Desc)], map: "dispatches_date_idx")
+  @@map("dispatches")
+}
+
+/// Godown stock ledger per item and size. Append-only (trigger) except article_id, which an item merge moves.
+model GodownMovement {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seq            BigInt         @unique @default(autoincrement())
+  articleId      String         @map("article_id") @db.Uuid
+  sizeLabel      String         @map("size_label")
+  movementDate   DateTime       @map("movement_date") @db.Date
+  /// PACKED_IN | PACKING_REVERSAL | DISPATCH | DISPATCH_REVERSAL | ADJUST_IN | ADJUST_OUT (CHECK constraint)
+  type           String
+  qtyIn          Int            @default(0) @map("qty_in")
+  qtyOut         Int            @default(0) @map("qty_out")
+  lotId          String?        @map("lot_id") @db.Uuid
+  packingEntryId String?        @map("packing_entry_id") @db.Uuid
+  dispatchId     String?        @map("dispatch_id") @db.Uuid
+  reason         String?
+  createdById    String         @map("created_by") @db.Uuid
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  article        Article        @relation(fields: [articleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  lot            ProductionLot? @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  packingEntry   PackingEntry?  @relation(fields: [packingEntryId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  dispatch       Dispatch?      @relation(fields: [dispatchId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy      User           @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([movementDate(sort: Desc), seq(sort: Desc)], map: "godown_movements_date_idx")
+  @@index([articleId, sizeLabel], map: "godown_movements_article_idx")
+  @@index([dispatchId], map: "godown_movements_dispatch_idx", where: raw("(dispatch_id IS NOT NULL)"))
+  @@index([packingEntryId], map: "godown_movements_packing_idx", where: raw("(packing_entry_id IS NOT NULL)"))
+  @@map("godown_movements")
+}
+
+/// Pieces in the godown per item and size, kept by trigger from godown_movements. Read-only for the app.
+model GodownStock {
+  articleId      String   @map("article_id") @db.Uuid
+  sizeLabel      String   @map("size_label")
+  qtyIn          Int      @default(0) @map("qty_in")
+  qtyOut         Int      @default(0) @map("qty_out")
+  balance        Int      @default(0)
+  lastMovementAt DateTime @default(now()) @map("last_movement_at") @db.Timestamptz(6)
+  article        Article  @relation(fields: [articleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@id([articleId, sizeLabel])
+  @@map("godown_stock")
 }

@@ -31,7 +31,17 @@ export interface SizeInput {
   pieceWeightG: string | null;
 }
 
+/** The fabric's unit: weighed fabric is cut by kg, fabric bought by the metre by metres. The maths is the same. */
+export type QtyUnit = "KG" | "METER";
+
+const UNIT_WORDS: Record<QtyUnit, { short: string; quantity: string }> = {
+  KG: { short: "kg", quantity: "weight" },
+  METER: { short: "m", quantity: "length" },
+};
+
 export interface MarkerInput {
+  /** Missing means KG. */
+  unit?: QtyUnit | undefined;
   widthM: string | null;
   lengthM: string | null;
   gsm: string | null;
@@ -162,22 +172,27 @@ export function formatKg(micro: bigint, shown = 3): string {
 
 /** Pala weight from fabric width (m) × marker length (m) × GSM ÷ 1000, in micro-kg. */
 export function calculatedPalaKg(widthM: string | null, lengthM: string | null, gsm: string | null): bigint | null {
-  const width = widthM === null ? null : parseScaled(widthM, 4);
-  const length = lengthM === null ? null : parseScaled(lengthM, 4);
+  const width = widthM === null ? null : parseScaled(widthM, 6);
+  const length = lengthM === null ? null : parseScaled(lengthM, 6);
   const grams = gsm === null ? null : parseScaled(gsm, 2);
 
   if (!width || !length || !grams) return null;
 
-  // 4 + 4 + 2 decimals = 10; grams → kg adds 3 more; micro-kg keeps 6, so drop 7.
-  return divideRounded(width * length * grams, 10n ** 7n);
+  // 6 + 6 + 2 decimals = 14; grams → kg adds 3 more; micro-kg keeps 6, so drop 11.
+  return divideRounded(width * length * grams, 10n ** 11n);
 }
 
 function calculateMarker(input: MarkerInput, issues: Issue[]): MarkerResult {
-  const calculated = calculatedPalaKg(input.widthM, input.lengthM, input.gsm);
+  const words = UNIT_WORDS[input.unit ?? "KG"];
+  // GSM gives a weight, which means nothing for fabric measured by length.
+  const calculated = input.unit === "METER" ? null : calculatedPalaKg(input.widthM, input.lengthM, input.gsm);
   const measured = input.measuredPalaKg ? parseKg(input.measuredPalaKg) : null;
 
   if (input.measuredPalaKg && (measured === null || measured === 0n)) {
-    issues.push({ path: "marker.measuredPalaKg", message: "Enter the Pala weight in kg, up to 6 decimals." });
+    issues.push({
+      path: "marker.measuredPalaKg",
+      message: `Enter the Pala ${words.quantity} in ${words.short}, up to 6 decimals.`,
+    });
   }
 
   const active = input.weightSource === "MEASURED" ? measured || null : calculated;
@@ -185,7 +200,7 @@ function calculateMarker(input: MarkerInput, issues: Issue[]): MarkerResult {
   if (active === null) {
     issues.push(
       input.weightSource === "MEASURED"
-        ? { path: "marker.measuredPalaKg", message: "Enter the measured weight of one Pala." }
+        ? { path: "marker.measuredPalaKg", message: `Enter the measured ${words.quantity} of one Pala.` }
         : { path: "marker.gsm", message: "Enter width, marker length and GSM to calculate the Pala weight." },
     );
   }
@@ -232,7 +247,8 @@ function calculateMarker(input: MarkerInput, issues: Issue[]): MarkerResult {
     issues.push({ path: "sizes", message: "At least one size needs pieces per Pala." });
   }
 
-  if (input.sizes.length === 0) netPalaKg = null;
+  // Piece weights only add up against a Pala weight, not a Pala length.
+  if (input.sizes.length === 0 || input.unit === "METER") netPalaKg = null;
 
   if (netPalaKg !== null && active !== null && netPalaKg > active) {
     issues.push({
@@ -264,23 +280,31 @@ export function calculateRoll(
   repetitionsPerLayer: number,
   path: string,
   issues: Issue[],
+  unit: QtyUnit = "KG",
 ): RollResult {
+  const words = UNIT_WORDS[unit];
   const issued = parseScaled(roll.issuedKg, 6);
   const returnText = roll.returnedKg?.trim() ?? "";
   const entered = returnText === "" ? null : parseScaled(returnText, 6);
 
-  if (issued === null) issues.push({ path: `${path}.issuedKg`, message: "Enter the issued weight in kg." });
-  else if (issued === 0n) issues.push({ path: `${path}.issuedKg`, message: "Issued weight must be more than zero." });
+  if (issued === null) {
+    issues.push({ path: `${path}.issuedKg`, message: `Enter the issued ${words.quantity} in ${words.short}.` });
+  } else if (issued === 0n) {
+    issues.push({ path: `${path}.issuedKg`, message: `Issued ${words.quantity} must be more than zero.` });
+  }
 
   if (returnText !== "" && entered === null) {
-    issues.push({ path: `${path}.returnedKg`, message: "Enter the returned weight in kg." });
+    issues.push({ path: `${path}.returnedKg`, message: `Enter the returned ${words.quantity} in ${words.short}.` });
   }
 
   const issuedKg = issued ?? 0n;
   let enteredKg = entered ?? 0n;
 
   if (enteredKg > issuedKg) {
-    issues.push({ path: `${path}.returnedKg`, message: "Returned weight cannot be more than the issued weight." });
+    issues.push({
+      path: `${path}.returnedKg`,
+      message: `Returned ${words.quantity} cannot be more than the issued ${words.quantity}.`,
+    });
     enteredKg = issuedKg;
   }
 
@@ -377,14 +401,14 @@ export function calculateBatch(markerInput: MarkerInput, colourInputs: ColourInp
 
       if (thaan) thaans.add(thaan.toLowerCase());
 
-      const result = calculateRoll(roll, marker, markerInput.repetitionsPerLayer, rollPath, issues);
+      const result = calculateRoll(roll, marker, markerInput.repetitionsPerLayer, rollPath, issues, markerInput.unit);
 
       const label = `${name || `Colour ${colourIndex + 1}`} Thaan ${thaan || rollIndex + 1}`;
 
       if (marker.activePalaKg && result.netKg > 0n && result.estimatedPala === 0) {
         warnings.push({
           path: `${rollPath}.issuedKg`,
-          message: `Less than one Pala: all ${formatKg(result.netKg)} kg of ${label} becomes wastage unless returned.`,
+          message: `Less than one Pala: all ${formatKg(result.netKg)} ${UNIT_WORDS[markerInput.unit ?? "KG"].short} of ${label} becomes wastage unless returned.`,
         });
       }
 

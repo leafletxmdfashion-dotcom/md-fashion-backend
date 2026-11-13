@@ -1,10 +1,20 @@
 import type { Request, RequestHandler } from "express";
 
+import { z } from "zod";
+
 import { errors } from "../../lib/errors";
 import { clientMeta } from "../../lib/request";
+import { queryRows, rowQueryFields, type RowQuery, type RowSpecs } from "../../lib/row-query";
 import { invitationService } from "./invitation.service";
-import { changeRoleSchema, createInvitationSchema, updateUserSchema, userIdParamsSchema } from "./user.schema";
+import {
+  changeRoleSchema,
+  createInvitationSchema,
+  setPasswordSchema,
+  updateUserSchema,
+  userIdParamsSchema,
+} from "./user.schema";
 import { userService } from "./user.service";
+import type { ManagedUserDto } from "./user.types";
 
 function actorOf(req: Request) {
   if (!req.auth) throw errors.unauthenticated();
@@ -15,9 +25,54 @@ function userIdOf(req: Request): string {
   return userIdParamsSchema.parse(req.params).userId;
 }
 
+/** What the Users table shows: an invitation past its expiry reads "Invite expired". */
+export function userStatus(user: ManagedUserDto): "ACTIVE" | "INVITED" | "EXPIRED" | "LOCKED" | "DISABLED" {
+  if (user.status === "INVITED") return !user.invitation || user.invitation.expired ? "EXPIRED" : "INVITED";
+  return user.status;
+}
+
+export const USER_STATUS_LABEL = {
+  ACTIVE: "Active",
+  INVITED: "Invited",
+  EXPIRED: "Invite expired",
+  LOCKED: "Locked",
+  DISABLED: "Disabled",
+} as const;
+
+// Column keys match the frontend table's, so the same URL params drive the list and its export.
+const USER_SPECS: RowSpecs<ManagedUserDto> = {
+  name: { type: "text", value: (u) => [u.name, u.email, u.phone].filter(Boolean).join(" ") },
+  role: { type: "enum", value: (u) => u.role.key, sortValue: (u) => u.role.rank },
+  status: {
+    type: "enum",
+    values: Object.keys(USER_STATUS_LABEL),
+    value: (u) => userStatus(u),
+    sortValue: (u) => USER_STATUS_LABEL[userStatus(u)],
+  },
+  linked: {
+    type: "enum",
+    values: ["linked", "unlinked"],
+    sortable: false,
+    value: (u) => (u.linkedTo ? "linked" : "unlinked"),
+  },
+  lastLogin: { type: "date", value: (u) => (u.lastLoginAt ? u.lastLoginAt.toISOString() : null) },
+};
+const userQuerySchema = z.object(rowQueryFields(USER_SPECS));
+
 export const userController = {
-  list: (async (_req, res) => {
-    res.json({ success: true, data: { users: await userService.list() } });
+  /** Every user matching the request's search, filters and sort (and the requested page). */
+  async rows(req: Request) {
+    // SAFETY: column params are validated by the schema; their keys are dynamic.
+    const query = userQuerySchema.parse(req.query) as RowQuery;
+    const users = await userService.list();
+    return queryRows(users, USER_SPECS, query, (u) =>
+      [u.name, u.email, u.phone, u.linkedTo?.name].filter(Boolean).join(" "),
+    );
+  },
+
+  list: (async (req, res) => {
+    const { page, total } = await userController.rows(req);
+    res.json({ success: true, data: { users: page, total } });
   }) satisfies RequestHandler,
 
   get: (async (req, res) => {
@@ -53,9 +108,15 @@ export const userController = {
 
   invite: (async (req, res) => {
     const input = createInvitationSchema.parse(req.body);
-    const invitation = await invitationService.create(actorOf(req), input, clientMeta(req));
+    const login = await invitationService.create(actorOf(req), input, clientMeta(req));
     res.setHeader("Cache-Control", "no-store");
-    res.status(201).json({ success: true, data: { invitation } });
+    res.status(201).json({ success: true, data: { login, invitation: login.invitation } });
+  }) satisfies RequestHandler,
+
+  setPassword: (async (req, res) => {
+    const { password } = setPasswordSchema.parse(req.body);
+    await userService.setPassword(actorOf(req), userIdOf(req), password, clientMeta(req));
+    res.json({ success: true, data: { mustChangePassword: true } });
   }) satisfies RequestHandler,
 
   resendInvitation: (async (req, res) => {

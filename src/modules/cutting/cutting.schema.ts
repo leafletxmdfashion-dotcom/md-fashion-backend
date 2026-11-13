@@ -64,10 +64,15 @@ const sizeSchema = z.strictObject({
 });
 
 export const markerSchema = z.strictObject({
-  widthM: optionalDecimal(4, 100, "the width in metres"),
-  lengthM: optionalDecimal(4, 1_000, "the marker length in metres"),
+  // Stored in metres; 6 decimals keep inches exact (1 in = 0.0254 m). The unit is how the operator typed it.
+  widthM: optionalDecimal(6, 100, "the width in metres"),
+  lengthM: optionalDecimal(6, 1_000, "the marker length in metres"),
+  widthUnit: z.enum(["M", "IN"], { error: "Choose metres or inches." }).default("M"),
+  lengthUnit: z.enum(["M", "IN"], { error: "Choose metres or inches." }).default("M"),
   gsm: optionalDecimal(2, 10_000, "the GSM"),
-  measuredPalaKg: optionalDecimal(6, 10_000, "the Pala weight in kg"),
+  measuredPalaKg: optionalDecimal(6, 10_000, "the Pala weight or length"),
+  // The Pala in the other unit (m for kg fabric, kg for metre fabric): recorded, not used by the calculation.
+  palaAltValue: optionalDecimal(6, 10_000, "the Pala in the other unit"),
   weightSource: z.enum(["MEASURED", "CALCULATED"]).default("MEASURED"),
   repetitionsPerLayer: z
     .number({ error: "Use a whole number from 1 to 50." })
@@ -115,33 +120,35 @@ const sizesSchema = z
   });
 
 // Fabric store quantities are kept to the gram, so issued and returned weights are too.
-const rollSchema = z.strictObject({
-  id: z.uuid().optional(),
-  // Blank on a new Thaan: numbered when the draft is parsed (see numberThaan).
-  thaan: z
-    .string()
-    .trim()
-    .max(50, "Keep the Thaan number under 50 characters.")
-    .nullish()
-    .transform((value) => value ?? ""),
-  issuedKg: positiveDecimal(3, 99_999, "the issued weight in kg"),
-  // Blank means "work it out" (see calculateRoll).
-  returnedKg: z
-    .preprocess((value) => (value === "" ? null : value), decimal(3, 99_999, "the returned weight in kg").nullish())
-    .transform((value) => value ?? null),
-  confirmedLayers: z.number().int("Use a whole number.").min(0).max(100_000).nullable().default(null),
-  // Optional: why the Pala differ from the estimate.
-  note: z
-    .string()
-    .trim()
-    .max(200, "Keep the note under 200 characters.")
-    .nullish()
-    .transform((value) => value || null),
-}).refine(
-  // Same rule as the calculator; the database CHECK would otherwise turn it into a 500.
-  (roll) => roll.returnedKg === null || parseScaled(roll.returnedKg, 3)! <= parseScaled(roll.issuedKg, 3)!,
-  { path: ["returnedKg"], message: "Returned weight cannot be more than the issued weight." },
-);
+const rollSchema = z
+  .strictObject({
+    id: z.uuid().optional(),
+    // Blank on a new Thaan: numbered when the draft is parsed (see numberThaan).
+    thaan: z
+      .string()
+      .trim()
+      .max(50, "Keep the Thaan number under 50 characters.")
+      .nullish()
+      .transform((value) => value ?? ""),
+    issuedKg: positiveDecimal(3, 99_999, "the issued quantity"),
+    // Blank means "work it out" (see calculateRoll).
+    returnedKg: z
+      .preprocess((value) => (value === "" ? null : value), decimal(3, 99_999, "the returned quantity").nullish())
+      .transform((value) => value ?? null),
+    confirmedLayers: z.number().int("Use a whole number.").min(0).max(100_000).nullable().default(null),
+    // Optional: why the Pala differ from the estimate.
+    note: z
+      .string()
+      .trim()
+      .max(200, "Keep the note under 200 characters.")
+      .nullish()
+      .transform((value) => value || null),
+  })
+  .refine(
+    // Same rule as the calculator; the database CHECK would otherwise turn it into a 500.
+    (roll) => roll.returnedKg === null || parseScaled(roll.returnedKg, 3)! <= parseScaled(roll.issuedKg, 3)!,
+    { path: ["returnedKg"], message: "Returned quantity cannot be more than the issued quantity." },
+  );
 
 const colourSchema = z.strictObject({
   id: z.uuid().optional(),
@@ -221,18 +228,20 @@ const articleRef = z.union([
   }),
 ]);
 
-export const createLotSchema = z.strictObject({
-  /** Typed by the operator; an existing open lot with this number takes the cutting. */
-  lotNumber: z.string().trim().min(1, "Enter the lot number.").max(30, "Keep the lot number under 30 characters."),
-  article: articleRef,
-  fabricId: z.uuid("Choose a fabric."),
-  productionDate: businessDate,
-  targetQuantity: z.number().int("Use whole pieces.").min(1).max(10_000_000).nullable().default(null),
-  notes: optionalText(500),
-  cutting: cuttingDraftSchema.optional(),
-  /** Also post the new cutting in the same request: issue its fabric, or finalize it. */
-  action: z.enum(["issue", "finalize"]).optional(),
-}).refine((input) => !input.action || input.cutting, { path: ["action"], message: "Add the cutting to post." });
+export const createLotSchema = z
+  .strictObject({
+    /** Typed by the operator; an existing open lot with this number takes the cutting. */
+    lotNumber: z.string().trim().min(1, "Enter the lot number.").max(30, "Keep the lot number under 30 characters."),
+    article: articleRef,
+    fabricId: z.uuid("Choose a fabric."),
+    productionDate: businessDate,
+    targetQuantity: z.number().int("Use whole pieces.").min(1).max(10_000_000).nullable().default(null),
+    notes: optionalText(500),
+    cutting: cuttingDraftSchema.optional(),
+    /** Also post the new cutting in the same request: issue its fabric, or finalize it. */
+    action: z.enum(["issue", "finalize"]).optional(),
+  })
+  .refine((input) => !input.action || input.cutting, { path: ["action"], message: "Add the cutting to post." });
 
 /** Issue or finalize, optionally saving the form's unsaved edits first in the same transaction. */
 export const postBatchSchema = z.strictObject({ cutting: cuttingDraftSchema.optional() }).default({});

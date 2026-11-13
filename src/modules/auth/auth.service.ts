@@ -31,11 +31,11 @@ export const authService = {
    * disabled/locked, or merely had a wrong password.
    */
   async login(
-    input: { email: string; password: string },
+    input: { login: string; password: string },
     meta: ClientMeta,
     presentedToken: string | undefined,
   ): Promise<AuthenticatedResult> {
-    const candidate = await authRepository.findLoginCandidate(input.email);
+    const candidate = await authRepository.findLoginCandidate(input.login);
 
     const fail = async (reason: string, userId: string | null): Promise<never> => {
       await recordAudit(prisma, { type: "LOGIN_FAILURE", targetUserId: userId, meta, metadata: { reason } });
@@ -131,7 +131,11 @@ export const authService = {
         newPassword: ["New password must differ from the current password."],
       });
     }
-    assertPasswordPolicy(input.newPassword, { email: credentials.email, name: credentials.name });
+    assertPasswordPolicy(input.newPassword, {
+      email: credentials.email,
+      phone: auth.user.phone,
+      name: credentials.name,
+    });
     const passwordHash = await hashPassword(input.newPassword);
 
     const session = await transaction(async (tx) => {

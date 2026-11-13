@@ -3,6 +3,7 @@ import { factoryToday } from "../../lib/business-date";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { columnFilters, contains, orderBy, page, where } from "../../lib/list-query";
 import { recordAudit } from "../audit/audit.service";
+import { packingBalance } from "../packing/packing.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
 import {
   ISSUE_COLUMNS,
@@ -43,6 +44,13 @@ function audit(actor: AuthContext, meta: ClientMeta) {
 const today = () => new Date(factoryToday());
 
 const pcs = (count: number) => `${count.toLocaleString("en-IN")} piece${count === 1 ? "" : "s"}`;
+
+/** "M" for a bulk line (all colours of the size), "Black M" for an older colour line. */
+export const lineLabel = (colour: string, size: string) => (colour ? `${colour} ${size}` : size);
+
+/** Cut output a stitching line draws from: its size, and its colour unless it is a bulk line. */
+const feeds = (output: { colour_name: string; size_label: string }, line: { colour: string; sizeLabel: string }) =>
+  output.size_label === line.sizeLabel && (line.colour === "" || output.colour_name === line.colour);
 
 /** "SI-12", "si12" or "12" → 12, so document numbers are searchable. */
 function numberOf(text: string, prefix: string): number | null {
@@ -313,9 +321,9 @@ export const stitchingService = {
 
     if (!lot) throw errors.notFound("Production lot");
 
+    // Bulk: one row per size, every colour together.
     const rows = await prisma.$queryRaw<
       {
-        colour: string;
         size: string;
         cut: number;
         unissued: number;
@@ -327,33 +335,33 @@ export const stitchingService = {
       }[]
     >`
       WITH cut AS (
-        SELECT o.colour_name AS colour, o.size_label AS size, min(b.number) AS batch, min(o.position) AS position,
+        SELECT o.size_label AS size, min(b.number) AS batch, min(o.position) AS position,
                sum(o.accepted_quantity)::int AS cut, sum(o.available_for_stitching)::int AS unissued
         FROM cutting_outputs o JOIN cutting_batches b ON b.id = o.batch_id AND b.status = 'FINALIZED'
-        WHERE o.lot_id = ${lotId}::uuid GROUP BY 1, 2
+        WHERE o.lot_id = ${lotId}::uuid GROUP BY 1
       ), issued AS (
-        SELECT l.colour, l.size_label AS size, sum(l.quantity)::int AS issued, sum(l.received)::int AS received
+        SELECT l.size_label AS size, sum(l.quantity)::int AS issued, sum(l.received)::int AS received
         FROM stitching_issue_lines l JOIN stitching_issues i ON i.id = l.issue_id AND i.status = 'POSTED'
-        WHERE i.lot_id = ${lotId}::uuid GROUP BY 1, 2
+        WHERE i.lot_id = ${lotId}::uuid GROUP BY 1
       ), received AS (
-        SELECT rl.colour, rl.size_label AS size, sum(rl.good)::int AS good, sum(rl.reject)::int AS reject
+        SELECT rl.size_label AS size, sum(rl.good)::int AS good, sum(rl.reject)::int AS reject
         FROM stitching_receipt_lines rl JOIN stitching_receipts r ON r.id = rl.receipt_id AND r.status = 'POSTED'
-        WHERE r.lot_id = ${lotId}::uuid GROUP BY 1, 2
+        WHERE r.lot_id = ${lotId}::uuid GROUP BY 1
       ), rework AS (
-        SELECT colour, size_label AS size, sum(recovered)::int AS recovered, sum(failed)::int AS failed,
+        SELECT size_label AS size, sum(recovered)::int AS recovered, sum(failed)::int AS failed,
                sum(quantity - recovered - failed)::int AS pending
-        FROM rework_items WHERE lot_id = ${lotId}::uuid AND status <> 'CANCELLED' GROUP BY 1, 2
+        FROM rework_items WHERE lot_id = ${lotId}::uuid AND status <> 'CANCELLED' GROUP BY 1
       )
-      SELECT c.colour, c.size, c.cut, c.unissued,
+      SELECT c.size, c.cut, c.unissued,
              COALESCE(i.issued, 0) AS issued, COALESCE(i.received, 0) AS received,
              (COALESCE(r.good, 0) + COALESCE(w.recovered, 0))::int AS good,
              COALESCE(w.pending, 0) AS rework,
              (COALESCE(r.reject, 0) + COALESCE(w.failed, 0))::int AS reject
       FROM cut c
-      LEFT JOIN issued i ON i.colour = c.colour AND i.size = c.size
-      LEFT JOIN received r ON r.colour = c.colour AND r.size = c.size
-      LEFT JOIN rework w ON w.colour = c.colour AND w.size = c.size
-      ORDER BY c.batch, c.colour, c.position`;
+      LEFT JOIN issued i ON i.size = c.size
+      LEFT JOIN received r ON r.size = c.size
+      LEFT JOIN rework w ON w.size = c.size
+      ORDER BY c.batch, c.position`;
 
     const lines = rows.map((row) => ({ ...row, wip: row.issued - row.received }));
     const sum = (key: keyof (typeof lines)[number]) => lines.reduce((total, row) => total + Number(row[key]), 0);
@@ -585,17 +593,16 @@ export const stitchingService = {
 
       input.teams.forEach((entry, teamIndex) => {
         entry.lines.forEach((line, index) => {
-          const matching = outputs.filter(
-            (output) => output.colour_name === line.colour && output.size_label === line.sizeLabel,
-          );
+          const matching = outputs.filter((output) => feeds(output, line));
           const available = matching.reduce((sum, output) => sum + (updates.get(output.id) ?? output.available), 0);
+          const label = lineLabel(line.colour, line.sizeLabel);
 
           if (line.quantity > available) {
             throw fieldError(
               `teams.${teamIndex}.lines.${index}.quantity`,
               available === 0
-                ? `No more ${line.colour} ${line.sizeLabel} pieces of ${lot.lot_number} are waiting for stitching.`
-                : `Only ${pcs(available)} of ${line.colour} ${line.sizeLabel} ${input.teams.length > 1 ? "are left for this team" : "are waiting for stitching"}.`,
+                ? `No more ${label} pieces of ${lot.lot_number} are waiting for stitching.`
+                : `Only ${pcs(available)} of ${label} ${input.teams.length > 1 ? "are left for this team" : "are waiting for stitching"}.`,
             );
           }
 
@@ -699,7 +706,7 @@ export const stitchingService = {
         for (const output of outputs) {
           if (left === 0) break;
 
-          if (output.colour_name !== line.colour || output.size_label !== line.sizeLabel) continue;
+          if (!feeds(output, line)) continue;
 
           const current = updates.get(output.id) ?? output.available;
           const room = Math.min(output.accepted - current, left);
@@ -711,7 +718,9 @@ export const stitchingService = {
 
         // Only possible if the cutting was reversed underneath, which issued pieces block.
         if (left > 0)
-          throw errors.conflict(`The cutting of ${line.colour} ${line.sizeLabel} no longer has room for these pieces.`);
+          throw errors.conflict(
+            `The cutting of ${lineLabel(line.colour, line.sizeLabel)} no longer has room for these pieces.`,
+          );
       }
 
       await setAvailable(tx, updates);
@@ -760,7 +769,7 @@ export const stitchingService = {
         if (received > outstanding) {
           throw fieldError(
             `lines.${index}.good`,
-            `${issued.colour} ${issued.sizeLabel}: ${pcs(received)} entered, the team holds ${pcs(outstanding)}.`,
+            `${lineLabel(issued.colour, issued.sizeLabel)}: ${pcs(received)} entered, the team holds ${pcs(outstanding)}.`,
           );
         }
       });
@@ -860,7 +869,7 @@ export const stitchingService = {
     if (!found) throw errors.notFound("Stitching receipt");
 
     await transaction(async (tx) => {
-      await lockIssue(tx, found.issueId);
+      const issue = await lockIssue(tx, found.issueId);
 
       const [receipt] = await tx.$queryRaw<{ number: number; status: string }[]>`
         SELECT number, status FROM stitching_receipts WHERE id = ${receiptId}::uuid FOR UPDATE`;
@@ -879,6 +888,20 @@ export const stitchingService = {
       }
 
       const lines = await tx.stitchingReceiptLine.findMany({ where: { receiptId } });
+
+      // Good pieces already packed cannot be taken back from under the packing.
+      const balances = await packingBalance(tx, issue.lot_id);
+
+      for (const balance of balances) {
+        const good = lines.filter((line) => line.sizeLabel === balance.size).reduce((sum, line) => sum + line.good, 0);
+
+        if (good > 0 && balance.good - good < balance.packed) {
+          throw errors.conflict(
+            `${receiptNumber(receipt!.number)}: ${balance.size} pieces have been packed. Reverse the packing first.`,
+          );
+        }
+      }
+
       const values = lines.map((line) => Prisma.sql`(${line.issueLineId}::uuid, ${line.received}::int)`);
 
       await tx.$executeRaw`

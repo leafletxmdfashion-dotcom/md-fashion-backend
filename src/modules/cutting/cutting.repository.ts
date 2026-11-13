@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 import { prisma, Prisma, type Db } from "../../db/prisma";
+import { factoryToday } from "../../lib/business-date";
 import { AppError, ErrorCode } from "../../lib/errors";
 import { columnFilters, contains, orderBy, page, where } from "../../lib/list-query";
-import { parseScaled, type ColourInput, type MarkerInput } from "./cutting.calc";
+import { parseScaled, type ColourInput, type MarkerInput, type QtyUnit } from "./cutting.calc";
 import { BATCH_COLUMNS, LOT_COLUMNS, type BatchListQuery, type CuttingDraft, type LotListQuery } from "./cutting.schema";
 
 // Reads of one batch or lot go through Prisma Client; paged lists with column
@@ -53,6 +54,8 @@ export interface CalcInputs {
 export function calcInputsOf(batch: BatchRecord): CalcInputs {
   return {
     marker: {
+      // SAFETY: fabrics.unit has a CHECK constraint allowing only KG and METER.
+      unit: batch.lot.fabric.unit as QtyUnit,
       widthM: dec(batch.widthM),
       lengthM: dec(batch.lengthM),
       gsm: dec(batch.gsm),
@@ -79,9 +82,9 @@ export function calcInputsOf(batch: BatchRecord): CalcInputs {
 }
 
 /** Calculation inputs from a submitted draft. */
-export function draftInputsOf(draft: CuttingDraft): CalcInputs {
+export function draftInputsOf(draft: CuttingDraft, unit: QtyUnit = "KG"): CalcInputs {
   return {
-    marker: { ...draft.marker, sizes: draft.sizes },
+    marker: { ...draft.marker, unit, sizes: draft.sizes },
     colours: draft.colours.map((colour) => ({
       name: colour.name,
       rolls: colour.rolls.map((roll) => ({
@@ -133,7 +136,7 @@ export async function writeDraft(tx: Prisma.TransactionClient, batch: BatchRecor
       if (stored.colourId !== colour.id || stored.thaan !== roll.thaan || !sameKg(stored.issuedKg.toFixed(), roll.issuedKg)) {
         throw fieldError(
           `${rollPath}.issuedKg`,
-          `Thaan ${stored.thaan} has been issued (${stored.issuedKg.toFixed()} kg); its colour, number and weight are fixed. Record a return instead.`,
+          `Thaan ${stored.thaan} has been issued (${stored.issuedKg.toFixed()} ${batch?.lot.fabric.unit === "METER" ? "m" : "kg"}); its colour, number and weight are fixed. Record a return instead.`,
         );
       }
     });
@@ -227,8 +230,18 @@ export async function writeDraft(tx: Prisma.TransactionClient, batch: BatchRecor
 }
 
 /** Kilograms held by cutting (issued, not yet consumed, wasted or returned), per filter. */
-export const IN_CUTTING_KG = Prisma.raw(`
-  COALESCE(sum(CASE WHEN m.to_state = 'CUTTING' THEN m.quantity WHEN m.from_state = 'CUTTING' THEN -m.quantity ELSE 0 END), 0)`);
+const inCutting = (unit?: "KG" | "METER") =>
+  Prisma.raw(`
+  COALESCE(sum(m.quantity * CASE WHEN m.to_state = 'CUTTING' THEN 1 WHEN m.from_state = 'CUTTING' THEN -1 ELSE 0 END)
+    ${unit ? `FILTER (WHERE m.unit = '${unit}')` : ""}, 0)`);
+
+/** One lot's quantity in cutting, in its fabric's unit. */
+export const IN_CUTTING = inCutting();
+
+/** Quantity still on the cutting floor, per unit: kilograms and metres are never added together. */
+export const IN_CUTTING_KG = inCutting("KG");
+
+export const IN_CUTTING_M = inCutting("METER");
 
 interface LotRow {
   id: string;
@@ -313,6 +326,10 @@ export interface ProductionSummary {
   wastageKgThisMonth: string;
   consumedKgThisMonth: string;
   inCuttingKg: string;
+  /** Fabric bought by the metre is cut in metres; never added to kilograms. */
+  wastageMThisMonth: string;
+  consumedMThisMonth: string;
+  inCuttingM: string;
   openBatches: number;
 }
 
@@ -320,12 +337,16 @@ export async function productionSummary(): Promise<ProductionSummary> {
   const [statuses, [month], [held], [open]] = await Promise.all([
     prisma.$queryRaw<{ status: string; count: number }[]>`
       SELECT status, count(*)::int AS count FROM production_lots GROUP BY status`,
-    prisma.$queryRaw<{ pieces: number; wastage: string; consumed: string }[]>`
-      SELECT COALESCE(sum(total_accepted_pieces), 0)::int AS pieces, COALESCE(sum(total_wastage_kg), 0)::text AS wastage,
-             COALESCE(sum(total_consumed_kg), 0)::text AS consumed
-      FROM cutting_batches
-      WHERE status = 'FINALIZED' AND cutting_date >= date_trunc('month', current_date)`,
-    prisma.$queryRaw<{ held: string }[]>`SELECT ${IN_CUTTING_KG}::text AS held FROM cutting_movements m`,
+    prisma.$queryRaw<{ pieces: number; wastage: string; consumed: string; wastage_m: string; consumed_m: string }[]>`
+      SELECT COALESCE(sum(b.total_accepted_pieces), 0)::int AS pieces,
+             COALESCE(sum(b.total_wastage_kg) FILTER (WHERE f.unit = 'KG'), 0)::text AS wastage,
+             COALESCE(sum(b.total_consumed_kg) FILTER (WHERE f.unit = 'KG'), 0)::text AS consumed,
+             COALESCE(sum(b.total_wastage_kg) FILTER (WHERE f.unit = 'METER'), 0)::text AS wastage_m,
+             COALESCE(sum(b.total_consumed_kg) FILTER (WHERE f.unit = 'METER'), 0)::text AS consumed_m
+      FROM cutting_batches b JOIN production_lots l ON l.id = b.lot_id JOIN fabrics f ON f.id = l.fabric_id
+      WHERE b.status = 'FINALIZED' AND b.cutting_date >= date_trunc('month', ${factoryToday()}::date)`,
+    prisma.$queryRaw<{ held: string; held_m: string }[]>`
+      SELECT ${IN_CUTTING_KG}::text AS held, ${IN_CUTTING_M}::text AS held_m FROM cutting_movements m`,
     prisma.$queryRaw<{ count: number }[]>`
       SELECT count(*)::int AS count FROM cutting_batches WHERE status IN ('DRAFT', 'ISSUED')`,
   ]);
@@ -336,6 +357,9 @@ export async function productionSummary(): Promise<ProductionSummary> {
     wastageKgThisMonth: month!.wastage,
     consumedKgThisMonth: month!.consumed,
     inCuttingKg: held!.held,
+    wastageMThisMonth: month!.wastage_m,
+    consumedMThisMonth: month!.consumed_m,
+    inCuttingM: held!.held_m,
     openBatches: open!.count,
   };
 }
@@ -349,6 +373,7 @@ interface BatchRow {
   lot_number: string;
   article_name: string;
   fabric_name: string;
+  unit: string;
   master: string | null;
   pala: number | null;
   pieces: number | null;
@@ -361,7 +386,7 @@ export interface BatchListItem {
   number: number;
   cuttingDate: string;
   status: string;
-  lot: { id: string; lotNumber: string; articleName: string; fabricName: string };
+  lot: { id: string; lotNumber: string; articleName: string; fabricName: string; unit: string };
   cuttingMaster: string | null;
   pala: number | null;
   acceptedPieces: number | null;
@@ -398,7 +423,7 @@ export async function listBatches(query: BatchListQuery): Promise<{ batches: Bat
   const [rows, [count]] = await Promise.all([
     prisma.$queryRaw<BatchRow[]>`
       SELECT b.id, b.number, b.cutting_date::text AS cutting_date, b.status, l.id AS lot_id, l.lot_number,
-             l.article_name, f.name AS fabric_name, k.name AS master, b.total_pala AS pala,
+             l.article_name, f.name AS fabric_name, f.unit, k.name AS master, b.total_pala AS pala,
              b.total_accepted_pieces AS pieces, COALESCE(b.total_issued_kg, r.issued, 0)::text AS issued,
              b.total_wastage_kg::text AS wastage
       ${BATCH_FROM} ${filter} ${order} ${page(query)}`,
@@ -411,7 +436,7 @@ export async function listBatches(query: BatchListQuery): Promise<{ batches: Bat
       number: row.number,
       cuttingDate: row.cutting_date,
       status: row.status,
-      lot: { id: row.lot_id, lotNumber: row.lot_number, articleName: row.article_name, fabricName: row.fabric_name },
+      lot: { id: row.lot_id, lotNumber: row.lot_number, articleName: row.article_name, fabricName: row.fabric_name, unit: row.unit },
       cuttingMaster: row.master,
       pala: row.pala,
       acceptedPieces: row.pieces,

@@ -17,6 +17,7 @@ import {
   type Issue,
   type MarkerResult,
   type PayMode,
+  type QtyUnit,
   type RollResult,
   type Totals,
 } from "./cutting.calc";
@@ -26,7 +27,7 @@ import {
   dec,
   draftInputsOf,
   fieldError,
-  IN_CUTTING_KG,
+  IN_CUTTING,
   listBatches,
   listLots,
   loadBatch,
@@ -74,7 +75,8 @@ async function lockLot(tx: Tx, lotId: string): Promise<LockedLot> {
 }
 
 function assertLotOpen(lot: LockedLot): void {
-  if (lot.status === "COMPLETED") throw errors.conflict(`${lot.lot_number} is completed. Reopen it to change its cutting.`);
+  if (lot.status === "COMPLETED")
+    throw errors.conflict(`${lot.lot_number} is completed. Reopen it to change its cutting.`);
 
   if (lot.status === "CANCELLED") throw errors.conflict(`${lot.lot_number} is cancelled.`);
 }
@@ -121,9 +123,8 @@ async function assertMaster(tx: Tx, masterId: string | null, required: boolean):
   if (!master?.active) throw fieldError("cuttingMasterId", "Choose an active cutting master.");
 }
 
-function assertKg(unit: string): void {
-  if (unit !== "KG") throw fieldError("fabricId", "Cutting is weighed in kg. Choose a fabric measured in kg.");
-}
+/** "kg" or "m": cutting quantities are in the fabric's own unit. */
+const unitShort = (unit: string) => (unit === "METER" ? "m" : "kg");
 
 /** Batch columns from a draft, including the Pala weights it resolves to. */
 function batchFields(draft: CuttingDraft) {
@@ -135,8 +136,11 @@ function batchFields(draft: CuttingDraft) {
     notes: draft.notes,
     widthM: draft.marker.widthM,
     lengthM: draft.marker.lengthM,
+    widthUnit: draft.marker.widthUnit,
+    lengthUnit: draft.marker.lengthUnit,
     gsm: draft.marker.gsm,
     measuredPalaKg: draft.marker.measuredPalaKg,
+    palaAltValue: draft.marker.palaAltValue,
     weightSource: draft.marker.weightSource,
     repetitionsPerLayer: draft.marker.repetitionsPerLayer,
     calculatedPalaKg: marker.calculatedPalaKg === null ? null : kg(marker.calculatedPalaKg),
@@ -174,14 +178,12 @@ async function issueRolls(
 
   const fabric = await lockFabric(tx, lot.fabric_id);
 
-  assertKg(fabric.unit);
-
   const needed = pending.reduce((sum, { roll }) => sum + parseScaled(roll.issuedKg.toFixed(), 6)!, 0n);
 
   if (needed > fabric.balance) {
     throw fieldError(
       "colours",
-      `Only ${formatKg(fabric.balance)} kg of ${fabric.name} is in the store; issuing these Thaan needs ${formatKg(needed)} kg.`,
+      `Only ${formatKg(fabric.balance)} ${unitShort(fabric.unit)} of ${fabric.name} is in the store; issuing these Thaan needs ${formatKg(needed)} ${unitShort(fabric.unit)}.`,
     );
   }
 
@@ -212,6 +214,7 @@ async function issueRolls(
       fromState: "STORE",
       toState: "CUTTING",
       quantity: roll.issuedKg.toFixed(),
+      unit: fabric.unit,
       createdById: actor.user.id,
     })),
   });
@@ -307,8 +310,11 @@ function toBatchDto(batch: BatchRecord, showCost: boolean) {
     marker: {
       widthM: dec(batch.widthM),
       lengthM: dec(batch.lengthM),
+      widthUnit: batch.widthUnit,
+      lengthUnit: batch.lengthUnit,
       gsm: dec(batch.gsm),
       measuredPalaKg: dec(batch.measuredPalaKg),
+      palaAltValue: dec(batch.palaAltValue),
       weightSource: batch.weightSource,
       repetitionsPerLayer: batch.repetitionsPerLayer,
       calculatedPalaKg: dec(batch.calculatedPalaKg),
@@ -394,7 +400,11 @@ async function createBatch(
 
   await writeDraft(tx, null, id, draft);
   await saveDefaultsIf(tx, draft, lot.article_id);
-  await recordAudit(tx, { type: "CUTTING_DRAFT_SAVED", ...audit(actor, meta), metadata: { batchId: id, lotId: lot.id } });
+  await recordAudit(tx, {
+    type: "CUTTING_DRAFT_SAVED",
+    ...audit(actor, meta),
+    metadata: { batchId: id, lotId: lot.id },
+  });
 
   return id;
 }
@@ -435,7 +445,9 @@ async function lotDetail(id: string, showCost: boolean) {
       WHERE o.lot_id = ${id}::uuid
       GROUP BY o.colour_name, o.size_label
       ORDER BY min(b.number), o.colour_name, min(o.position)`,
-    prisma.$queryRaw<{ held: string }[]>`SELECT ${IN_CUTTING_KG}::text AS held FROM cutting_movements m WHERE m.lot_id = ${id}::uuid`,
+    prisma.$queryRaw<
+      { held: string }[]
+    >`SELECT ${IN_CUTTING}::text AS held FROM cutting_movements m WHERE m.lot_id = ${id}::uuid`,
     prisma.cuttingMovement.findMany({
       where: { lotId: id },
       orderBy: { seq: "desc" },
@@ -443,7 +455,11 @@ async function lotDetail(id: string, showCost: boolean) {
       include: { batch: { select: { number: true } }, createdBy: { select: { name: true } } },
     }),
     showCost
-      ? prisma.lotCost.findMany({ where: { lotId: id }, orderBy: { seq: "asc" }, include: { batch: { select: { number: true } } } })
+      ? prisma.lotCost.findMany({
+          where: { lotId: id },
+          orderBy: { seq: "asc" },
+          include: { batch: { select: { number: true } } },
+        })
       : null,
   ]);
 
@@ -540,7 +556,10 @@ export const lotService = {
 
       if (existing) {
         if (existing.status !== "DRAFT" && existing.status !== "ACTIVE") {
-          throw fieldError("lotNumber", `${existing.lot_number} is ${existing.status.toLowerCase()}. Use another lot number.`);
+          throw fieldError(
+            "lotNumber",
+            `${existing.lot_number} is ${existing.status.toLowerCase()}. Use another lot number.`,
+          );
         }
 
         if (existing.fabric_id !== input.fabricId) {
@@ -569,8 +588,6 @@ export const lotService = {
       const fabric = await tx.fabric.findUnique({ where: { id: input.fabricId }, select: { unit: true } });
 
       if (!fabric) throw fieldError("fabricId", "Choose a fabric.");
-
-      assertKg(fabric.unit);
 
       const article = await articleService.resolve(tx, actor, input.article, input.fabricId, meta);
 
@@ -631,7 +648,11 @@ export const lotService = {
 
         for (const draft of drafts) {
           await tx.cuttingBatch.delete({ where: { id: draft.id } });
-          await recordAudit(tx, { type: "CUTTING_DRAFT_DELETED", ...audit(actor, meta), metadata: { batchId: draft.id, lotId: id } });
+          await recordAudit(tx, {
+            type: "CUTTING_DRAFT_DELETED",
+            ...audit(actor, meta),
+            metadata: { batchId: draft.id, lotId: id },
+          });
         }
       } else if (input.status === "COMPLETED") {
         if (lot.status !== "ACTIVE") throw errors.conflict("Only an active lot can be completed.");
@@ -654,7 +675,6 @@ export const lotService = {
 
         if (!fabric) throw fieldError("fabricId", "Choose a fabric.");
 
-        assertKg(fabric.unit);
         data.fabricId = input.fabricId;
       }
 
@@ -700,7 +720,11 @@ async function applyDraft(
   await tx.cuttingBatch.update({ where: { id: batch.id }, data: batchFields(draft) });
   await writeDraft(tx, batch, batch.id, draft);
   await saveDefaultsIf(tx, draft, lot.article_id);
-  await recordAudit(tx, { type: "CUTTING_DRAFT_SAVED", ...audit(actor, meta), metadata: { batchId: batch.id, lotId: lot.id } });
+  await recordAudit(tx, {
+    type: "CUTTING_DRAFT_SAVED",
+    ...audit(actor, meta),
+    metadata: { batchId: batch.id, lotId: lot.id },
+  });
 
   return (await loadBatch(tx, batch.id))!;
 }
@@ -717,7 +741,13 @@ function withDraft(
 }
 
 /** Issues every Thaan still in the store, inside the caller's transaction. */
-async function issueLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch: BatchRecord, meta: ClientMeta): Promise<void> {
+async function issueLocked(
+  tx: Tx,
+  actor: AuthContext,
+  lot: LockedLot,
+  batch: BatchRecord,
+  meta: ClientMeta,
+): Promise<void> {
   const id = batch.id;
 
   if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
@@ -741,7 +771,13 @@ async function issueLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch: Ba
 /**
  * Posts a locked batch inside the caller's transaction: see cuttingService.finalize.
  */
-async function finalizeLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch: BatchRecord, meta: ClientMeta): Promise<void> {
+async function finalizeLocked(
+  tx: Tx,
+  actor: AuthContext,
+  lot: LockedLot,
+  batch: BatchRecord,
+  meta: ClientMeta,
+): Promise<void> {
   const id = batch.id;
 
   if (batch.status === "FINALIZED" || batch.status === "REVERSED") {
@@ -779,11 +815,18 @@ async function finalizeLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch:
         colour: colour.name,
         thaan: roll.thaan,
         movementDate: batch.cuttingDate,
+        unit: batch.lot.fabric.unit,
         createdById: actor.user.id,
       };
 
       if (calc.returnedKg > 0n) {
-        movements.push({ ...base, type: "RETURN", fromState: "CUTTING", toState: "STORE", quantity: kg(calc.returnedKg) });
+        movements.push({
+          ...base,
+          type: "RETURN",
+          fromState: "CUTTING",
+          toState: "STORE",
+          quantity: kg(calc.returnedKg),
+        });
         returns.push({
           fabricId: lot.fabric_id,
           movementDate: batch.cuttingDate,
@@ -796,7 +839,13 @@ async function finalizeLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch:
       }
 
       if (calc.consumedKg > 0n) {
-        movements.push({ ...base, type: "CONSUME", fromState: "CUTTING", toState: "CONSUMED", quantity: kg(calc.consumedKg) });
+        movements.push({
+          ...base,
+          type: "CONSUME",
+          fromState: "CUTTING",
+          toState: "CONSUMED",
+          quantity: kg(calc.consumedKg),
+        });
       }
 
       if (calc.wastageKg > 0n) {
@@ -858,8 +907,18 @@ async function finalizeLocked(tx: Tx, actor: AuthContext, lot: LockedLot, batch:
   const entryDate = batch.cuttingDate;
 
   const costs = [
-    { kind: "FABRIC_CONSUMED", quantity: result.totals.consumedKg, paisa: consumedCost, rate: ratePerKg(consumedCost, result.totals.consumedKg) },
-    { kind: "FABRIC_WASTAGE", quantity: result.totals.wastageKg, paisa: wastageCost, rate: ratePerKg(wastageCost, result.totals.wastageKg) },
+    {
+      kind: "FABRIC_CONSUMED",
+      quantity: result.totals.consumedKg,
+      paisa: consumedCost,
+      rate: ratePerKg(consumedCost, result.totals.consumedKg),
+    },
+    {
+      kind: "FABRIC_WASTAGE",
+      quantity: result.totals.wastageKg,
+      paisa: wastageCost,
+      rate: ratePerKg(wastageCost, result.totals.wastageKg),
+    },
     ...(earning ? [{ kind: "CUTTING_LABOUR", quantity: earning.quantity, paisa: earning.amount, rate: payRate }] : []),
   ];
 
@@ -972,24 +1031,34 @@ export const cuttingService = {
       }
 
       await tx.cuttingBatch.delete({ where: { id } });
-      await recordAudit(tx, { type: "CUTTING_DRAFT_DELETED", ...audit(actor, meta), metadata: { batchId: id, lotId: lot.id } });
+      await recordAudit(tx, {
+        type: "CUTTING_DRAFT_DELETED",
+        ...audit(actor, meta),
+        metadata: { batchId: id, lotId: lot.id },
+      });
     });
   },
 
   /** Recalculates a submitted draft and checks the store can cover what it would issue. */
   async preview(input: { fabricId: string; batchId?: string | undefined; cutting: CuttingDraft }) {
-    const inputs = draftInputsOf(input.cutting);
-    const result = calculateBatch(inputs.marker, inputs.colours);
-
     const [fabric, issued] = await Promise.all([
-      prisma.fabric.findUnique({ where: { id: input.fabricId }, select: { unit: true, stock: { select: { balance: true } } } }),
+      prisma.fabric.findUnique({
+        where: { id: input.fabricId },
+        select: { unit: true, stock: { select: { balance: true } } },
+      }),
       input.batchId
-        ? prisma.cuttingRoll.findMany({ where: { batchId: input.batchId, status: { not: "DRAFT" } }, select: { id: true } })
+        ? prisma.cuttingRoll.findMany({
+            where: { batchId: input.batchId, status: { not: "DRAFT" } },
+            select: { id: true },
+          })
         : [],
     ]);
 
     if (!fabric) throw fieldError("fabricId", "Choose a fabric.");
 
+    // SAFETY: fabrics.unit has a CHECK constraint allowing only KG and METER.
+    const inputs = draftInputsOf(input.cutting, fabric.unit as QtyUnit);
+    const result = calculateBatch(inputs.marker, inputs.colours);
     const alreadyIssued = new Set(issued.map((roll) => roll.id));
 
     const toIssue = input.cutting.colours
@@ -1086,6 +1155,7 @@ export const cuttingService = {
             fromState: posting.toState,
             toState: posting.fromState,
             quantity: posting.quantity,
+            unit: posting.unit,
             reversalOfId: posting.id,
             reason,
             createdById: actor.user.id,
@@ -1102,6 +1172,7 @@ export const cuttingService = {
             fromState: "CUTTING",
             toState: "STORE",
             quantity: held,
+            unit: batch.lot.fabric.unit,
             reason,
             createdById: actor.user.id,
           })),
@@ -1168,7 +1239,11 @@ export const cuttingService = {
         where: { id },
         data: { status: "REVERSED", reversedById: actor.user.id, reversedAt: new Date(), reversalReason: reason },
       });
-      await recordAudit(tx, { type: "CUTTING_REVERSED", ...audit(actor, meta), metadata: { batchId: id, lotId: lot.id, reason } });
+      await recordAudit(tx, {
+        type: "CUTTING_REVERSED",
+        ...audit(actor, meta),
+        metadata: { batchId: id, lotId: lot.id, reason },
+      });
     });
 
     return batchDto(id, showCost);

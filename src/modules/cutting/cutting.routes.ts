@@ -1,5 +1,7 @@
 import { Router, type Request, type RequestHandler } from "express";
 
+import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
+import { BATCH_STATUS_LABEL, label, unitShort } from "../../lib/labels";
 import { errors } from "../../lib/errors";
 import { actorOf, can, clientMeta } from "../../lib/request";
 import { requireAuth } from "../auth/auth.middleware";
@@ -87,6 +89,34 @@ export function cuttingRoutes(): Router {
     const query = batchListQuerySchema.parse(req.query) as BatchListQuery;
 
     res.json({ success: true, data: await cuttingService.list(query) });
+  }) satisfies RequestHandler);
+
+  router.get("/export", view, (async (req, res) => {
+    // SAFETY: column params are validated by the schema; their keys are dynamic.
+    const query = batchListQuerySchema.parse(req.query) as BatchListQuery;
+    const { batches } = await cuttingService.list(allRows(query));
+
+    sendCsv(
+      req,
+      res,
+      "cutting",
+      [
+        { header: "Cutting no.", value: (b) => docNumber("CUT", b.number) },
+        { header: "Date", value: (b) => b.cuttingDate },
+        { header: "Lot", value: (b) => b.lot.lotNumber },
+        { header: "Item / design", value: (b) => b.lot.articleName },
+        { header: "Fabric", value: (b) => b.lot.fabricName },
+        { header: "Unit", value: (b) => unitShort(b.lot.unit) },
+        { header: "Cutting master", value: (b) => b.cuttingMaster },
+        { header: "Issued", value: (b) => b.issuedKg },
+        { header: "Pala", value: (b) => b.pala },
+        { header: "Pieces", value: (b) => b.acceptedPieces },
+        { header: "Wastage", value: (b) => b.wastageKg },
+        { header: "Status", value: (b) => label(BATCH_STATUS_LABEL, b.status) },
+      ],
+      batches,
+      (b) => b.id,
+    );
   }) satisfies RequestHandler);
 
   // Server-side recalculation of an unsaved draft, plus the store check for what it would issue.

@@ -1,5 +1,6 @@
 import { prisma, Prisma, type Db } from "../../db/prisma";
 import type { TokenHash } from "../../lib/crypto";
+import { loginLookup } from "../../lib/request";
 import type { UserStatus } from "../sessions/session.types";
 import { LOGIN_FAILURE_WINDOW_MINUTES, LOGIN_LOCK_THRESHOLD, lockMinutesFor } from "./auth.constants";
 
@@ -12,7 +13,7 @@ export interface LoginCandidate {
 
 export interface Credentials {
   id: string;
-  email: string;
+  email: string | null;
   name: string;
   passwordHash: string;
   status: UserStatus;
@@ -23,9 +24,10 @@ export interface Credentials {
 // outcome even when requests race.
 
 export const authRepository = {
-  findLoginCandidate(email: string): Promise<LoginCandidate | null> {
+  /** `login` is an email (has an @) or a phone number, normalized the way they are stored. */
+  findLoginCandidate(login: string): Promise<LoginCandidate | null> {
     return prisma.user.findUnique({
-      where: { email },
+      where: loginLookup(login),
       select: { id: true, passwordHash: true, status: true, lockedUntil: true },
     });
   },
@@ -64,7 +66,7 @@ export const authRepository = {
 
   async findCredentials(db: Db, userId: string, lock = false): Promise<Credentials | null> {
     const [row] = await db.$queryRaw<
-      { id: string; email: string; name: string; password_hash: string | null; status: UserStatus }[]
+      { id: string; email: string | null; name: string; password_hash: string | null; status: UserStatus }[]
     >`SELECT id, email, name, password_hash, status::text FROM users
       WHERE id = ${userId}::uuid ${lock ? Prisma.sql`FOR UPDATE` : Prisma.empty}`;
     if (!row?.password_hash) return null;
@@ -75,13 +77,23 @@ export const authRepository = {
     await db.$executeRaw`
       UPDATE users SET
         password_hash = ${passwordHash}, password_changed_at = now(), updated_at = now(),
-        failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL,
+        must_change_password = false, failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL,
         status = CASE WHEN status = 'LOCKED' THEN 'ACTIVE'::user_status ELSE status END
       WHERE id = ${userId}::uuid`;
   },
 
   async updateName(db: Db, userId: string, name: string): Promise<void> {
     await db.user.update({ where: { id: userId }, data: { name } });
+  },
+
+  /** A password chosen by an admin: the user must replace it at the next sign-in. */
+  async setTemporaryPassword(db: Db, userId: string, passwordHash: string): Promise<void> {
+    await db.$executeRaw`
+      UPDATE users SET
+        password_hash = ${passwordHash}, password_changed_at = now(), updated_at = now(),
+        must_change_password = true, failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL,
+        status = CASE WHEN status IN ('LOCKED', 'INVITED') THEN 'ACTIVE'::user_status ELSE status END
+      WHERE id = ${userId}::uuid`;
   },
 
   // ---- password reset tokens ----

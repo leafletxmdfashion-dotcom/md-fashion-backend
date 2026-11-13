@@ -1,8 +1,9 @@
 import { z } from "zod";
 
 import { columnQueryFields, type ColumnQuery, type ColumnSpecs } from "../../lib/list-query";
+import { personLoginSchema } from "../users/user.schema";
 
-export const KARIGAR_CATEGORIES = ["CUTTING_MASTER", "TAILOR", "HELPER", "OTHER"] as const;
+export const KARIGAR_CATEGORIES = ["CUTTING_MASTER", "TAILOR", "HELPER", "PACKER", "STAFF", "OTHER"] as const;
 
 export const PAY_MODES = ["PER_PIECE", "PER_PALA", "PER_KG", "FIXED_JOB", "SALARY"] as const;
 
@@ -40,6 +41,10 @@ export const karigarSchema = z.strictObject({
     .max(9_999_999, "Rate is too large.")
     .multipleOf(0.01, "Use at most 2 decimals."),
   active: z.boolean().default(true),
+  /** The login this person uses to see their own ledger; left out keeps the current one. */
+  userId: z.uuid("Choose a login.").nullish(),
+  /** A new login for this person, created with the record (needs users.manage). */
+  login: personLoginSchema.optional(),
   notes: optionalText(500),
 });
 

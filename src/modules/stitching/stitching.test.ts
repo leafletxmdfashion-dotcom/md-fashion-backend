@@ -250,16 +250,113 @@ describe("stitching issue", () => {
     const balance = (await owner.get(`/api/v1/stitching/lots/${lotId}/balance`)).body.data;
 
     expect(balance.totals).toMatchObject({ cut: 84, unissued: 51, issued: 33, wip: 33, good: 0 });
-    expect(
-      balance.rows.find((row: { colour: string; size: string }) => row.colour === "Black" && row.size === "M"),
-    ).toMatchObject({
-      unissued: 0,
+    // The balance is by size: Black M 28 + Blue M 14 cut, the 28 Black M issued.
+    expect(balance.rows.find((row: { size: string }) => row.size === "M")).toMatchObject({
+      cut: 42,
+      unissued: 14,
       wip: 28,
     });
 
     expect(
       (await owner.send("post", `/api/v1/cutting-batches/${batchId}/reverse`, { reason: "Wrong marker" })).status,
     ).toBe(409);
+  });
+
+  it("issues in bulk by size: all colours of a size together, oldest cutting first", async () => {
+    const { owner, lotId, teamId } = await setup();
+
+    // M waiting: Black 28 + Blue 14 = 42.
+    const tooMany = await owner.send("post", "/api/v1/stitching/issues", {
+      lotId,
+      operation: "Full stitching",
+      rate: 10,
+      issueDate: today,
+      teams: [{ teamId, lines: [{ sizeLabel: "M", quantity: 43 }] }],
+    });
+
+    expect(tooMany.status).toBe(400);
+    expect(tooMany.body.error.details["teams.0.lines.0.quantity"][0]).toMatch(/Only 42 pieces of M/);
+
+    const issued = (
+      await post(owner, "/api/v1/stitching/issues", {
+        lotId,
+        operation: "Full stitching",
+        rate: 10,
+        issueDate: today,
+        teams: [
+          {
+            teamId,
+            lines: [
+              { sizeLabel: "M", quantity: 30 },
+              { sizeLabel: "S", quantity: 21 },
+            ],
+          },
+        ],
+      })
+    ).issues[0] as Issue;
+
+    expect(issued.lines.map((line) => [line.colour, line.sizeLabel, line.quantity])).toEqual([
+      ["", "M", 30],
+      ["", "S", 21],
+    ]);
+
+    const balance = (await owner.get(`/api/v1/stitching/lots/${lotId}/balance`)).body.data;
+
+    expect(
+      balance.rows.map((row: { size: string; cut: number; unissued: number; wip: number }) => [
+        row.size,
+        row.cut,
+        row.unissued,
+        row.wip,
+      ]),
+    ).toEqual([
+      ["S", 21, 0, 21],
+      ["M", 42, 12, 30],
+      ["L", 21, 21, 0],
+    ]);
+    expect(
+      (
+        await sql(
+          "SELECT colour_name, size_label, available_for_stitching AS a FROM cutting_outputs WHERE size_label = 'M' ORDER BY colour_name",
+        )
+      ).rows,
+    ).toEqual([
+      { colour_name: "Black", size_label: "M", a: 0 },
+      { colour_name: "Blue", size_label: "M", a: 12 },
+    ]);
+
+    // Received by size; rework shows by size too.
+    const m = issued.lines.find((line) => line.sizeLabel === "M")!;
+    const received = await owner.send("post", `/api/v1/stitching/issues/${issued.id}/receipts`, {
+      receiptDate: today,
+      lines: [{ issueLineId: m.id, good: 27, rework: 2, reject: 1, rejectReason: "Hole or tear" }],
+    });
+
+    expect(received.status).toBe(201);
+    expect((await owner.get("/api/v1/stitching/rework")).body.data.items[0]).toMatchObject({
+      colour: "",
+      sizeLabel: "M",
+      quantity: 2,
+    });
+
+    // Reversing a size-only issue puts the pieces back, whatever colour they were cut in.
+    const other = (
+      await post(owner, "/api/v1/stitching/issues", {
+        lotId,
+        operation: "Full stitching",
+        rate: 10,
+        issueDate: today,
+        teams: [{ teamId, lines: [{ sizeLabel: "L", quantity: 21 }] }],
+      })
+    ).issues[0] as Issue;
+
+    expect(
+      (await owner.send("post", `/api/v1/stitching/issues/${other.id}/reverse`, { reason: "Wrong team" })).status,
+    ).toBe(200);
+    expect((await owner.get(`/api/v1/stitching/lots/${lotId}/balance`)).body.data.rows[2]).toMatchObject({
+      size: "L",
+      unissued: 21,
+    });
   });
 
   it("divides one lot between several Jogadi teams in one posting, never more than is waiting", async () => {

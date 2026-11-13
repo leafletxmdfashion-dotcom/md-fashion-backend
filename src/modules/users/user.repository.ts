@@ -6,6 +6,7 @@ import type { ManagedUserDto, ManagedUserRecord } from "./user.types";
 const MANAGED_USER_SELECT = {
   id: true,
   email: true,
+  phone: true,
   name: true,
   status: true,
   role: { select: { key: true, name: true, rank: true } },
@@ -14,7 +15,8 @@ const MANAGED_USER_SELECT = {
 /** Locked rows come from raw SQL (Prisma has no FOR UPDATE), shaped like MANAGED_USER_SELECT. */
 interface LockedUserRow {
   id: string;
-  email: string;
+  email: string | null;
+  phone: string | null;
   name: string;
   status: UserStatus;
   role_key: string;
@@ -31,6 +33,8 @@ export const userRepository = {
       select: {
         ...MANAGED_USER_SELECT,
         lockedUntil: true,
+        mustChangePassword: true,
+        karigar: { select: { id: true, name: true } },
         lastLoginAt: true,
         createdAt: true,
         _count: { select: { sessions: { where: { revokedAt: null, expiresAt: { gt: now } } } } },
@@ -38,7 +42,7 @@ export const userRepository = {
       },
       orderBy: { createdAt: "asc" },
     });
-    return users.map(({ _count, invitations, ...user }) => {
+    return users.map(({ _count, invitations, karigar, ...user }) => {
       const invitation = invitations[0];
       // Locks expire on their own; the row only flips back on the next sign-in.
       const lockOver = user.status === "LOCKED" && user.lockedUntil !== null && user.lockedUntil <= now;
@@ -47,6 +51,7 @@ export const userRepository = {
         status: lockOver ? "ACTIVE" : user.status,
         lockedUntil: lockOver ? null : user.lockedUntil,
         activeSessionCount: _count.sessions,
+        linkedTo: karigar,
         invitation: invitation ? { ...invitation, expired: invitation.expiresAt <= now } : null,
       };
     });
@@ -63,7 +68,7 @@ export const userRepository = {
       ORDER BY u.id
       FOR UPDATE OF u`;
     const [row] = await db.$queryRaw<LockedUserRow[]>`
-      SELECT u.id, u.email, u.name, u.status::text AS status,
+      SELECT u.id, u.email, u.phone, u.name, u.status::text AS status,
              r.key AS role_key, r.name AS role_name, r.rank AS role_rank
       FROM users u JOIN roles r ON r.id = u.role_id
       WHERE u.id = ${userId}::uuid
@@ -72,6 +77,7 @@ export const userRepository = {
       ? {
           id: row.id,
           email: row.email,
+          phone: row.phone,
           name: row.name,
           status: row.status,
           role: { key: row.role_key, name: row.role_name, rank: row.role_rank },
@@ -83,16 +89,35 @@ export const userRepository = {
     return prisma.user.findUnique({ where: { id: userId }, select: MANAGED_USER_SELECT });
   },
 
-  async emailExists(db: Db, email: string): Promise<boolean> {
-    return (await db.user.findUnique({ where: { email }, select: { id: true } })) !== null;
+  async loginExists(db: Db, where: { email: string } | { phone: string }): Promise<boolean> {
+    return (await db.user.findUnique({ where, select: { id: true } })) !== null;
   },
 
-  async createInvited(
+  /** INVITED without a password (they set it from the link); ACTIVE with a must-change password otherwise. */
+  async createLogin(
     db: Db,
-    input: { email: string; name: string; roleId: string; createdBy: string },
+    input: {
+      email: string | null;
+      phone: string | null;
+      name: string;
+      roleId: string;
+      createdBy: string;
+      passwordHash: string | null;
+    },
   ): Promise<string> {
+    const withPassword = input.passwordHash !== null;
     const user = await db.user.create({
-      data: { email: input.email, name: input.name, roleId: input.roleId, status: "INVITED", createdById: input.createdBy },
+      data: {
+        email: input.email,
+        phone: input.phone,
+        name: input.name,
+        roleId: input.roleId,
+        createdById: input.createdBy,
+        status: withPassword ? "ACTIVE" : "INVITED",
+        passwordHash: input.passwordHash,
+        passwordChangedAt: withPassword ? new Date() : null,
+        mustChangePassword: withPassword,
+      },
       select: { id: true },
     });
     return user.id;
@@ -150,14 +175,18 @@ export const invitationRepository = {
 
   async findValidByTokenHash(
     tokenHash: TokenHash,
-  ): Promise<{ email: string; name: string; roleName: string; expiresAt: Date } | null> {
+  ): Promise<{ email: string | null; phone: string | null; name: string; roleName: string; expiresAt: Date } | null> {
     const invitation = await prisma.invitation.findFirst({
       where: { tokenHash, ...openInvitation, expiresAt: { gt: new Date() }, user: { status: "INVITED" } },
-      select: { expiresAt: true, user: { select: { email: true, name: true, role: { select: { name: true } } } } },
+      select: {
+        expiresAt: true,
+        user: { select: { email: true, phone: true, name: true, role: { select: { name: true } } } },
+      },
     });
     return invitation
       ? {
           email: invitation.user.email,
+          phone: invitation.user.phone,
           name: invitation.user.name,
           roleName: invitation.user.role.name,
           expiresAt: invitation.expiresAt,
@@ -177,11 +206,7 @@ export const invitationRepository = {
     return row ? { id: row.id, userId: row.user_id } : null;
   },
 
-  async activateInvitedUser(
-    db: Db,
-    userId: string,
-    input: { name: string; passwordHash: string },
-  ): Promise<boolean> {
+  async activateInvitedUser(db: Db, userId: string, input: { name: string; passwordHash: string }): Promise<boolean> {
     const { count } = await db.user.updateMany({
       where: { id: userId, status: "INVITED" },
       data: { status: "ACTIVE", name: input.name, passwordHash: input.passwordHash, passwordChangedAt: new Date() },
