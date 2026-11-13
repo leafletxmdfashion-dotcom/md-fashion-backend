@@ -88,7 +88,8 @@ const pieces = (label: string) =>
 const issueLines = z
   .array(
     z.strictObject({
-      colour: z.string().trim().min(1).max(50),
+      /** Left out: bulk issue of the size, drawn from every colour cut. */
+      colour: z.string().trim().max(50).default(""),
       sizeLabel: z.string().trim().min(1).max(20),
       quantity: pieces("the pieces").min(1, "Issue at least 1 piece."),
     }),

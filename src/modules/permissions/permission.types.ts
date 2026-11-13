@@ -42,10 +42,28 @@ export const PERMISSION_GROUPS = [
     ],
   },
   {
-    module: "Workers",
+    module: "Packing",
     permissions: [
-      { key: "karigar.view", label: "View", description: "Karigars and Jogadi teams." },
-      { key: "karigar.manage", label: "Create and edit", description: "Add karigars, Jogadi teams and members." },
+      { key: "packing.view", label: "View", description: "Pieces waiting to pack, packing entries and who packed what." },
+      { key: "packing.manage", label: "Pack", description: "Record packing and reverse a packing entry, with a reason." },
+    ],
+  },
+  {
+    module: "Godown",
+    permissions: [
+      { key: "godown.view", label: "View", description: "Finished-goods stock, movements, dispatches and history." },
+      {
+        key: "godown.manage",
+        label: "Dispatch and adjust",
+        description: "Dispatch goods, correct counts, reverse dispatches, merge items.",
+      },
+    ],
+  },
+  {
+    module: "Staff & Karigar",
+    permissions: [
+      { key: "karigar.view", label: "View", description: "Staff, karigars and Jogadi teams." },
+      { key: "karigar.manage", label: "Create and edit", description: "Add staff and karigars, Jogadi teams and members." },
     ],
   },
   {
@@ -55,6 +73,12 @@ export const PERMISSION_GROUPS = [
         key: "costing.view",
         label: "See rates and costs",
         description: "Pay rates, earnings, fabric cost and lot cost.",
+      },
+      { key: "payments.view", label: "View payments", description: "Balances and ledgers of staff and karigars." },
+      {
+        key: "payments.manage",
+        label: "Record payments",
+        description: "Payments, advances, expenses, credits and money received back.",
       },
     ],
   },
@@ -90,6 +114,7 @@ export const BUILT_IN_ROLES: readonly string[] = [
   "PACKING_STAFF",
   "GODOWN_STAFF",
   "VIEWER",
+  "KARIGAR",
 ];
 
 /** Roles created on the Roles screen sit between Manager (60) and Staff (40). */

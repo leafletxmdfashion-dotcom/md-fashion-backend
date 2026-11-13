@@ -30,3 +30,15 @@ export function actorOf(req: Request): AuthContext {
 export function can(req: Request, permission: Permission): boolean {
   return req.auth ? hasPermission(req.auth.user, permission) : false;
 }
+
+// Single normalization rule for every phone lookup and write: digits with an optional leading +,
+// so "+977 980-123 4567" and "+9779801234567" are the same login.
+export function normalizePhone(phone: string): string {
+  const trimmed = phone.normalize("NFKC").trim();
+  return (trimmed.startsWith("+") ? "+" : "") + trimmed.replace(/\D/g, "");
+}
+
+/** A login id is an email when it has an @, otherwise a phone number. */
+export function loginLookup(id: string): { email: string } | { phone: string } {
+  return id.includes("@") ? { email: normalizeEmail(id) } : { phone: normalizePhone(id) };
+}

@@ -640,19 +640,57 @@ describe("lots and articles", () => {
     expect((await owner.send("post", "/api/v1/articles", { name: "POLO  T SHIRT" })).status).toBe(404);
   });
 
-  it("only cuts fabric measured in kg", async () => {
-    const { owner } = await setup();
-    const metreId = await buyFabric(owner, "Denim", "METER", 10);
+  it("cuts fabric bought by the metre: Pala, Thaan, return and wastage are in metres", async () => {
+    const { owner, masterId } = await setup();
+    const metreId = await buyFabric(owner, "Denim", "METER", 100);
 
-    const res = await owner.send("post", "/api/v1/production-lots", {
-      lotNumber: "L-J1",
-      article: { name: "Jeans" },
+    // 30 m at 7.2 m per Pala → 4 Pala (28.8 m), 1.2 m left under one Pala is wastage.
+    const { batch } = await newProduction(owner, metreId, draft(masterId, [black("30")], "7.2"));
+    const res = await owner.send("post", `/api/v1/cutting-batches/${batch.id}/finalize`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.data.batch.lot.fabric.unit).toBe("METER");
+    expect(res.body.data.batch.posted).toMatchObject({ consumedKg: "28.8", wastageKg: "1.2", pala: 4, acceptedPieces: 16 });
+    expect(await balanceOf(owner, metreId)).toBe(70);
+    expect((await sql("SELECT DISTINCT unit FROM cutting_movements WHERE batch_id = $1", [batch.id])).rows).toEqual([
+      { unit: "METER" },
+    ]);
+
+    const reversed = await owner.send("post", `/api/v1/cutting-batches/${batch.id}/reverse`, { reason: "Wrong marker" });
+
+    expect(reversed.status).toBe(201);
+    expect((await sql("SELECT DISTINCT unit FROM cutting_movements WHERE batch_id = $1", [batch.id])).rows).toEqual([
+      { unit: "METER" },
+    ]);
+  });
+
+  it("speaks the fabric's unit in cutting messages", async () => {
+    const { owner, masterId } = await setup();
+    const metreId = await buyFabric(owner, "Denim", "METER", 100);
+    const preview = await owner.send("post", "/api/v1/cutting-batches/preview", {
       fabricId: metreId,
-      productionDate: today,
+      cutting: draft(masterId, [black("3")], "7.2"),
     });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error.details.fabricId).toBeDefined();
+    expect(preview.body.data.stock.unit).toBe("METER");
+    expect(preview.body.data.result.warnings[0].message).toMatch(/all 3\.000 m of Black/);
+  });
+
+  it("records Panaha and layer length typed in inches, stored in metres", async () => {
+    const { owner, fabricId, masterId } = await setup();
+    const inches = draft(masterId, [black("1")]);
+
+    inches.marker = { ...inches.marker, widthM: "1.4732", lengthM: "7.1", widthUnit: "IN", lengthUnit: "M" } as never;
+
+    const { batch } = await newProduction(owner, fabricId, inches);
+    const marker = (await owner.get(`/api/v1/cutting-batches/${batch.id}`)).body.data.batch.marker;
+
+    expect(marker).toMatchObject({ widthM: "1.4732", widthUnit: "IN", lengthM: "7.1", lengthUnit: "M" });
+
+    const bad = draft(masterId, [black("1")]);
+
+    bad.marker = { ...bad.marker, widthUnit: "FT" } as never;
+    expect((await owner.send("post", "/api/v1/cutting-batches/preview", { fabricId, cutting: bad })).status).toBe(400);
   });
 
   it("cancels a lot only while nothing has been issued", async () => {

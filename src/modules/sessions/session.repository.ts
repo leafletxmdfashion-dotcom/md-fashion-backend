@@ -8,7 +8,10 @@ export interface SessionLookupRow {
   last_seen_at: Date;
   expires_at: Date;
   user_id: string;
-  email: string;
+  email: string | null;
+  phone: string | null;
+  must_change_password: boolean;
+  karigar_id: string | null;
   name: string;
   status: UserStatus;
   role_key: string;
@@ -40,19 +43,20 @@ export const sessionRepository = {
   async findValidByTokenHash(tokenHash: TokenHash, idleTimeoutMs: number): Promise<SessionLookupRow | null> {
     const [row] = await prisma.$queryRaw<SessionLookupRow[]>`
       SELECT s.id AS session_id, s.last_seen_at, s.expires_at,
-             u.id AS user_id, u.email, u.name, u.status::text AS status,
+             u.id AS user_id, u.email, u.phone, u.must_change_password, k.id AS karigar_id, u.name, u.status::text AS status,
              r.key AS role_key, r.name AS role_name, r.rank AS role_rank,
              COALESCE(array_agg(rp.permission) FILTER (WHERE rp.permission IS NOT NULL), '{}') AS permissions
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       JOIN roles r ON r.id = u.role_id
       LEFT JOIN role_permissions rp ON rp.role_id = r.id
+      LEFT JOIN karigars k ON k.user_id = u.id
       WHERE s.token_hash = ${tokenHash}
         AND s.revoked_at IS NULL
         AND s.expires_at > now()
         AND s.last_seen_at > now() - (${idleTimeoutMs}::bigint * interval '1 millisecond')
         AND u.status IN ('ACTIVE', 'LOCKED')
-      GROUP BY s.id, u.id, r.id`;
+      GROUP BY s.id, u.id, r.id, k.id`;
     return row ?? null;
   },
 

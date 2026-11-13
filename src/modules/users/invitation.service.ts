@@ -20,6 +20,31 @@ export interface IssuedInvitation {
   inviteUrl: string;
 }
 
+/** A new login: invited by link (the person sets the password) or given a password by the admin. */
+export interface NewLoginInput {
+  name: string;
+  email: string | null;
+  phone: string | null;
+  roleKey: string;
+  mode: "INVITE" | "PASSWORD";
+  /** Required for PASSWORD; the person must change it at the first sign-in. */
+  password?: string | undefined;
+}
+
+/** Checked and hashed outside the transaction (Argon2 is slow); `createInTx` writes it. */
+export interface PreparedLogin {
+  input: NewLoginInput;
+  role: { id: string; key: string };
+  passwordHash: string | null;
+}
+
+export interface CreatedLogin {
+  userId: string;
+  mode: NewLoginInput["mode"];
+  /** Only for INVITE. */
+  invitation: IssuedInvitation | null;
+}
+
 function inviteUrl(token: string): string {
   // Fragment (#) keeps the token out of server logs, proxies and Referer headers.
   return `${env.clientOrigin}/accept-invitation#token=${token}`;
@@ -37,7 +62,10 @@ async function issueInvitation(tx: Db, userId: string, invitedBy: string) {
   return { token, invitationId, expiresAt };
 }
 
-async function deliver(email: string, name: string, url: string): Promise<void> {
+async function deliver(email: string | null, name: string, url: string): Promise<void> {
+  // Phone-only logins get the link from the admin (shown once in the response).
+  if (!email) return;
+
   try {
     await sendMail({
       to: email,
@@ -57,49 +85,118 @@ async function deliver(email: string, name: string, url: string): Promise<void> 
   }
 }
 
+/** Password policy for a password an admin chooses for someone; errors name the `password` field. */
+export function assertChosenPassword(
+  password: string,
+  context: { email: string | null; phone: string | null; name: string },
+): void {
+  try {
+    assertPasswordPolicy(password, context);
+  } catch (error) {
+    if (error instanceof AppError && error.details?.newPassword) {
+      throw new AppError(error.status, error.code, error.message, { password: error.details.newPassword });
+    }
+    throw error;
+  }
+}
+
+const taken = (field: "email" | "phone") =>
+  new AppError(409, ErrorCode.CONFLICT, `A login with this ${field} already exists.`, {
+    [field]: [`A login with this ${field} already exists.`],
+  });
+
 export const invitationService = {
-  async create(
-    actor: AuthContext,
-    input: { email: string; name: string; roleKey: string },
-    meta: ClientMeta,
-  ): Promise<IssuedInvitation> {
+  /** Role and hierarchy checks plus password policy and hashing, before any transaction. */
+  async prepare(actor: AuthContext, input: NewLoginInput): Promise<PreparedLogin> {
+    if (!input.email && !input.phone) {
+      throw new AppError(400, ErrorCode.VALIDATION_ERROR, "Enter an email or a phone number.", {
+        email: ["Enter an email or a phone number."],
+      });
+    }
+
     const role = await permissionRepository.findRoleByKey(prisma, input.roleKey);
     if (!role) {
       throw new AppError(400, ErrorCode.VALIDATION_ERROR, "Unknown role.", { roleKey: ["Unknown role."] });
     }
     if (!canAssignRole(actor.user, role)) throw errors.forbidden();
 
-    try {
-      const result = await transaction(async (tx) => {
-        if (await userRepository.emailExists(tx, input.email)) {
-          throw errors.conflict("A user with this email already exists.");
-        }
-        const userId = await userRepository.createInvited(tx, {
-          email: input.email,
-          name: input.name,
-          roleId: role.id,
-          createdBy: actor.user.id,
-        });
-        const issued = await issueInvitation(tx, userId, actor.user.id);
-        await recordAudit(tx, {
-          type: "INVITATION_CREATED",
-          actorUserId: actor.user.id,
-          targetUserId: userId,
-          sessionId: actor.sessionId,
-          meta,
-          metadata: { invitationId: issued.invitationId, role: role.key },
-        });
-        return { userId, ...issued };
-      });
+    let passwordHash: string | null = null;
 
-      const url = inviteUrl(result.token);
-      await deliver(input.email, input.name, url);
-      return { userId: result.userId, invitationId: result.invitationId, expiresAt: result.expiresAt, inviteUrl: url };
-    } catch (error) {
-      // Concurrent invite for the same email loses on the unique constraint.
-      if (isUniqueViolation(error)) {
-        throw errors.conflict("A user with this email already exists.");
+    if (input.mode === "PASSWORD") {
+      if (!input.password) {
+        throw new AppError(400, ErrorCode.VALIDATION_ERROR, "Enter a password.", { password: ["Enter a password."] });
       }
+      assertChosenPassword(input.password, input);
+      passwordHash = await hashPassword(input.password);
+    }
+
+    return { input, role: { id: role.id, key: role.key }, passwordHash };
+  },
+
+  /** Writes the user (and invitation) inside the caller's transaction. Mail goes out after commit via `notify`. */
+  async createInTx(tx: Db, actor: AuthContext, prepared: PreparedLogin, meta: ClientMeta): Promise<CreatedLogin> {
+    const { input, role, passwordHash } = prepared;
+
+    if (input.email && (await userRepository.loginExists(tx, { email: input.email }))) throw taken("email");
+    if (input.phone && (await userRepository.loginExists(tx, { phone: input.phone }))) throw taken("phone");
+
+    const userId = await userRepository.createLogin(tx, {
+      email: input.email,
+      phone: input.phone,
+      name: input.name,
+      roleId: role.id,
+      createdBy: actor.user.id,
+      passwordHash,
+    });
+
+    if (input.mode === "PASSWORD") {
+      await recordAudit(tx, {
+        type: "USER_CREATED",
+        actorUserId: actor.user.id,
+        targetUserId: userId,
+        sessionId: actor.sessionId,
+        meta,
+        metadata: { role: role.key, mode: "PASSWORD", mustChangePassword: true },
+      });
+      return { userId, mode: "PASSWORD", invitation: null };
+    }
+
+    const issued = await issueInvitation(tx, userId, actor.user.id);
+    await recordAudit(tx, {
+      type: "INVITATION_CREATED",
+      actorUserId: actor.user.id,
+      targetUserId: userId,
+      sessionId: actor.sessionId,
+      meta,
+      metadata: { invitationId: issued.invitationId, role: role.key },
+    });
+    return {
+      userId,
+      mode: "INVITE",
+      invitation: {
+        userId,
+        invitationId: issued.invitationId,
+        expiresAt: issued.expiresAt,
+        inviteUrl: inviteUrl(issued.token),
+      },
+    };
+  },
+
+  /** After commit: emails the invitation link when the login has an email. */
+  async notify(created: CreatedLogin, input: NewLoginInput): Promise<void> {
+    if (created.invitation) await deliver(input.email, input.name, created.invitation.inviteUrl);
+  },
+
+  async create(actor: AuthContext, input: NewLoginInput, meta: ClientMeta): Promise<CreatedLogin> {
+    const prepared = await invitationService.prepare(actor, input);
+
+    try {
+      const created = await transaction((tx) => invitationService.createInTx(tx, actor, prepared, meta));
+      await invitationService.notify(created, input);
+      return created;
+    } catch (error) {
+      // A concurrent create for the same email or phone loses on the unique constraint.
+      if (isUniqueViolation(error)) throw errors.conflict("A login with this email or phone already exists.");
       throw error;
     }
   },
@@ -161,7 +258,7 @@ export const invitationService = {
 
       const user = await userRepository.findForUpdate(tx, invitation.userId);
       if (!user || user.status !== "INVITED") throw errors.tokenInvalid();
-      assertPasswordPolicy(input.newPassword, { email: user.email, name: input.name });
+      assertPasswordPolicy(input.newPassword, { email: user.email, phone: user.phone, name: input.name });
 
       const activated = await invitationRepository.activateInvitedUser(tx, user.id, {
         name: input.name,

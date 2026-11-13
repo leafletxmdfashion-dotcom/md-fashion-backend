@@ -1,7 +1,7 @@
 import { Router } from "express";
 
 import type { RateLimiters } from "../lib/rate-limit";
-import { loadSession } from "../modules/auth/auth.middleware";
+import { loadSession, requirePasswordChanged } from "../modules/auth/auth.middleware";
 import { authRoutes } from "../modules/auth/auth.routes";
 import { csrfProtection } from "../modules/auth/csrf";
 import { articleRoutes } from "../modules/articles/article.routes";
@@ -9,6 +9,9 @@ import { cuttingRoutes, lotRoutes } from "../modules/cutting/cutting.routes";
 import { fabricRoutes } from "../modules/fabrics/fabric.routes";
 import { jogadiRoutes } from "../modules/jogadi/jogadi";
 import { karigarRoutes } from "../modules/karigars/karigar.routes";
+import { godownRoutes } from "../modules/godown/godown.routes";
+import { packingRoutes } from "../modules/packing/packing.routes";
+import { paymentsRoutes } from "../modules/payments/payments.routes";
 import { roleRoutes } from "../modules/permissions/permission.routes";
 import { stitchingRoutes } from "../modules/stitching/stitching.routes";
 import { userRoutes } from "../modules/users/user.routes";
@@ -21,13 +24,14 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use(limiters.api);
   router.use(loadSession);
   router.use(csrfProtection);
+  router.use(requirePasswordChanged);
 
   router.get("/", (_req, res) => {
     res.json({ success: true, data: { name: "Garment Management API" } });
   });
 
   router.use("/auth", authRoutes(limiters));
-  router.use("/users", userRoutes());
+  router.use("/users", userRoutes(limiters));
   router.use("/roles", roleRoutes());
   router.use("/fabrics", fabricRoutes());
   router.use("/karigars", karigarRoutes());
@@ -36,6 +40,9 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use("/cutting-batches", cuttingRoutes());
   router.use("/jogadi", jogadiRoutes());
   router.use("/stitching", stitchingRoutes());
+  router.use("/packing", packingRoutes());
+  router.use("/godown", godownRoutes());
+  router.use("/payments", paymentsRoutes());
 
   return router;
 }

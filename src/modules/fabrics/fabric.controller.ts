@@ -1,9 +1,8 @@
-import type { Request, RequestHandler, Response } from "express";
+import type { Request, RequestHandler } from "express";
 
-import { factoryToday } from "../../lib/business-date";
 import { errors } from "../../lib/errors";
 import { can, clientMeta } from "../../lib/request";
-import { toCsv } from "../../lib/list-query";
+import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
 import {
   adjustmentSchema,
   createInwardSchema,
@@ -27,18 +26,6 @@ function actorOf(req: Request) {
 
 function idOf(req: Request): string {
   return idParamsSchema.parse(req.params).id;
-}
-
-// ponytail: exports are capped and built in memory; stream with a cursor if they ever need to be larger.
-const EXPORT_LIMIT = 10_000;
-
-function sendCsv(res: Response, name: string, header: string[], rows: (string | number | null)[][]) {
-  const stamp = factoryToday();
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="${name}-${stamp}.csv"`);
-  res.setHeader("Cache-Control", "no-store");
-  // BOM so spreadsheet apps read the file as UTF-8.
-  res.send(`\uFEFF${toCsv(header, rows)}`);
 }
 
 // Fabric cost (rates, amounts, stock value) is only returned to users with costing.view.
@@ -105,36 +92,26 @@ export const fabricController = {
   }) satisfies RequestHandler,
 
   exportMovements: (async (req, res) => {
-    const { movements } = await fabricService.listMovements({ ...movementQuery(req), page: 1, pageSize: EXPORT_LIMIT });
+    const { movements } = await fabricService.listMovements(allRows(movementQuery(req)));
     sendCsv(
+      req,
       res,
       "fabric-ledger",
       [
-        "Date",
-        "Movement",
-        "Fabric code",
-        "Fabric",
-        "Unit",
-        "In",
-        "Out",
-        "Balance",
-        "Reference",
-        "Reason",
-        "By",
+        { header: "Date", value: (m) => m.date },
+        { header: "Movement", value: (m) => m.type },
+        { header: "Fabric code", value: (m) => m.fabric.code },
+        { header: "Fabric", value: (m) => m.fabric.name },
+        { header: "Unit", value: (m) => m.fabric.unit },
+        { header: "In", value: (m) => m.qtyIn || null },
+        { header: "Out", value: (m) => m.qtyOut || null },
+        { header: "Balance", value: (m) => m.balance },
+        { header: "Reference", value: (m) => (m.inward ? docNumber("FI", m.inward.number) : null) },
+        { header: "Reason", value: (m) => m.reason },
+        { header: "By", value: (m) => m.createdBy },
       ],
-      movements.map((m) => [
-        m.date,
-        m.type,
-        m.fabric.code,
-        m.fabric.name,
-        m.fabric.unit,
-        m.qtyIn || null,
-        m.qtyOut || null,
-        m.balance,
-        m.inward ? `FI-${String(m.inward.number).padStart(4, "0")}` : null,
-        m.reason,
-        m.createdBy,
-      ]),
+      movements,
+      (m) => m.id,
     );
   }) satisfies RequestHandler,
 
@@ -145,37 +122,32 @@ export const fabricController = {
   }) satisfies RequestHandler,
 
   exportInwards: (async (req, res) => {
-    const { inwards } = await inwardService.list({ ...inwardQuery(req), page: 1, pageSize: EXPORT_LIMIT });
+    const { inwards } = await inwardService.list(allRows(inwardQuery(req)));
     const cost = showCost(req);
     sendCsv(
+      req,
       res,
       "fabric-purchases",
       [
-        "No.",
-        "Date",
-        "Fabric code",
-        "Fabric",
-        "Unit",
-        "Quantity",
-        ...(cost ? ["Rate", "Amount"] : []),
-        "Supplier",
-        "Invoice",
-        "Status",
-        "Notes",
+        { header: "No.", value: (i) => docNumber("FI", i.number) },
+        { header: "Date", value: (i) => i.inwardDate },
+        { header: "Fabric code", value: (i) => i.fabric.code },
+        { header: "Fabric", value: (i) => i.fabric.name },
+        { header: "Unit", value: (i) => i.fabric.unit },
+        { header: "Quantity", value: (i) => i.quantity },
+        ...(cost
+          ? [
+              { header: "Rate", value: (i: InwardDto) => i.rate },
+              { header: "Amount", value: (i: InwardDto) => i.amount },
+            ]
+          : []),
+        { header: "Supplier", value: (i) => i.supplier },
+        { header: "Invoice", value: (i) => i.invoiceRef },
+        { header: "Status", value: (i) => (i.reversal ? "Reversed" : "Posted") },
+        { header: "Notes", value: (i) => i.notes },
       ],
-      inwards.map((i) => [
-        `FI-${String(i.number).padStart(4, "0")}`,
-        i.inwardDate,
-        i.fabric.code,
-        i.fabric.name,
-        i.fabric.unit,
-        i.quantity,
-        ...(cost ? [i.rate, i.amount] : []),
-        i.supplier,
-        i.invoiceRef,
-        i.reversal ? "Reversed" : "Posted",
-        i.notes,
-      ]),
+      inwards,
+      (i) => i.id,
     );
   }) satisfies RequestHandler,
 

@@ -21,7 +21,7 @@ export async function sql(text: string, values: unknown[] = []): Promise<{ rows:
 }
 
 export async function resetDatabase(): Promise<void> {
-  await prisma.$executeRawUnsafe("TRUNCATE users, sessions, password_reset_tokens, invitations, audit_events CASCADE");
+  await prisma.$executeRawUnsafe("TRUNCATE users, sessions, password_reset_tokens, invitations, audit_events RESTART IDENTITY CASCADE");
   // Not owned by a column, so TRUNCATE does not restart it; codes start at FAB-0001 in every test.
   await prisma.$executeRawUnsafe("ALTER SEQUENCE fabric_code_seq RESTART");
   // Roles are not owned by users: custom ones go, and built-in grants return to the migrated seed.

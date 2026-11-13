@@ -9,6 +9,7 @@ export const ErrorCode = {
   AUTH_INVALID_CREDENTIALS: "AUTH_INVALID_CREDENTIALS",
   AUTH_UNAUTHENTICATED: "AUTH_UNAUTHENTICATED",
   AUTH_FORBIDDEN: "AUTH_FORBIDDEN",
+  PASSWORD_CHANGE_REQUIRED: "PASSWORD_CHANGE_REQUIRED",
   AUTH_CURRENT_PASSWORD_INCORRECT: "AUTH_CURRENT_PASSWORD_INCORRECT",
   PASSWORD_TOO_WEAK: "PASSWORD_TOO_WEAK",
   PASSWORD_REUSED: "PASSWORD_REUSED",
@@ -36,7 +37,7 @@ export class AppError extends Error {
 }
 
 export const errors = {
-  invalidCredentials: () => new AppError(401, ErrorCode.AUTH_INVALID_CREDENTIALS, "Invalid email or password."),
+  invalidCredentials: () => new AppError(401, ErrorCode.AUTH_INVALID_CREDENTIALS, "Invalid email, phone or password."),
   unauthenticated: () => new AppError(401, ErrorCode.AUTH_UNAUTHENTICATED, "Authentication required."),
   forbidden: () => new AppError(403, ErrorCode.AUTH_FORBIDDEN, "You do not have permission to perform this action."),
   csrf: () => new AppError(403, ErrorCode.CSRF_INVALID, "Invalid or missing CSRF token."),
@@ -83,6 +84,9 @@ export const errorHandler: ErrorRequestHandler = (err: unknown, req, res, _next)
       err.type === "entity.too.large"
         ? new AppError(413, ErrorCode.PAYLOAD_TOO_LARGE, "Request body too large.")
         : new AppError(400, ErrorCode.BAD_REQUEST, "Malformed request body.");
+  } else if (typeof err === "object" && err !== null && "code" in err && err.code === "P2002") {
+    // A unique constraint caught a race the service check could not (e.g. the same email twice at once).
+    appError = new AppError(409, ErrorCode.CONFLICT, "This already exists. Reload and try again.");
   } else if (isConcurrencyConflict(err)) {
     // Postgres aborted one of two transactions racing for the same rows; the data is intact.
     req.log.warn({ err }, "concurrent update conflict");

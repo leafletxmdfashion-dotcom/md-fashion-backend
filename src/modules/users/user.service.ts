@@ -5,7 +5,10 @@ import { permissionRepository } from "../permissions/permission.repository";
 import { canAssignRole, canManageUser, isOwner } from "../permissions/permission.service";
 import { sessionService } from "../sessions/session.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
-import { userRepository } from "./user.repository";
+import { authRepository } from "../auth/auth.repository";
+import { hashPassword } from "../auth/password";
+import { assertChosenPassword } from "./invitation.service";
+import { invitationRepository, userRepository } from "./user.repository";
 import type { ManagedUserDto, ManagedUserRecord } from "./user.types";
 
 /** Locks the target row and enforces the hierarchy; self-management goes through /auth instead. */
@@ -71,6 +74,35 @@ export const userService = {
         sessionId: actor.sessionId,
         meta,
         metadata: { from: target.role.key, to: role.key },
+      });
+    });
+  },
+
+  /**
+   * Sets a password chosen by an admin (for people without email, or who forgot theirs). The user
+   * must change it at the next sign-in; open invitations, reset links and sessions are retired.
+   */
+  async setPassword(actor: AuthContext, userId: string, password: string, meta: ClientMeta): Promise<void> {
+    const current = await userRepository.findById(userId);
+    if (!current) throw errors.notFound("User");
+    assertChosenPassword(password, current);
+    const passwordHash = await hashPassword(password);
+
+    await transaction(async (tx) => {
+      const target = await lockManageableTarget(tx, actor, userId);
+      if (target.status === "DISABLED") throw errors.conflict("Enable this login before setting a password.");
+
+      await authRepository.setTemporaryPassword(tx, userId, passwordHash);
+      await invitationRepository.revokeOpenForUser(tx, userId);
+      await authRepository.invalidateResetTokens(tx, userId);
+      const revoked = await sessionService.revokeAllForUser(tx, userId, "revoked_by_admin");
+      await recordAudit(tx, {
+        type: "PASSWORD_SET_BY_ADMIN",
+        actorUserId: actor.user.id,
+        targetUserId: userId,
+        sessionId: actor.sessionId,
+        meta,
+        metadata: { revokedSessions: revoked, mustChangePassword: true },
       });
     });
   },

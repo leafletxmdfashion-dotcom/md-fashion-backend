@@ -65,6 +65,9 @@ export const sessionService = {
       user: {
         id: row.user_id,
         email: row.email,
+        phone: row.phone,
+        mustChangePassword: row.must_change_password,
+        karigarId: row.karigar_id,
         name: row.name,
         status: row.status,
         role: { key: row.role_key, name: row.role_name, rank: row.role_rank },
