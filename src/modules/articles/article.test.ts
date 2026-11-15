@@ -59,6 +59,16 @@ describe("merge items", () => {
       });
     }
 
+    // The engine suggests the two as one design; the item with more stock comes first.
+    const similar = (await owner.get("/api/v1/articles/similar")).body.data.groups as {
+      items: { id: string; name: string }[];
+      score: number;
+    }[];
+
+    expect(similar).toHaveLength(1);
+    expect(similar[0]!.items.map((item) => item.name).sort()).toEqual(["Black trouser", "Trouser"]);
+    expect(similar[0]!.score).toBeGreaterThanOrEqual(0.45);
+
     const self = await owner.send("post", "/api/v1/articles/merge", { targetId: articleId, sourceIds: [articleId] });
 
     expect(self.status).toBe(400);
@@ -78,6 +88,7 @@ describe("merge items", () => {
       { size_label: "M", balance: 20 },
     ]);
     expect((await sql("SELECT count(*)::int AS n FROM articles")).rows[0].n).toBe(1);
+    expect((await owner.get("/api/v1/articles/similar")).body.data.groups).toEqual([]);
 
     // Stock still moves normally after the merge.
     const out = await owner.send("post", "/api/v1/godown/dispatches", {

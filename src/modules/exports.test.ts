@@ -107,7 +107,6 @@ const LISTS: [string, string, string][] = [
   ["/api/v1/godown/movements", "/api/v1/godown/movements/export", "movements"],
   ["/api/v1/godown/dispatches", "/api/v1/godown/dispatches/export", "dispatches"],
   ["/api/v1/godown/finished-goods", "/api/v1/godown/finished-goods/export", "lots"],
-  ["/api/v1/godown/finished-goods/items?page=1", "/api/v1/godown/finished-goods/items/export", "items"],
   ["/api/v1/payments/people", "/api/v1/payments/people/export", "people"],
   ["/api/v1/payments/ledger", "/api/v1/payments/ledger/export", "entries"],
   ["/api/v1/users?page=1", "/api/v1/users/export", "users"],

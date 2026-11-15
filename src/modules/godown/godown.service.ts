@@ -103,25 +103,64 @@ export async function lockStock(tx: Tx, keys: { articleId: string; sizeLabel: st
 }
 
 export const godownService = {
-  /** Stock per item, with each size's net in, out and balance. */
+  /**
+   * Every item (design) with lots or godown stock, all its lots added together: how many are
+   * still in production, waiting to pack, packed, dispatched and in the godown, with each
+   * size's net in, out and balance. The Godown screen lists these; one item opens its page.
+   */
   async stock(query: StockQuery) {
-    const clauses: Prisma.Sql[] = [];
+    const clauses: Prisma.Sql[] = [Prisma.sql`(f.article_id IS NOT NULL OR s.article_id IS NOT NULL)`];
 
     if (query.search) clauses.push(Prisma.sql`a.search_text LIKE ${contains(query.search)}`);
 
     if (query.articleId) clauses.push(Prisma.sql`a.id = ${query.articleId}::uuid`);
 
-    const having = query.inStock === "true" ? Prisma.sql`HAVING sum(s.balance) > 0` : Prisma.empty;
+    if (query.inStock === "true") clauses.push(Prisma.sql`COALESCE(s.balance, 0) > 0`);
+
     const month = factoryToday().slice(0, 7) + "-01";
 
     const items = Prisma.sql`
-      SELECT a.id, a.code, a.name, sum(s.balance)::int AS balance, max(s.last_movement_at) AS last_movement_at
-      FROM godown_stock s JOIN articles a ON a.id = s.article_id ${where(clauses)}
-      GROUP BY a.id ${having}`;
+      WITH f AS (
+        SELECT l.article_id, count(*)::int AS lots, sum(x.cut)::int AS cut, sum(x.good)::int AS good,
+               sum(x.reject)::int AS reject, sum(x.packed)::int AS packed,
+               sum(x.unissued + x.wip + x.rework)::int AS in_production
+        FROM (${LOT_FLOW}) x JOIN production_lots l ON l.id = x.lot_id AND l.status <> 'CANCELLED' GROUP BY 1
+      ), mv AS (
+        SELECT m.article_id, (${NET_OUT})::int AS out,
+               (COALESCE(sum(m.qty_out) FILTER (WHERE m.type = 'DISPATCH'), 0)
+                 - COALESCE(sum(m.qty_in) FILTER (WHERE m.type = 'DISPATCH_REVERSAL'), 0))::int AS dispatched
+        FROM godown_movements m GROUP BY 1
+      ), s AS (
+        SELECT article_id, sum(balance)::int AS balance, max(last_movement_at) AS last_movement_at
+        FROM godown_stock GROUP BY 1
+      )
+      SELECT a.id, a.code, a.name, COALESCE(f.lots, 0) AS lots, COALESCE(f.cut, 0) AS cut,
+             COALESCE(f.good, 0) AS good, COALESCE(f.reject, 0) AS reject, COALESCE(f.packed, 0) AS packed,
+             COALESCE(f.in_production, 0) AS in_production, COALESCE(mv.dispatched, 0) AS dispatched,
+             COALESCE(s.balance, 0) AS balance, s.last_movement_at
+      FROM articles a
+      LEFT JOIN f ON f.article_id = a.id
+      LEFT JOIN mv ON mv.article_id = a.id
+      LEFT JOIN s ON s.article_id = a.id
+      ${where(clauses)}`;
 
     const [rows, [count], [summary]] = await Promise.all([
-      prisma.$queryRaw<{ id: string; code: string; name: string; balance: number; last_movement_at: Date }[]>`
-        ${items} ORDER BY a.name, a.code ${page(query)}`,
+      prisma.$queryRaw<
+        {
+          id: string;
+          code: string;
+          name: string;
+          lots: number;
+          cut: number;
+          good: number;
+          reject: number;
+          packed: number;
+          in_production: number;
+          dispatched: number;
+          balance: number;
+          last_movement_at: Date | null;
+        }[]
+      >`${items} ORDER BY a.name, a.code ${page(query)}`,
       prisma.$queryRaw<{ total: number }[]>`SELECT count(*)::int AS total FROM (${items}) i`,
       prisma.$queryRaw<{ items: number; pieces: number; sizes: number; in_month: number; out_month: number }[]>`
         SELECT (SELECT count(DISTINCT article_id)::int FROM godown_stock WHERE balance > 0) AS items,
@@ -149,6 +188,15 @@ export const godownService = {
         return {
           article: { id: row.id, code: row.code, name: row.name },
           sizes: own,
+          lots: row.lots,
+          cut: row.cut,
+          good: row.good,
+          reject: row.reject,
+          inProduction: row.in_production,
+          /** Good pieces not packed yet. */
+          toPack: Math.max(0, row.good - row.packed),
+          packed: row.packed,
+          dispatched: row.dispatched,
           in: own.reduce((sum, size) => sum + size.in, 0),
           out: own.reduce((sum, size) => sum + size.out, 0),
           balance: row.balance,
@@ -575,60 +623,6 @@ export const godownService = {
         toPack: summary!.to_pack,
         inProduction: summary!.in_production,
       },
-    };
-  },
-
-  /** Finished goods per item: lots, cut, Good, packed, dispatched and in stock. */
-  async finishedItems(search: string | undefined) {
-    const filter = search ? Prisma.sql`AND a.search_text LIKE ${contains(search)}` : Prisma.empty;
-
-    const rows = await prisma.$queryRaw<
-      {
-        id: string;
-        code: string;
-        name: string;
-        lots: number;
-        cut: number;
-        good: number;
-        reject: number;
-        packed: number;
-        dispatched: number;
-        in_stock: number;
-      }[]
-    >`
-      WITH flow AS (
-        SELECT l.article_id, count(*)::int AS lots, sum(x.cut)::int AS cut, sum(x.good)::int AS good,
-               sum(x.reject)::int AS reject, sum(x.packed)::int AS packed
-        FROM (${LOT_FLOW}) x JOIN production_lots l ON l.id = x.lot_id GROUP BY 1
-      ), moved AS (
-        SELECT m.article_id, (${NET_OUT})::int AS out,
-               (COALESCE(sum(m.qty_out) FILTER (WHERE m.type = 'DISPATCH'), 0)
-                 - COALESCE(sum(m.qty_in) FILTER (WHERE m.type = 'DISPATCH_REVERSAL'), 0))::int AS dispatched
-        FROM godown_movements m GROUP BY 1
-      ), stock AS (SELECT article_id, sum(balance)::int AS in_stock FROM godown_stock GROUP BY 1)
-      SELECT a.id, a.code, a.name, COALESCE(f.lots, 0) AS lots, COALESCE(f.cut, 0) AS cut, COALESCE(f.good, 0) AS good,
-             COALESCE(f.reject, 0) AS reject, COALESCE(f.packed, 0) AS packed,
-             COALESCE(mv.dispatched, 0) AS dispatched, COALESCE(s.in_stock, 0) AS in_stock
-      FROM articles a
-      LEFT JOIN flow f ON f.article_id = a.id
-      LEFT JOIN moved mv ON mv.article_id = a.id
-      LEFT JOIN stock s ON s.article_id = a.id
-      WHERE (f.article_id IS NOT NULL OR s.article_id IS NOT NULL) ${filter}
-      ORDER BY a.name`;
-
-    return {
-      items: rows.map((row) => ({
-        id: row.id,
-        code: row.code,
-        articleName: row.name,
-        lots: row.lots,
-        cut: row.cut,
-        good: row.good,
-        reject: row.reject,
-        packed: row.packed,
-        dispatched: row.dispatched,
-        inStock: row.in_stock,
-      })),
     };
   },
 };

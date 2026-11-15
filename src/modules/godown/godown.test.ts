@@ -175,9 +175,21 @@ describe("finished goods", () => {
     });
     expect(data.summary).toMatchObject({ lots: 1, cut: 84, good: 81, packed: 81, reject: 1 });
 
-    const items = (await owner.get("/api/v1/godown/finished-goods/items")).body.data.items;
+    // One row per item, every lot added together: the Godown list.
+    const stock = (await owner.get("/api/v1/godown/stock")).body.data;
 
-    expect(items[0]).toMatchObject({ articleName: "Polo", packed: 81, dispatched: 1, inStock: 80, lots: 1 });
+    expect(stock.items[0]).toMatchObject({
+      article: { name: "Polo" },
+      lots: 1,
+      cut: 84,
+      good: 81,
+      inProduction: 2,
+      toPack: 0,
+      packed: 81,
+      dispatched: 1,
+      balance: 80,
+    });
+    expect(stock.totals).toEqual({ inProduction: 2, toPack: 0, packed: 81, dispatched: 1, balance: 80 });
   });
 });
 
