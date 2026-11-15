@@ -45,18 +45,23 @@ export const sessionRepository = {
       SELECT s.id AS session_id, s.last_seen_at, s.expires_at,
              u.id AS user_id, u.email, u.phone, u.must_change_password, k.id AS karigar_id, u.name, u.status::text AS status,
              r.key AS role_key, r.name AS role_name, r.rank AS role_rank,
-             COALESCE(array_agg(rp.permission) FILTER (WHERE rp.permission IS NOT NULL), '{}') AS permissions
+             -- Role rights plus rights given to this person, minus rights taken from them.
+             ARRAY(
+               SELECT rp.permission FROM role_permissions rp WHERE rp.role_id = r.id
+               UNION
+               SELECT o.permission FROM user_permission_overrides o WHERE o.user_id = u.id AND o.effect = 'ALLOW'
+               EXCEPT
+               SELECT o.permission FROM user_permission_overrides o WHERE o.user_id = u.id AND o.effect = 'DENY'
+             ) AS permissions
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       JOIN roles r ON r.id = u.role_id
-      LEFT JOIN role_permissions rp ON rp.role_id = r.id
       LEFT JOIN karigars k ON k.user_id = u.id
       WHERE s.token_hash = ${tokenHash}
         AND s.revoked_at IS NULL
         AND s.expires_at > now()
         AND s.last_seen_at > now() - (${idleTimeoutMs}::bigint * interval '1 millisecond')
-        AND u.status IN ('ACTIVE', 'LOCKED')
-      GROUP BY s.id, u.id, r.id, k.id`;
+        AND u.status IN ('ACTIVE', 'LOCKED')`;
     return row ?? null;
   },
 
