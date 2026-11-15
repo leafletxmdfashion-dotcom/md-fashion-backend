@@ -84,6 +84,7 @@ export async function recordAudit(db: Db, event: AuditEvent): Promise<void> {
       sessionId: event.sessionId ?? null,
       ipAddress: event.meta?.ip ?? null,
       userAgent: event.meta?.userAgent ?? null,
+      requestId: event.meta?.requestId ?? null,
       metadata: event.metadata ?? {},
     },
   });

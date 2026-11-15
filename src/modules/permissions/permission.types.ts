@@ -88,6 +88,11 @@ export const PERMISSION_GROUPS = [
       { key: "users.view", label: "View users", description: "Who has an account and their role." },
       { key: "users.manage", label: "Manage users", description: "Invite staff, change roles, disable accounts." },
       { key: "roles.manage", label: "Manage roles", description: "Create roles and choose what each can do." },
+      {
+        key: "audit.view",
+        label: "View audit log",
+        description: "Who did what and when, from which device and address.",
+      },
     ],
   },
 ] as const;

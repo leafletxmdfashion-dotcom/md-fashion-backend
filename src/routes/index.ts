@@ -5,6 +5,7 @@ import { loadSession, requirePasswordChanged } from "../modules/auth/auth.middle
 import { authRoutes } from "../modules/auth/auth.routes";
 import { csrfProtection } from "../modules/auth/csrf";
 import { articleRoutes } from "../modules/articles/article.routes";
+import { auditRoutes } from "../modules/audit/audit.routes";
 import { cuttingRoutes, lotRoutes } from "../modules/cutting/cutting.routes";
 import { fabricRoutes } from "../modules/fabrics/fabric.routes";
 import { accessRoutes } from "../modules/permissions/access";
@@ -35,6 +36,7 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use("/users", userRoutes(limiters));
   router.use("/roles", roleRoutes());
   router.use("/access", accessRoutes());
+  router.use("/audit-events", auditRoutes());
   router.use("/fabrics", fabricRoutes());
   router.use("/karigars", karigarRoutes());
   router.use("/articles", articleRoutes());

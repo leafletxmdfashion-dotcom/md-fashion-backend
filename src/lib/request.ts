@@ -11,6 +11,8 @@ export function clientMeta(req: Request): ClientMeta {
   return {
     ip: req.ip ?? null,
     userAgent: req.get("user-agent")?.slice(0, 512) ?? null,
+    // Set by pino-http (app.ts) from a valid incoming X-Request-Id or a new UUID.
+    requestId: typeof req.id === "string" ? req.id.slice(0, 100) : null,
   };
 }
 

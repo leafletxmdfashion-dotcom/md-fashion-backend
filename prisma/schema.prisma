@@ -170,20 +170,30 @@ model Invitation {
 }
 
 model AuditEvent {
-  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  eventType    String   @map("event_type")
-  actorUserId  String?  @map("actor_user_id") @db.Uuid
-  targetUserId String?  @map("target_user_id") @db.Uuid
-  sessionId    String?  @map("session_id") @db.Uuid
-  ipAddress    String?  @map("ip_address") @db.Inet
-  userAgent    String?  @map("user_agent")
-  metadata     Json     @default("{}")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  actor        User?    @relation("AuditActor", fields: [actorUserId], references: [id], onUpdate: NoAction)
-  target       User?    @relation("AuditTarget", fields: [targetUserId], references: [id], onUpdate: NoAction)
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  eventType     String   @map("event_type")
+  actorUserId   String?  @map("actor_user_id") @db.Uuid
+  targetUserId  String?  @map("target_user_id") @db.Uuid
+  sessionId     String?  @map("session_id") @db.Uuid
+  ipAddress     String?  @map("ip_address") @db.Inet
+  userAgent     String?  @map("user_agent")
+  metadata      Json     @default("{}")
+  /// Snapshots of the actor at the time, filled by trigger from actor_user_id.
+  actorName     String?  @map("actor_name")
+  actorRoleKey  String?  @map("actor_role_key")
+  actorRoleName String?  @map("actor_role_name")
+  /// The X-Request-Id of the request that made the change (matches the server log).
+  requestId     String?  @map("request_id")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  actor         User?    @relation("AuditActor", fields: [actorUserId], references: [id], onUpdate: NoAction)
+  target        User?    @relation("AuditTarget", fields: [targetUserId], references: [id], onUpdate: NoAction)
 
   @@index([targetUserId, createdAt(sort: Desc)], map: "audit_events_target_created_idx")
   @@index([eventType, createdAt(sort: Desc)], map: "audit_events_type_created_idx")
+  @@index([createdAt(sort: Desc)], map: "audit_events_created_idx")
+  @@index([actorUserId, createdAt(sort: Desc)], map: "audit_events_actor_created_idx")
+  @@index([ipAddress], map: "audit_events_ip_idx", where: raw("(ip_address IS NOT NULL)"))
+  @@index([sessionId], map: "audit_events_session_idx", where: raw("(session_id IS NOT NULL)"))
   @@map("audit_events")
 }
 
