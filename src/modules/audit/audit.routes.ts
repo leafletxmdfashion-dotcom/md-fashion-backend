@@ -52,7 +52,11 @@ export const auditQuerySchema = z.object({
   recordId: z.uuid().optional(),
   sort: z.enum(["asc", "desc"]).default("desc"),
   page: z.coerce.number().int().min(1).max(100_000).default(1),
-  pageSize: z.coerce.number().int().refine((size) => [10, 25, 50, 100].includes(size), "Use 10, 25, 50 or 100.").default(25),
+  pageSize: z.coerce
+    .number()
+    .int()
+    .refine((size) => [10, 25, 50, 100].includes(size), "Use 10, 25, 50 or 100.")
+    .default(25),
 });
 
 export type AuditQuery = z.infer<typeof auditQuerySchema>;
@@ -97,9 +101,7 @@ function clauses(query: AuditQuery): Prisma.Sql[] {
     const failures = typesWhere((info) => "failure" in info);
 
     sql.push(
-      query.outcome === "failure"
-        ? inTypes(failures)
-        : Prisma.sql`e.event_type NOT IN (${Prisma.join(failures)})`,
+      query.outcome === "failure" ? inTypes(failures) : Prisma.sql`e.event_type NOT IN (${Prisma.join(failures)})`,
     );
   }
 
@@ -114,7 +116,9 @@ function clauses(query: AuditQuery): Prisma.Sql[] {
   if (query.q) {
     const pattern = contains(query.q);
     // Labels live in code: a search for "dispatch" also finds the event types so labelled.
-    const labelled = AUDIT_TYPES.filter((type) => AUDIT_EVENTS[type].label.toLowerCase().includes(query.q!.toLowerCase()));
+    const labelled = AUDIT_TYPES.filter((type) =>
+      AUDIT_EVENTS[type].label.toLowerCase().includes(query.q!.toLowerCase()),
+    );
 
     sql.push(Prisma.sql`(
       lower(e.event_type) LIKE ${pattern}
@@ -192,7 +196,12 @@ function toEvent(row: Row) {
     severity: info.severity,
     outcome: info.failure ? ("failure" as const) : ("success" as const),
     actor: row.actor_user_id
-      ? { id: row.actor_user_id, name: row.actor_name ?? "Unknown", roleKey: row.actor_role_key, roleName: row.actor_role_name }
+      ? {
+          id: row.actor_user_id,
+          name: row.actor_name ?? "Unknown",
+          roleKey: row.actor_role_key,
+          roleName: row.actor_role_name,
+        }
       : null,
     target: row.target_user_id ? { id: row.target_user_id, name: row.target_name, login: row.target_login } : null,
     record: entityKey ? { key: entityKey, id: row.metadata[entityKey] as string } : null,
@@ -214,7 +223,8 @@ const SELECT = Prisma.sql`
 export const auditReadService = {
   async list(query: AuditQuery) {
     const filter = where(clauses(query));
-    const order = query.sort === "asc" ? Prisma.sql`ORDER BY e.created_at ASC, e.id` : Prisma.sql`ORDER BY e.created_at DESC, e.id`;
+    const order =
+      query.sort === "asc" ? Prisma.sql`ORDER BY e.created_at ASC, e.id` : Prisma.sql`ORDER BY e.created_at DESC, e.id`;
     const failures = typesWhere((info) => "failure" in info);
     const critical = typesWhere((info) => info.severity === "critical");
 

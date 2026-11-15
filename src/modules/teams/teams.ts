@@ -1,7 +1,7 @@
 import { Router, type Request, type RequestHandler } from "express";
 import { z } from "zod";
 
-import { isUniqueViolation, prisma, transaction } from "../../db/prisma";
+import { isUniqueViolation, prisma, Prisma, transaction } from "../../db/prisma";
 import { factoryToday } from "../../lib/business-date";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { karigarCode } from "../../lib/labels";
@@ -61,13 +61,14 @@ export type TeamInput = z.infer<typeof teamSchema>;
 
 const MEMBER_SELECT = {
   where: { leftAt: null },
-  orderBy: { joinedAt: "asc" },
+  // Members added together share joinedAt: name keeps their order stable.
+  orderBy: [{ joinedAt: "asc" }, { karigar: { name: "asc" } }],
   select: {
     id: true,
     joinedAt: true,
     karigar: { select: { id: true, number: true, name: true, category: true, active: true } },
   },
-} as const;
+} satisfies Prisma.JogadiTeam$membersArgs;
 
 interface TeamWork {
   /** Jogadi: pieces issued and not yet received back. */
@@ -281,7 +282,13 @@ export const teamService = {
           actorUserId: actor.user.id,
           sessionId: actor.sessionId,
           meta,
-          metadata: { teamId: id, name: input.name, joined: joining.length, left: leaving.length, active: input.active },
+          metadata: {
+            teamId: id,
+            name: input.name,
+            joined: joining.length,
+            left: leaving.length,
+            active: input.active,
+          },
         });
       });
 

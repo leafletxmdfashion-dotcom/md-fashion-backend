@@ -88,9 +88,10 @@ describe("audit log", () => {
     expect(failed.events[0]!.device).toMatchObject({ browser: "Chrome 131", os: "Android" });
     expect(failed.summary.failures).toBe(1);
 
-    expect((await events(owner, "?category=Teams%20%26%20karigars")).events.map((event) => event.type).sort()).toEqual(
-      ["KARIGAR_CREATED", "TEAM_CREATED"],
-    );
+    expect((await events(owner, "?category=Teams%20%26%20karigars")).events.map((event) => event.type).sort()).toEqual([
+      "KARIGAR_CREATED",
+      "TEAM_CREATED",
+    ]);
     expect((await events(owner, "?severity=critical")).events.every((event) => event.severity === "critical")).toBe(
       true,
     );

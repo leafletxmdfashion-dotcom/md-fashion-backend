@@ -136,9 +136,7 @@ describe("packing", () => {
     expect((await queue(owner)).totals).toEqual({ good: 81, packed: 50, waiting: 31 });
 
     // The next entry for the same item prefills this rate.
-    expect((await owner.get(`/api/v1/packing/last-rate?lotId=${lotId}&teamId=${teamId}`)).body.data.rate).toBe(
-      "1.01",
-    );
+    expect((await owner.get(`/api/v1/packing/last-rate?lotId=${lotId}&teamId=${teamId}`)).body.data.rate).toBe("1.01");
     expect((await owner.get(`/api/v1/teams/${teamId}`)).body.data.team.packedThisMonth).toBe(50);
   });
 
@@ -279,7 +277,9 @@ describe("packing", () => {
       lines: [{ sizeLabel: "S", quantity: 1 }],
     });
 
-    const res = await owner.send("post", `/api/v1/stitching/receipts/${receiptId}/reverse`, { reason: "Counted twice" });
+    const res = await owner.send("post", `/api/v1/stitching/receipts/${receiptId}/reverse`, {
+      reason: "Counted twice",
+    });
 
     expect(res.status).toBe(409);
     expect(res.body.error.message).toMatch(/packed/);
