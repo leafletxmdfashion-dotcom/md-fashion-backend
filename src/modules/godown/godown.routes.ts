@@ -23,7 +23,6 @@ import { godownService } from "./godown.service";
 const idOf = (req: Request) => idParamsSchema.parse(req.params).id;
 
 type StockItem = Awaited<ReturnType<typeof godownService.stock>>["items"][number];
-type FinishedItem = Awaited<ReturnType<typeof godownService.finishedItems>>["items"][number];
 
 const MOVEMENT_LABEL: Record<string, string> = {
   PACKED_IN: "Packed in",
@@ -49,31 +48,24 @@ const STOCK_SPECS: RowSpecs<StockItem> = {
         .map((size) => ` ${size.size} `)
         .join(""),
   },
+  lots: { type: "number", value: (row) => row.lots },
+  inProduction: { type: "number", value: (row) => row.inProduction },
+  toPack: { type: "number", value: (row) => row.toPack },
+  packed: { type: "number", value: (row) => row.packed },
   in: { type: "number", value: (row) => row.in },
   out: { type: "number", value: (row) => row.out },
+  dispatched: { type: "number", value: (row) => row.dispatched },
   balance: { type: "number", value: (row) => row.balance },
   lastMovement: { type: "date", value: (row) => day(row.lastMovementAt) },
 };
 const stockQuerySchema = z.object({
   articleId: z.uuid().optional(),
-  // "true": only items with pieces; left out: every item that ever had stock.
+  // "true": only items with pieces in the godown; left out: every item with lots or stock.
   inStock: z.enum(["true", "false"]).optional(),
   ...rowQueryFields(STOCK_SPECS),
 });
 const stockHaystack = (row: StockItem) =>
   [row.article.name, row.article.code, ...inStockSizes(row).map((size) => size.size)].join(" ");
-
-const ITEM_SPECS: RowSpecs<FinishedItem> = {
-  item: { type: "text", value: (row) => `${row.articleName} ${row.code}` },
-  lots: { type: "number", value: (row) => row.lots },
-  cut: { type: "number", value: (row) => row.cut },
-  good: { type: "number", value: (row) => row.good },
-  reject: { type: "number", value: (row) => row.reject },
-  packed: { type: "number", value: (row) => row.packed },
-  dispatched: { type: "number", value: (row) => row.dispatched },
-  inStock: { type: "number", value: (row) => row.inStock },
-};
-const itemQuerySchema = z.object(rowQueryFields(ITEM_SPECS));
 
 async function stockRows(req: Request) {
   // SAFETY: column params are validated by the schema; their keys are dynamic.
@@ -87,13 +79,6 @@ async function stockRows(req: Request) {
   return { ...queryRows(data.items, STOCK_SPECS, query, stockHaystack), summary: data.summary };
 }
 
-async function itemRows(req: Request) {
-  // SAFETY: column params are validated by the schema; their keys are dynamic.
-  const query = itemQuerySchema.parse(req.query) as RowQuery;
-  const { items } = await godownService.finishedItems(undefined);
-  return queryRows(items, ITEM_SPECS, query, (row) => `${row.articleName} ${row.code}`);
-}
-
 export function godownRoutes(): Router {
   const router = Router();
 
@@ -103,9 +88,25 @@ export function godownRoutes(): Router {
   const manage = requirePermission("godown.manage");
 
   router.get("/stock", view, (async (req, res) => {
-    const { page, total, summary } = await stockRows(req);
+    const { matching, page, total, summary } = await stockRows(req);
+    const sum = (key: "inProduction" | "toPack" | "packed" | "dispatched" | "balance") =>
+      matching.reduce((acc, row) => acc + row[key], 0);
 
-    res.json({ success: true, data: { items: page, total, summary } });
+    res.json({
+      success: true,
+      data: {
+        items: page,
+        total,
+        summary,
+        totals: {
+          inProduction: sum("inProduction"),
+          toPack: sum("toPack"),
+          packed: sum("packed"),
+          dispatched: sum("dispatched"),
+          balance: sum("balance"),
+        },
+      },
+    });
   }) satisfies RequestHandler);
 
   router.get("/stock/export", view, (async (req, res) => {
@@ -125,8 +126,16 @@ export function godownRoutes(): Router {
               .map((size) => `${size.size} ${size.balance}`)
               .join(", "),
         },
+        { header: "Lots", value: (row) => row.lots },
+        { header: "Cut", value: (row) => row.cut },
+        { header: "In production", value: (row) => row.inProduction },
+        { header: "Good", value: (row) => row.good },
+        { header: "Rejected", value: (row) => row.reject },
+        { header: "To pack", value: (row) => row.toPack },
+        { header: "Packed", value: (row) => row.packed },
         { header: "In", value: (row) => row.in },
         { header: "Out", value: (row) => row.out },
+        { header: "Dispatched", value: (row) => row.dispatched },
         { header: "In stock", value: (row) => row.balance },
         { header: "Last movement", value: (row) => day(row.lastMovementAt) },
       ],
@@ -241,51 +250,6 @@ export function godownRoutes(): Router {
       ],
       lots,
       (l) => l.id,
-    );
-  }) satisfies RequestHandler);
-
-  router.get("/finished-goods/items", view, (async (req, res) => {
-    const { matching, page, total } = await itemRows(req);
-    const sum = (key: "cut" | "good" | "reject" | "packed" | "dispatched" | "inStock") =>
-      matching.reduce((acc, row) => acc + row[key], 0);
-
-    res.json({
-      success: true,
-      data: {
-        items: page,
-        total,
-        totals: {
-          cut: sum("cut"),
-          good: sum("good"),
-          reject: sum("reject"),
-          packed: sum("packed"),
-          dispatched: sum("dispatched"),
-          inStock: sum("inStock"),
-        },
-      },
-    });
-  }) satisfies RequestHandler);
-
-  router.get("/finished-goods/items/export", view, (async (req, res) => {
-    const { matching } = await itemRows(req);
-
-    sendCsv(
-      req,
-      res,
-      "finished-items",
-      [
-        { header: "Item code", value: (row) => row.code },
-        { header: "Item / design", value: (row) => row.articleName },
-        { header: "Lots", value: (row) => row.lots },
-        { header: "Cut", value: (row) => row.cut },
-        { header: "Good", value: (row) => row.good },
-        { header: "Rejected", value: (row) => row.reject },
-        { header: "Packed", value: (row) => row.packed },
-        { header: "Dispatched", value: (row) => row.dispatched },
-        { header: "In godown", value: (row) => row.inStock },
-      ],
-      matching,
-      (row) => row.id,
     );
   }) satisfies RequestHandler);
 

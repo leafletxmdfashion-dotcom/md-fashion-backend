@@ -4,13 +4,14 @@ import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { columnFilters, contains, orderBy, page, where } from "../../lib/list-query";
 import { recordAudit } from "../audit/audit.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
-import { paisaText, toPaisa } from "../stitching/stitching.split";
+import { paisaText, splitEarning, toPaisa } from "../stitching/stitching.split";
 import { ENTRY_COLUMNS, LINE_COLUMNS, type EntryListQuery, type LineListQuery, type PackInput } from "./packing.schema";
 
 // Packing: Good pieces from stitching (receipt Good + recovered rework) wait to be packed
-// with no transfer step. Packing them, per size, pays the packer per piece into their
-// ledger, books packing labour on the lot and puts the pieces into the godown, all in one
-// transaction. Corrections are reversals. Lock order: lot, then entry, then godown stock.
+// with no transfer step. A packing team packs them, per size, at a typed rate per piece:
+// the earning is split equally into the members' ledgers, packing labour is booked on the
+// lot and the pieces go into the godown, all in one transaction. Entries from before teams
+// name one packer. Corrections are reversals. Lock order: lot, team, entry, godown stock.
 
 type Tx = Prisma.TransactionClient;
 
@@ -79,9 +80,22 @@ async function lockLot(tx: Tx, lotId: string) {
   return lot;
 }
 
+/** Who packed an entry: its packing team, or (older entries) one person. */
+function packedBy(row: { team_id: string | null; team_name: string | null; packer_id: string | null; packer_name: string | null }) {
+  return row.team_id
+    ? { kind: "TEAM" as const, id: row.team_id, name: row.team_name ?? "" }
+    : { kind: "PERSON" as const, id: row.packer_id ?? "", name: row.packer_name ?? "" };
+}
+
+/** Entries a person packed alone or as a member of the packing team. */
+const byPerson = (id: string) =>
+  Prisma.sql`(e.packer_id = ${id}::uuid OR EXISTS (
+    SELECT 1 FROM packing_entry_members pm WHERE pm.entry_id = e.id AND pm.karigar_id = ${id}::uuid))`;
+
 const ENTRY_INCLUDE = {
   lot: { select: { id: true, lotNumber: true, articleId: true, articleName: true, articleCode: true } },
   lines: { orderBy: { position: "asc" } },
+  members: { orderBy: { karigarName: "asc" } },
   createdBy: { select: { name: true } },
   reversedBy: { select: { name: true } },
 } satisfies Prisma.PackingEntryInclude;
@@ -149,7 +163,7 @@ export const packingService = {
                COALESCE(sum(pieces) FILTER (WHERE pack_date >= date_trunc('month', ${today}::date)), 0)::int AS month,
                COALESCE(sum(pieces), 0)::int AS total,
                count(*) FILTER (WHERE pack_date = ${today}::date)::int AS entries_today,
-               count(DISTINCT packer_id) FILTER (WHERE pack_date = ${today}::date)::int AS packers_today,
+               count(DISTINCT COALESCE(team_id, packer_id)) FILTER (WHERE pack_date = ${today}::date)::int AS packers_today,
                COALESCE(sum(earning) FILTER (WHERE pack_date >= date_trunc('month', ${today}::date)), 0)::text AS earning_month
         FROM packing_entries WHERE status = 'POSTED'`,
     ]);
@@ -171,13 +185,15 @@ export const packingService = {
     if (query.search) {
       const pattern = contains(query.search);
 
-      clauses.push(Prisma.sql`(l.search_text LIKE ${pattern} OR lower(e.packer_name) LIKE ${pattern}
+      clauses.push(Prisma.sql`(l.search_text LIKE ${pattern} OR lower(COALESCE(e.team_name, e.packer_name)) LIKE ${pattern}
         OR e.number = ${numberOf(query.search)}::int)`);
     }
 
     if (query.lotId) clauses.push(Prisma.sql`e.lot_id = ${query.lotId}::uuid`);
 
-    if (query.packerId) clauses.push(Prisma.sql`e.packer_id = ${query.packerId}::uuid`);
+    if (query.packerId) clauses.push(byPerson(query.packerId));
+
+    if (query.teamId) clauses.push(Prisma.sql`e.team_id = ${query.teamId}::uuid`);
 
     const filter = where(clauses);
     const from = Prisma.sql`FROM packing_entries e JOIN production_lots l ON l.id = e.lot_id`;
@@ -192,8 +208,10 @@ export const packingService = {
           lot_id: string;
           lot_number: string;
           article_name: string;
-          packer_id: string;
-          packer_name: string;
+          packer_id: string | null;
+          packer_name: string | null;
+          team_id: string | null;
+          team_name: string | null;
           pieces: number;
           rate: string;
           earning: string;
@@ -201,7 +219,7 @@ export const packingService = {
         }[]
       >`
         SELECT e.id, e.number, e.pack_date::text AS pack_date, e.status, l.id AS lot_id, l.lot_number, l.article_name,
-               e.packer_id, e.packer_name, e.pieces, e.rate::text AS rate, e.earning::text AS earning,
+               e.packer_id, e.packer_name, e.team_id, e.team_name, e.pieces, e.rate::text AS rate, e.earning::text AS earning,
                (SELECT string_agg(pl.size_label || ' ' || pl.quantity, ' · ' ORDER BY pl.position)
                 FROM packing_lines pl WHERE pl.entry_id = e.id) AS sizes
         ${from} ${filter} ${orderBy(ENTRY_COLUMNS, query, "e.pack_date DESC", "e.number DESC")} ${page(query)}`,
@@ -219,7 +237,7 @@ export const packingService = {
         date: row.pack_date,
         status: row.status,
         lot: { id: row.lot_id, lotNumber: row.lot_number, articleName: row.article_name },
-        packer: { id: row.packer_id, name: row.packer_name },
+        packedBy: packedBy(row),
         pieces: row.pieces,
         sizes: row.sizes,
         rate: showMoney ? Number(row.rate).toFixed(2) : null,
@@ -241,13 +259,15 @@ export const packingService = {
     if (query.search) {
       const pattern = contains(query.search);
 
-      clauses.push(Prisma.sql`(l.search_text LIKE ${pattern} OR lower(e.packer_name) LIKE ${pattern}
+      clauses.push(Prisma.sql`(l.search_text LIKE ${pattern} OR lower(COALESCE(e.team_name, e.packer_name)) LIKE ${pattern}
         OR lower(pl.size_label) = ${query.search.toLowerCase()})`);
     }
 
     if (query.lotId) clauses.push(Prisma.sql`e.lot_id = ${query.lotId}::uuid`);
 
-    if (query.packerId) clauses.push(Prisma.sql`e.packer_id = ${query.packerId}::uuid`);
+    if (query.packerId) clauses.push(byPerson(query.packerId));
+
+    if (query.teamId) clauses.push(Prisma.sql`e.team_id = ${query.teamId}::uuid`);
 
     const filter = where(clauses);
     const from = Prisma.sql`
@@ -260,8 +280,10 @@ export const packingService = {
           pack_date: string;
           number: number;
           entry_id: string;
-          packer_id: string;
-          packer_name: string;
+          packer_id: string | null;
+          packer_name: string | null;
+          team_id: string | null;
+          team_name: string | null;
           lot_id: string;
           lot_number: string;
           article_name: string;
@@ -270,6 +292,7 @@ export const packingService = {
         }[]
       >`
         SELECT pl.id, e.pack_date::text AS pack_date, e.number, e.id AS entry_id, e.packer_id, e.packer_name,
+               e.team_id, e.team_name,
                l.id AS lot_id, l.lot_number, l.article_name, pl.size_label, pl.quantity
         ${from} ${filter} ${orderBy(LINE_COLUMNS, query, "e.pack_date DESC, e.number DESC", "pl.position")} ${page(query)}`,
       prisma.$queryRaw<{ total: number; pieces: number }[]>`
@@ -281,7 +304,7 @@ export const packingService = {
         id: row.id,
         date: row.pack_date,
         entry: { id: row.entry_id, number: row.number },
-        packer: { id: row.packer_id, name: row.packer_name },
+        packedBy: packedBy(row),
         lot: { id: row.lot_id, lotNumber: row.lot_number },
         articleName: row.article_name,
         sizeLabel: row.size_label,
@@ -292,7 +315,10 @@ export const packingService = {
     };
   },
 
-  /** Per packer: entries, pieces, items and pay in a date range (all time by default). */
+  /**
+   * Per packing team (and, for entries from before teams, per person): entries, pieces,
+   * items and pay in a date range (all time by default).
+   */
   async staff(range: { dateFrom?: string | undefined; dateTo?: string | undefined }, showMoney: boolean) {
     const clauses = [Prisma.sql`e.status = 'POSTED'`];
 
@@ -303,8 +329,10 @@ export const packingService = {
     const rows = await prisma.$queryRaw<
       {
         id: string;
-        number: number;
+        kind: "TEAM" | "PERSON";
+        code: string;
         name: string;
+        members: string | null;
         entries: number;
         pieces: number;
         lots: number;
@@ -314,20 +342,31 @@ export const packingService = {
         earned: string;
       }[]
     >`
-      SELECT k.id, k.number, k.name, count(*)::int AS entries, sum(e.pieces)::int AS pieces,
+      SELECT COALESCE(e.team_id, e.packer_id) AS id,
+             CASE WHEN e.team_id IS NULL THEN 'PERSON' ELSE 'TEAM' END AS kind,
+             COALESCE(max(t.code), 'K-' || lpad(max(k.number)::text, 3, '0')) AS code,
+             COALESCE(max(t.name), max(k.name)) AS name,
+             (SELECT string_agg(kk.name, ', ' ORDER BY kk.name) FROM jogadi_members jm JOIN karigars kk ON kk.id = jm.karigar_id
+              WHERE jm.team_id = e.team_id AND jm.left_at IS NULL) AS members,
+             count(*)::int AS entries, sum(e.pieces)::int AS pieces,
              count(DISTINCT e.lot_id)::int AS lots,
              string_agg(DISTINCT l.article_name, ', ') AS items,
              min(e.pack_date)::text AS first_date, max(e.pack_date)::text AS last_date,
              sum(e.earning)::text AS earned
-      FROM packing_entries e JOIN karigars k ON k.id = e.packer_id JOIN production_lots l ON l.id = e.lot_id
+      FROM packing_entries e
+      JOIN production_lots l ON l.id = e.lot_id
+      LEFT JOIN jogadi_teams t ON t.id = e.team_id
+      LEFT JOIN karigars k ON k.id = e.packer_id
       ${where(clauses)}
-      GROUP BY k.id ORDER BY sum(e.pieces) DESC, k.name`;
+      GROUP BY e.team_id, e.packer_id ORDER BY sum(e.pieces) DESC, 4`;
 
     return {
       staff: rows.map((row) => ({
         id: row.id,
-        number: row.number,
+        kind: row.kind,
+        code: row.code,
         name: row.name,
+        members: row.members,
         entries: row.entries,
         pieces: row.pieces,
         lots: row.lots,
@@ -339,6 +378,21 @@ export const packingService = {
     };
   },
 
+  /**
+   * The rate per piece last used to pack this lot's item (the same team's first), to prefill
+   * the form. Null for people who may not see money.
+   */
+  async lastRate(query: { lotId: string; teamId?: string | undefined }, showMoney: boolean) {
+    if (!showMoney) return null;
+
+    const [row] = await prisma.$queryRaw<{ rate: string }[]>`
+      SELECT e.rate::text AS rate FROM packing_entries e JOIN production_lots l ON l.id = e.lot_id
+      WHERE e.status = 'POSTED' AND l.article_id = (SELECT article_id FROM production_lots WHERE id = ${query.lotId}::uuid)
+      ORDER BY (e.team_id IS NOT DISTINCT FROM ${query.teamId ?? null}::uuid) DESC, e.created_at DESC LIMIT 1`;
+
+    return row ? Number(row.rate).toFixed(2) : null;
+  },
+
   async getEntry(id: string, showMoney: boolean) {
     const entry = await prisma.packingEntry.findUnique({
       where: { id },
@@ -348,13 +402,23 @@ export const packingService = {
 
     if (!entry) throw errors.notFound("Packing entry");
 
+    const members = entry.members.map((member) => ({ karigarId: member.karigarId, name: member.karigarName }));
+    const shares = showMoney && members.length > 0 ? equalShares(entry.earning.toFixed(2), members) : null;
+
     return {
       id: entry.id,
       number: entry.number,
       status: entry.status,
       date: entry.packDate.toISOString().slice(0, 10),
       lot: { id: entry.lot.id, lotNumber: entry.lot.lotNumber, articleName: entry.lot.articleName },
-      packer: { id: entry.packerId, name: entry.packerName },
+      packedBy: packedBy({
+        team_id: entry.teamId,
+        team_name: entry.teamName,
+        packer_id: entry.packerId,
+        packer_name: entry.packerName,
+      }),
+      /** The team as it was when packed, each with their equal share of the pay (money only). */
+      members: members.map((member) => ({ ...member, earning: shares?.get(member.karigarId) ?? null })),
       pieces: entry.pieces,
       rate: showMoney ? entry.rate.toFixed(2) : null,
       earning: showMoney ? entry.earning.toFixed(2) : null,
@@ -369,27 +433,27 @@ export const packingService = {
   },
 
   async pack(actor: AuthContext, input: PackInput, meta: ClientMeta) {
-    const showMoney = actor.user.permissions.has("costing.view");
-
-    if (input.rate !== undefined && !showMoney) {
-      throw new AppError(
-        403,
-        ErrorCode.AUTH_FORBIDDEN,
-        "Setting the packing rate needs permission to see rates and costs.",
-      );
-    }
-
     const id = await transaction(async (tx) => {
       const lot = await lockLot(tx, input.lotId);
 
       if (lot.status === "CANCELLED") throw fieldError("lotId", `${lot.lot_number} is cancelled.`);
 
-      const packer = await tx.karigar.findUnique({
-        where: { id: input.packerId },
-        select: { name: true, active: true, payMode: true, payRate: true },
-      });
+      // Locks the team so its members cannot change while the earning is split over them.
+      const [team] = await tx.$queryRaw<{ id: string; name: string; kind: string; active: boolean }[]>`
+        SELECT id, name, kind, active FROM jogadi_teams WHERE id = ${input.teamId}::uuid FOR SHARE`;
 
-      if (!packer?.active) throw fieldError("packerId", "Choose an active person who packed.");
+      if (!team || team.kind !== "PACKING" || !team.active) {
+        throw fieldError("teamId", "Choose an active packing team.");
+      }
+
+      // By name, as the entry shows them: the leftover paisa of an equal split goes in this order.
+      const members = await tx.$queryRaw<{ id: string; name: string }[]>`
+        SELECT k.id, k.name FROM jogadi_members m JOIN karigars k ON k.id = m.karigar_id
+        WHERE m.team_id = ${team.id}::uuid AND m.left_at IS NULL ORDER BY k.name, k.number`;
+
+      if (members.length === 0) {
+        throw fieldError("teamId", `${team.name} has no members. Add them in Teams.`);
+      }
 
       const balances = await packingBalance(tx, lot.id);
       const waitingOf = new Map(balances.map((row) => [row.size, row.good - row.packed]));
@@ -412,19 +476,26 @@ export const packingService = {
         (a, b) => (position.get(a.sizeLabel) ?? 999) - (position.get(b.sizeLabel) ?? 999),
       );
       const pieces = lines.reduce((sum, line) => sum + line.quantity, 0);
-      // Paid per piece: the packer's rate unless one was given; salaried people earn nothing per piece.
-      const rate = input.rate ?? (packer.payMode === "PER_PIECE" ? packer.payRate.toNumber() : 0);
-      const earning = BigInt(pieces) * toPaisa(rate);
+      const earning = BigInt(pieces) * toPaisa(input.rate);
+      const split = splitEarning(
+        earning,
+        "EQUAL",
+        members.map((member) => ({ karigarId: member.id })),
+      );
+
+      // SAFETY: an equal split over at least one member always succeeds.
+      if (!split.ok) throw errors.conflict(split.message);
+
       const date = new Date(input.packDate);
 
       const entry = await tx.packingEntry.create({
         data: {
           lotId: lot.id,
-          packerId: input.packerId,
-          packerName: packer.name,
+          teamId: team.id,
+          teamName: team.name,
           packDate: date,
           pieces,
-          rate,
+          rate: input.rate,
           earning: paisaText(earning),
           notes: input.notes,
           createdById: actor.user.id,
@@ -437,28 +508,35 @@ export const packingService = {
               })),
             },
           },
+          members: {
+            createMany: { data: members.map((member) => ({ karigarId: member.id, karigarName: member.name })) },
+          },
         },
         select: { id: true, number: true },
       });
 
-      const description = `Packing ${packingNumber(entry.number)} · ${lot.lot_number} · ${pcs(pieces)}`;
+      const description = `Packing ${packingNumber(entry.number)} · ${lot.lot_number} · ${pcs(pieces)} · ${team.name}`;
+      const paid = members.filter((member) => split.amounts.get(member.id)! > 0n);
 
-      if (earning > 0n) {
-        await tx.karigarLedgerEntry.create({
-          data: {
-            karigarId: input.packerId,
+      if (paid.length > 0) {
+        await tx.karigarLedgerEntry.createMany({
+          data: paid.map((member) => ({
+            karigarId: member.id,
             entryDate: date,
             type: "EARNING",
             payMode: "PER_PIECE",
             quantity: pieces,
-            rate,
-            amount: paisaText(earning),
+            rate: input.rate,
+            amount: paisaText(split.amounts.get(member.id)!),
             sourceType: "PACKING",
             sourceId: entry.id,
             description,
             createdById: actor.user.id,
-          },
+          })),
         });
+      }
+
+      if (earning > 0n) {
         await tx.lotCost.create({
           data: {
             lotId: lot.id,
@@ -466,7 +544,7 @@ export const packingService = {
             kind: "PACKING_LABOUR",
             entryDate: date,
             quantity: pieces,
-            rate,
+            rate: input.rate,
             amount: paisaText(earning),
             createdById: actor.user.id,
           },
@@ -489,16 +567,16 @@ export const packingService = {
       await recordAudit(tx, {
         type: "PACKING_POSTED",
         ...audit(actor, meta),
-        metadata: { entryId: entry.id, lotId: lot.id, packerId: input.packerId, pieces },
+        metadata: { entryId: entry.id, lotId: lot.id, teamId: team.id, members: members.length, pieces },
       });
 
       return entry.id;
     });
 
-    return this.getEntry(id, showMoney);
+    return this.getEntry(id, actor.user.permissions.has("costing.view"));
   },
 
-  /** Undoes a packing entry whose pieces are still in the godown. */
+  /** Undoes a packing entry whose pieces are still in the godown: every member's pay is reversed. */
   async reverse(actor: AuthContext, id: string, reason: string, meta: ClientMeta) {
     const found = await prisma.packingEntry.findUnique({ where: { id }, select: { lotId: true } });
 
@@ -506,8 +584,8 @@ export const packingService = {
 
     await transaction(async (tx) => {
       const lot = await lockLot(tx, found.lotId);
-      const [entry] = await tx.$queryRaw<{ number: number; status: string; packer_id: string }[]>`
-        SELECT number, status, packer_id FROM packing_entries WHERE id = ${id}::uuid FOR UPDATE`;
+      const [entry] = await tx.$queryRaw<{ number: number; status: string }[]>`
+        SELECT number, status FROM packing_entries WHERE id = ${id}::uuid FOR UPDATE`;
 
       if (!entry) throw errors.notFound("Packing entry");
 
@@ -547,14 +625,14 @@ export const packingService = {
         })),
       });
 
-      const [earning, costs] = await Promise.all([
-        tx.karigarLedgerEntry.findFirst({ where: { sourceType: "PACKING", sourceId: id, type: "EARNING" } }),
+      const [earnings, costs] = await Promise.all([
+        tx.karigarLedgerEntry.findMany({ where: { sourceType: "PACKING", sourceId: id, type: "EARNING" } }),
         tx.lotCost.findMany({ where: { sourceId: id, kind: "PACKING_LABOUR", reversalOfId: null } }),
       ]);
 
-      if (earning) {
-        await tx.karigarLedgerEntry.create({
-          data: {
+      if (earnings.length > 0) {
+        await tx.karigarLedgerEntry.createMany({
+          data: earnings.map((earning) => ({
             karigarId: earning.karigarId,
             entryDate: date,
             type: "EARNING_REVERSAL",
@@ -566,7 +644,7 @@ export const packingService = {
             sourceId: id,
             description: `${earning.description} · reversed: ${reason}`.slice(0, 500),
             createdById: actor.user.id,
-          },
+          })),
         });
       }
 
@@ -596,3 +674,10 @@ export const packingService = {
     return this.getEntry(id, actor.user.permissions.has("costing.view"));
   },
 };
+
+/** Each member's equal share of an entry's pay, as posted (same split as at packing). */
+function equalShares(earning: string, members: { karigarId: string }[]): Map<string, string> {
+  const split = splitEarning(toPaisa(earning), "EQUAL", members);
+
+  return new Map(split.ok ? [...split.amounts].map(([id, paisa]) => [id, paisaText(paisa)]) : []);
+}

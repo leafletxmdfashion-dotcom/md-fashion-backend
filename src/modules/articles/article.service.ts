@@ -89,7 +89,83 @@ async function nextCode(db: Db): Promise<string> {
   return `ART-${String(row!.next).padStart(4, "0")}`;
 }
 
+/** A group of items whose names look alike, most stock first: the first is the one to keep. */
+export interface SimilarGroup {
+  items: { id: string; code: string; name: string; lots: number; inStock: number }[];
+  /** Highest name similarity inside the group, 0..1. */
+  score: number;
+}
+
+/** Name similarity (trigram) at or above which two items are suggested as the same design. */
+export const SIMILAR_THRESHOLD = 0.45;
+
 export const articleService = {
+  /**
+   * Items in use (with lots or godown stock) whose names look alike, grouped: "T-Shirt",
+   * "T-Shirts" and "Tshirt (Black)" end up together. Merging is still a person's decision.
+   */
+  // ponytail: pairwise trigram scan over items in use; fine for hundreds, use a pg_trgm index join past thousands.
+  async similar(): Promise<SimilarGroup[]> {
+    const [items, pairs] = await Promise.all([
+      prisma.$queryRaw<{ id: string; code: string; name: string; lots: number; in_stock: number }[]>`
+        SELECT a.id, a.code, a.name,
+               (SELECT count(*)::int FROM production_lots l WHERE l.article_id = a.id AND l.status <> 'CANCELLED') AS lots,
+               (SELECT COALESCE(sum(balance), 0)::int FROM godown_stock s WHERE s.article_id = a.id) AS in_stock
+        FROM articles a
+        WHERE a.active AND (EXISTS (SELECT 1 FROM production_lots l WHERE l.article_id = a.id)
+                            OR EXISTS (SELECT 1 FROM godown_stock s WHERE s.article_id = a.id))`,
+      prisma.$queryRaw<{ a: string; b: string; score: number }[]>`
+        WITH used AS (
+          SELECT a.id, lower(a.name) AS n FROM articles a
+          WHERE a.active AND (EXISTS (SELECT 1 FROM production_lots l WHERE l.article_id = a.id)
+                              OR EXISTS (SELECT 1 FROM godown_stock s WHERE s.article_id = a.id))
+        )
+        SELECT x.id AS a, y.id AS b, similarity(x.n, y.n)::float8 AS score
+        FROM used x JOIN used y ON x.id < y.id
+        WHERE similarity(x.n, y.n) >= ${SIMILAR_THRESHOLD}`,
+    ]);
+
+    // Union-find over the alike pairs.
+    const parent = new Map<string, string>();
+    const root = (id: string): string => {
+      const up = parent.get(id) ?? id;
+
+      if (up === id) return id;
+
+      const top = root(up);
+
+      parent.set(id, top);
+
+      return top;
+    };
+    const best = new Map<string, number>();
+
+    for (const pair of pairs) parent.set(root(pair.a), root(pair.b));
+
+    for (const pair of pairs) best.set(root(pair.a), Math.max(best.get(root(pair.a)) ?? 0, pair.score));
+
+    const groups = new Map<string, SimilarGroup["items"]>();
+
+    for (const item of items) {
+      if (!parent.has(item.id) && !pairs.some((pair) => pair.b === item.id)) continue;
+
+      const key = root(item.id);
+
+      groups.set(key, [
+        ...(groups.get(key) ?? []),
+        { id: item.id, code: item.code, name: item.name, lots: item.lots, inStock: item.in_stock },
+      ]);
+    }
+
+    return [...groups.entries()]
+      .filter(([, members]) => members.length > 1)
+      .map(([key, members]) => ({
+        items: members.sort((a, b) => b.inStock - a.inStock || b.lots - a.lots || a.name.localeCompare(b.name)),
+        score: Math.round((best.get(key) ?? 0) * 100) / 100,
+      }))
+      .sort((a, b) => b.score - a.score);
+  },
+
   /** Active articles for the production form's search-or-create picker. */
   async options(): Promise<ArticleDto[]> {
     const rows = await prisma.$queryRaw<

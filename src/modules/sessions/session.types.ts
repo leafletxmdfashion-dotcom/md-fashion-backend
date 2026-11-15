@@ -25,6 +25,8 @@ export interface AuthContext {
 export interface ClientMeta {
   ip: string | null;
   userAgent: string | null;
+  /** X-Request-Id of the request (also in the server log line). */
+  requestId?: string | null;
 }
 
 export interface SessionSummary {

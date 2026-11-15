@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { actorOf, clientMeta } from "../../lib/request";
 import { requireAuth } from "../auth/auth.middleware";
-import { requirePermission } from "../permissions/permission.middleware";
+import { requireAnyPermission, requirePermission } from "../permissions/permission.middleware";
 import { articleService } from "./article.service";
 
 const idOf = (req: Request) => z.object({ id: z.uuid() }).parse(req.params).id;
@@ -24,6 +24,11 @@ export function articleRoutes(): Router {
 
   router.get("/options", requirePermission("production.view"), (async (_req, res) => {
     res.json({ success: true, data: { articles: await articleService.options() } });
+  }) satisfies RequestHandler);
+
+  // Items that look like the same design, for the Godown screen to offer merging.
+  router.get("/similar", requireAnyPermission("production.view", "godown.view"), (async (_req, res) => {
+    res.json({ success: true, data: { groups: await articleService.similar() } });
   }) satisfies RequestHandler);
 
   router.delete("/:id", requirePermission("production.manage"), (async (req, res) => {

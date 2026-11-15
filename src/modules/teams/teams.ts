@@ -1,26 +1,32 @@
 import { Router, type Request, type RequestHandler } from "express";
 import { z } from "zod";
 
-import { isUniqueViolation, prisma, transaction } from "../../db/prisma";
+import { isUniqueViolation, prisma, Prisma, transaction } from "../../db/prisma";
+import { factoryToday } from "../../lib/business-date";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
+import { karigarCode } from "../../lib/labels";
 import { actorOf, clientMeta } from "../../lib/request";
 import { recordAudit } from "../audit/audit.service";
 import { requireAuth } from "../auth/auth.middleware";
 import { requireAnyPermission, requirePermission } from "../permissions/permission.middleware";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
 
-// Jogadi: stitching teams of karigars. Membership is history (leaving sets left_at),
-// so stitching issues keep the team they were given to, frozen in their own snapshot.
+// Teams of karigars: Jogadi (stitching) or Packing. Membership is history (leaving sets
+// left_at), so work keeps the team it was given to, frozen in its own snapshot. Team
+// earnings split equally; the kind is chosen once, when the team is made.
+
+export const TEAM_KINDS = ["JOGADI", "PACKING"] as const;
+
+export type TeamKind = (typeof TEAM_KINDS)[number];
 
 function fieldError(path: string, message: string): AppError {
   return new AppError(400, ErrorCode.VALIDATION_ERROR, message, { [path]: [message] });
 }
 
-/** Percent with 2 decimals → hundredths (33.33 → 3333), exact. */
-const hundredths = (value: number) => Math.round(value * 100);
-
 export const teamSchema = z
   .strictObject({
+    /** Fixed after creation; an update must send the team's own kind or leave it out. */
+    kind: z.enum(TEAM_KINDS, { error: "Choose Jogadi or Packing." }).optional(),
     name: z
       .string({ error: "Enter the team name." })
       .trim()
@@ -35,19 +41,7 @@ export const teamSchema = z
       .nullish()
       .transform((value) => value || null),
     members: z
-      .array(
-        z.strictObject({
-          karigarId: z.uuid("Choose a karigar."),
-          // Empty for every member: earnings split equally.
-          sharePercent: z
-            .number()
-            .positive("Share must be above 0%.")
-            .max(100, "Share cannot be above 100%.")
-            .multipleOf(0.01, "Use at most 2 decimals.")
-            .nullish()
-            .transform((value) => value ?? null),
-        }),
-      )
+      .array(z.strictObject({ karigarId: z.uuid("Choose a karigar.") }))
       .min(1, "Add at least one member.")
       .max(50, "Use at most 50 members."),
   })
@@ -61,73 +55,99 @@ export const teamSchema = z
 
       seen.add(member.karigarId);
     });
-
-    const shares = team.members.filter((member) => member.sharePercent !== null);
-
-    if (shares.length > 0 && shares.length < team.members.length) {
-      ctx.addIssue({ code: "custom", path: ["members"], message: "Give every member a share, or none (equal split)." });
-    } else if (
-      shares.length > 0 &&
-      shares.reduce((sum, member) => sum + hundredths(member.sharePercent!), 0) !== 10_000
-    ) {
-      ctx.addIssue({ code: "custom", path: ["members"], message: "Shares must add up to exactly 100%." });
-    }
   });
 
 export type TeamInput = z.infer<typeof teamSchema>;
 
 const MEMBER_SELECT = {
   where: { leftAt: null },
-  orderBy: { joinedAt: "asc" },
+  // Members added together share joinedAt: name keeps their order stable.
+  orderBy: [{ joinedAt: "asc" }, { karigar: { name: "asc" } }],
   select: {
     id: true,
-    sharePercent: true,
     joinedAt: true,
-    karigar: { select: { id: true, name: true, category: true, active: true } },
+    karigar: { select: { id: true, number: true, name: true, category: true, active: true } },
   },
-} as const;
+} satisfies Prisma.JogadiTeam$membersArgs;
 
-async function teamDto(id: string) {
-  const [team, [held]] = await Promise.all([
-    prisma.jogadiTeam.findUnique({ where: { id }, include: { members: MEMBER_SELECT } }),
-    prisma.$queryRaw<{ pieces: number }[]>`
-      SELECT COALESCE(sum(l.quantity - l.received), 0)::int AS pieces
+interface TeamWork {
+  /** Jogadi: pieces issued and not yet received back. */
+  held: number;
+  /** Packing: pieces packed this month (posted entries). */
+  packedThisMonth: number;
+}
+
+/** Work figures per team: pieces a Jogadi holds, pieces a packing team packed this month. */
+async function teamWork(id: string | null): Promise<Map<string, TeamWork>> {
+  const month = factoryToday().slice(0, 7) + "-01";
+  const [held, packed] = await Promise.all([
+    prisma.$queryRaw<{ team_id: string; pieces: number }[]>`
+      SELECT i.team_id, sum(l.quantity - l.received)::int AS pieces
       FROM stitching_issue_lines l JOIN stitching_issues i ON i.id = l.issue_id
-      WHERE i.team_id = ${id}::uuid AND i.status = 'POSTED'`,
+      WHERE i.status = 'POSTED' AND (${id}::uuid IS NULL OR i.team_id = ${id}::uuid)
+      GROUP BY i.team_id`,
+    prisma.$queryRaw<{ team_id: string; pieces: number }[]>`
+      SELECT team_id, sum(pieces)::int AS pieces FROM packing_entries
+      WHERE status = 'POSTED' AND team_id IS NOT NULL AND pack_date >= ${month}::date
+        AND (${id}::uuid IS NULL OR team_id = ${id}::uuid)
+      GROUP BY team_id`,
   ]);
 
-  if (!team) throw errors.notFound("Jogadi team");
+  const work = new Map<string, TeamWork>();
+  const at = (teamId: string) => {
+    if (!work.has(teamId)) work.set(teamId, { held: 0, packedThisMonth: 0 });
 
-  return toDto(team, held!.pieces);
+    return work.get(teamId)!;
+  };
+
+  held.forEach((row) => (at(row.team_id).held = row.pieces));
+  packed.forEach((row) => (at(row.team_id).packedThisMonth = row.pieces));
+
+  return work;
+}
+
+async function teamDto(id: string) {
+  const [team, work] = await Promise.all([
+    prisma.jogadiTeam.findUnique({ where: { id }, include: { members: MEMBER_SELECT } }),
+    teamWork(id),
+  ]);
+
+  if (!team) throw errors.notFound("Team");
+
+  return toDto(team, work.get(id));
 }
 
 type TeamRecord = NonNullable<Awaited<ReturnType<typeof findTeams>>>[number];
 
-function findTeams(activeOnly: boolean) {
+function findTeams(filter: { activeOnly: boolean; kind: TeamKind | undefined }) {
   return prisma.jogadiTeam.findMany({
-    where: activeOnly ? { active: true } : {},
+    where: { ...(filter.activeOnly ? { active: true } : {}), ...(filter.kind ? { kind: filter.kind } : {}) },
     orderBy: [{ active: "desc" }, { name: "asc" }],
     include: { members: MEMBER_SELECT },
   });
 }
 
-function toDto(team: TeamRecord, piecesHeld: number) {
+function toDto(team: TeamRecord, work: TeamWork | undefined) {
   return {
     id: team.id,
     code: team.code ?? "",
+    kind: team.kind as TeamKind,
     name: team.name,
     active: team.active,
     notes: team.notes,
+    createdAt: team.createdAt,
     members: team.members.map((member) => ({
       karigarId: member.karigar.id,
+      code: karigarCode(member.karigar.number),
       name: member.karigar.name,
       category: member.karigar.category,
       active: member.karigar.active,
-      sharePercent: member.sharePercent === null ? null : member.sharePercent.toNumber(),
       joinedAt: member.joinedAt,
     })),
-    /** Pieces issued to the team and not yet received back. */
-    piecesHeld,
+    /** Jogadi: pieces issued to the team and not yet received back. */
+    piecesHeld: work?.held ?? 0,
+    /** Packing: pieces the team packed this month. */
+    packedThisMonth: work?.packedThisMonth ?? 0,
   };
 }
 
@@ -140,7 +160,7 @@ const duplicateName = () =>
 
 /**
  * Refuses a name another team has (any case) before inserting, so a refused
- * duplicate does not use up a JG code. The unique index still settles races.
+ * duplicate does not use up a team code. The unique index still settles races.
  */
 async function assertNameFree(tx: Pick<typeof prisma, "$queryRaw">, name: string, exceptId: string | null) {
   const [taken] = await tx.$queryRaw<{ id: string }[]>`
@@ -168,25 +188,19 @@ async function assertMembers(tx: Pick<typeof prisma, "karigar">, input: TeamInpu
   });
 }
 
-export const jogadiService = {
+export const teamService = {
   // ponytail: teams are a small master list, returned whole; page it if a factory ever has hundreds.
-  async list(activeOnly: boolean): Promise<TeamDto[]> {
-    const [teams, held] = await Promise.all([
-      findTeams(activeOnly),
-      prisma.$queryRaw<{ team_id: string; pieces: number }[]>`
-        SELECT i.team_id, sum(l.quantity - l.received)::int AS pieces
-        FROM stitching_issue_lines l JOIN stitching_issues i ON i.id = l.issue_id
-        WHERE i.status = 'POSTED' GROUP BY i.team_id`,
-    ]);
+  async list(filter: { activeOnly: boolean; kind: TeamKind | undefined }): Promise<TeamDto[]> {
+    const [teams, work] = await Promise.all([findTeams(filter), teamWork(null)]);
 
-    const heldBy = new Map(held.map((row) => [row.team_id, row.pieces]));
-
-    return teams.map((team) => toDto(team, heldBy.get(team.id) ?? 0));
+    return teams.map((team) => toDto(team, work.get(team.id)));
   },
 
   get: teamDto,
 
   async create(actor: AuthContext, input: TeamInput, meta: ClientMeta): Promise<TeamDto> {
+    const kind = input.kind ?? "JOGADI";
+
     try {
       const id = await transaction(async (tx) => {
         await assertNameFree(tx, input.name, null);
@@ -194,28 +208,22 @@ export const jogadiService = {
 
         const team = await tx.jogadiTeam.create({
           data: {
+            kind,
             name: input.name,
             active: input.active,
             notes: input.notes,
             createdById: actor.user.id,
-            members: {
-              createMany: {
-                data: input.members.map((member) => ({
-                  karigarId: member.karigarId,
-                  sharePercent: member.sharePercent,
-                })),
-              },
-            },
+            members: { createMany: { data: input.members.map((member) => ({ karigarId: member.karigarId })) } },
           },
           select: { id: true },
         });
 
         await recordAudit(tx, {
-          type: "JOGADI_CREATED",
+          type: "TEAM_CREATED",
           actorUserId: actor.user.id,
           sessionId: actor.sessionId,
           meta,
-          metadata: { teamId: team.id, name: input.name, members: input.members.length },
+          metadata: { teamId: team.id, kind, name: input.name, members: input.members.length },
         });
 
         return team.id;
@@ -227,30 +235,30 @@ export const jogadiService = {
     }
   },
 
-  /** Renames, (de)activates and changes members. Leavers keep their history; issued work keeps its snapshot. */
+  /** Renames, (de)activates and changes members. Leavers keep their history; given work keeps its snapshot. */
   async update(actor: AuthContext, id: string, input: TeamInput, meta: ClientMeta): Promise<TeamDto> {
     try {
       await transaction(async (tx) => {
         const [locked] = await tx.$queryRaw<
-          { id: string }[]
-        >`SELECT id FROM jogadi_teams WHERE id = ${id}::uuid FOR UPDATE`;
+          { id: string; kind: TeamKind }[]
+        >`SELECT id, kind FROM jogadi_teams WHERE id = ${id}::uuid FOR UPDATE`;
 
-        if (!locked) throw errors.notFound("Jogadi team");
+        if (!locked) throw errors.notFound("Team");
+
+        if (input.kind && input.kind !== locked.kind) {
+          throw fieldError("kind", "A team's type cannot change. Make a new team instead.");
+        }
+
+        await assertNameFree(tx, input.name, id);
 
         const current = await tx.jogadiMember.findMany({ where: { teamId: id, leftAt: null } });
         const currentIds = new Set(current.map((member) => member.karigarId));
-        const next = new Map(input.members.map((member) => [member.karigarId, member]));
+        const next = new Set(input.members.map((member) => member.karigarId));
 
         await assertMembers(tx, input, currentIds);
 
         const leaving = current.filter((member) => !next.has(member.karigarId));
         const joining = input.members.filter((member) => !currentIds.has(member.karigarId));
-
-        const reshared = current.filter((member) => {
-          const share = next.get(member.karigarId)?.sharePercent;
-
-          return share !== undefined && (member.sharePercent?.toNumber() ?? null) !== share;
-        });
 
         if (leaving.length > 0) {
           await tx.jogadiMember.updateMany({
@@ -261,18 +269,7 @@ export const jogadiService = {
 
         if (joining.length > 0) {
           await tx.jogadiMember.createMany({
-            data: joining.map((member) => ({
-              teamId: id,
-              karigarId: member.karigarId,
-              sharePercent: member.sharePercent,
-            })),
-          });
-        }
-
-        for (const member of reshared) {
-          await tx.jogadiMember.update({
-            where: { id: member.id },
-            data: { sharePercent: next.get(member.karigarId)!.sharePercent },
+            data: joining.map((member) => ({ teamId: id, karigarId: member.karigarId })),
           });
         }
 
@@ -281,11 +278,17 @@ export const jogadiService = {
           data: { name: input.name, active: input.active, notes: input.notes },
         });
         await recordAudit(tx, {
-          type: "JOGADI_UPDATED",
+          type: "TEAM_UPDATED",
           actorUserId: actor.user.id,
           sessionId: actor.sessionId,
           meta,
-          metadata: { teamId: id, joined: joining.length, left: leaving.length, active: input.active },
+          metadata: {
+            teamId: id,
+            name: input.name,
+            joined: joining.length,
+            left: leaving.length,
+            active: input.active,
+          },
         });
       });
 
@@ -298,32 +301,36 @@ export const jogadiService = {
 
 const idOf = (req: Request) => z.object({ id: z.uuid() }).parse(req.params).id;
 
-export function jogadiRoutes(): Router {
+export function teamRoutes(): Router {
   const router = Router();
 
   router.use(requireAuth);
 
   const manage = requirePermission("karigar.manage");
+  // The team list feeds the Teams screen, the stitching issue form and the packing form.
+  const view = requireAnyPermission("karigar.view", "stitching.view", "packing.view");
 
-  // The team list feeds both the Jogadi screen and the stitching issue form.
-  router.get("/", requireAnyPermission("karigar.view", "stitching.view"), (async (req, res) => {
-    const activeOnly = z.object({ active: z.enum(["true", "false"]).optional() }).parse(req.query).active === "true";
+  router.get("/", view, (async (req, res) => {
+    const query = z
+      .object({ active: z.enum(["true", "false"]).optional(), kind: z.enum(TEAM_KINDS).optional() })
+      .parse(req.query);
+    const teams = await teamService.list({ activeOnly: query.active === "true", kind: query.kind });
 
-    res.json({ success: true, data: { teams: await jogadiService.list(activeOnly) } });
+    res.json({ success: true, data: { teams } });
   }) satisfies RequestHandler);
 
-  router.get("/:id", requireAnyPermission("karigar.view", "stitching.view"), (async (req, res) => {
-    res.json({ success: true, data: { team: await jogadiService.get(idOf(req)) } });
+  router.get("/:id", view, (async (req, res) => {
+    res.json({ success: true, data: { team: await teamService.get(idOf(req)) } });
   }) satisfies RequestHandler);
 
   router.post("/", manage, (async (req, res) => {
-    const team = await jogadiService.create(actorOf(req), teamSchema.parse(req.body), clientMeta(req));
+    const team = await teamService.create(actorOf(req), teamSchema.parse(req.body), clientMeta(req));
 
     res.status(201).json({ success: true, data: { team } });
   }) satisfies RequestHandler);
 
   router.put("/:id", manage, (async (req, res) => {
-    const team = await jogadiService.update(actorOf(req), idOf(req), teamSchema.parse(req.body), clientMeta(req));
+    const team = await teamService.update(actorOf(req), idOf(req), teamSchema.parse(req.body), clientMeta(req));
 
     res.json({ success: true, data: { team } });
   }) satisfies RequestHandler);

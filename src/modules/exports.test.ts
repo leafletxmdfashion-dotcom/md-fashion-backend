@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { BOM, EXPORT_MAX, sendCsv } from "../lib/csv-export";
 import { AppError } from "../lib/errors";
-import { karigar, post, stitchedLot, today } from "../test/fixtures";
+import { karigar, packingTeam, post, stitchedLot, today } from "../test/fixtures";
 import { createUser, loggedInClient, resetDatabase, TestClient } from "../test/helpers";
 
 // Every list's Export: built on the server from the same query as the list, every matching
@@ -63,7 +63,8 @@ async function everything() {
   const packer = await karigar(owner, "Puja", "PACKER", 1.5);
   await post(owner, "/api/v1/packing/entries", {
     lotId,
-    packerId: packer,
+    teamId: await packingTeam(owner, "Pack A", [packer]),
+    rate: 1.5,
     packDate: today,
     lines: [
       { sizeLabel: "S", quantity: 20 },
@@ -106,7 +107,6 @@ const LISTS: [string, string, string][] = [
   ["/api/v1/godown/movements", "/api/v1/godown/movements/export", "movements"],
   ["/api/v1/godown/dispatches", "/api/v1/godown/dispatches/export", "dispatches"],
   ["/api/v1/godown/finished-goods", "/api/v1/godown/finished-goods/export", "lots"],
-  ["/api/v1/godown/finished-goods/items?page=1", "/api/v1/godown/finished-goods/items/export", "items"],
   ["/api/v1/payments/people", "/api/v1/payments/people/export", "people"],
   ["/api/v1/payments/ledger", "/api/v1/payments/ledger/export", "entries"],
   ["/api/v1/users?page=1", "/api/v1/users/export", "users"],

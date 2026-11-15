@@ -4,6 +4,18 @@ import { createUser, loggedInClient, type TestClient } from "./helpers";
 
 export const today = new Date().toISOString().slice(0, 10);
 
+/** A packing team of the given people (made by name); returns its id. */
+export async function packingTeam(owner: TestClient, name: string, members: string[]): Promise<string> {
+  // SAFETY: post() asserted the 201, so the team DTO is present.
+  return (
+    await post(owner, "/api/v1/teams", {
+      kind: "PACKING",
+      name,
+      members: members.map((karigarId) => ({ karigarId })),
+    })
+  ).team.id as string;
+}
+
 /** POST that must answer `status`; returns the response's data. */
 // Supertest bodies are untyped; each caller narrows what it reads.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -56,7 +68,7 @@ export async function stitchedLot(articleName = "Polo", lotNumber = "LOT-1") {
 
   // SAFETY: post() asserted the 201, so the team DTO is present.
   const teamId = (
-    await post(owner, "/api/v1/jogadi", { name: "Team Ram", members: [{ karigarId: ram }, { karigarId: sita }] })
+    await post(owner, "/api/v1/teams", { name: "Team Ram", members: [{ karigarId: ram }, { karigarId: sita }] })
   ).team.id as string;
 
   const stitched = await stitch(owner, lot.lotId, teamId);

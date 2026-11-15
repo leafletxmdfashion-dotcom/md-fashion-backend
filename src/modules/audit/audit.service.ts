@@ -21,6 +21,7 @@ export type AuditEventType =
   | "USER_ENABLED"
   | "ROLE_CHANGED"
   | "PERMISSION_CHANGED"
+  | "PERMISSION_OVERRIDE_CHANGED"
   | "ROLE_CREATED"
   | "ROLE_DELETED"
   | "SESSION_REVOKED"
@@ -44,6 +45,8 @@ export type AuditEventType =
   | "CUTTING_REVERSED"
   | "JOGADI_CREATED"
   | "JOGADI_UPDATED"
+  | "TEAM_CREATED"
+  | "TEAM_UPDATED"
   | "STITCHING_ISSUED"
   | "STITCHING_ISSUE_REVERSED"
   | "STITCHING_RECEIVED"
@@ -81,6 +84,7 @@ export async function recordAudit(db: Db, event: AuditEvent): Promise<void> {
       sessionId: event.sessionId ?? null,
       ipAddress: event.meta?.ip ?? null,
       userAgent: event.meta?.userAgent ?? null,
+      requestId: event.meta?.requestId ?? null,
       metadata: event.metadata ?? {},
     },
   });

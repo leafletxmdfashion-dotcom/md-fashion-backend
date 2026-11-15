@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { cutLot, karigar, post, stitch, stitchedLot, today } from "../../test/fixtures";
+import { cutLot, karigar, packingTeam, post, stitch, stitchedLot, today } from "../../test/fixtures";
 import { createUser, loggedInClient, resetDatabase, sql } from "../../test/helpers";
 
 beforeEach(resetDatabase);
@@ -47,16 +47,27 @@ describe("merge items", () => {
 
     await stitch(owner, other.lotId, teamId);
 
-    const packer = await karigar(owner, "Puja", "PACKER", 1);
+    const packer = await packingTeam(owner, "Pack A", [await karigar(owner, "Puja", "PACKER", 1)]);
 
     for (const lot of [lotId, other.lotId]) {
       await post(owner, "/api/v1/packing/entries", {
         lotId: lot,
-        packerId: packer,
+        teamId: packer,
+        rate: 1,
         packDate: today,
         lines: [{ sizeLabel: "M", quantity: 10 }],
       });
     }
+
+    // The engine suggests the two as one design; the item with more stock comes first.
+    const similar = (await owner.get("/api/v1/articles/similar")).body.data.groups as {
+      items: { id: string; name: string }[];
+      score: number;
+    }[];
+
+    expect(similar).toHaveLength(1);
+    expect(similar[0]!.items.map((item) => item.name).sort()).toEqual(["Black trouser", "Trouser"]);
+    expect(similar[0]!.score).toBeGreaterThanOrEqual(0.45);
 
     const self = await owner.send("post", "/api/v1/articles/merge", { targetId: articleId, sourceIds: [articleId] });
 
@@ -77,6 +88,7 @@ describe("merge items", () => {
       { size_label: "M", balance: 20 },
     ]);
     expect((await sql("SELECT count(*)::int AS n FROM articles")).rows[0].n).toBe(1);
+    expect((await owner.get("/api/v1/articles/similar")).body.data.groups).toEqual([]);
 
     // Stock still moves normally after the merge.
     const out = await owner.send("post", "/api/v1/godown/dispatches", {

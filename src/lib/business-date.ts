@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 // ponytail: one factory, one timezone; make it a setting if a second site opens elsewhere.
-const FACTORY_TIME_ZONE = "Asia/Kathmandu";
+export const FACTORY_TIME_ZONE = "Asia/Kathmandu";
 
 /** Today's date (YYYY-MM-DD) at the factory, whatever timezone the server runs in. */
 export function factoryToday(now: Date = new Date()): string {
