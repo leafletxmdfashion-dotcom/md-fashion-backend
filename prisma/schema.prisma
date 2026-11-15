@@ -293,6 +293,7 @@ model Karigar {
   issueMemberships  StitchingIssueMember[]
   reworkAssigned    ReworkItem[]
   packingEntries    PackingEntry[]
+  packingMembers    PackingEntryMember[]
   /// The login this person uses to see their own ledger.
   userId            String?                @unique @map("user_id") @db.Uuid
   user              User?                  @relation("KarigarLogin", fields: [userId], references: [id], onUpdate: NoAction)
@@ -602,12 +603,14 @@ model LotCost {
   @@map("lot_costs")
 }
 
-/// A Jogadi: a stitching team. Code JG-001… is generated. Name unique ignoring case (expression index).
+/// A team of karigars: JOGADI (stitching) or PACKING (CHECK constraint), fixed once made.
+/// Code JG-001… / PT-001… is generated. Name unique ignoring case (expression index).
 model JogadiTeam {
   id          String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   number      Int              @unique @default(autoincrement())
-  /// Generated: 'JG-' || lpad(number, 3).
-  code        String?          @default(dbgenerated("('JG-'::text || lpad((number)::text, 3, '0'::text))"))
+  kind        String           @default("JOGADI")
+  /// Generated: 'JG-' or 'PT-' || lpad(number, 3).
+  code        String?          @default(dbgenerated("(CASE kind WHEN 'PACKING'::text THEN 'PT-'::text ELSE 'JG-'::text END || lpad((number)::text, 3, '0'::text))"))
   name        String
   active      Boolean          @default(true)
   notes       String?
@@ -617,7 +620,9 @@ model JogadiTeam {
   createdBy   User             @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   members     JogadiMember[]
   issues      StitchingIssue[]
+  packing     PackingEntry[]
 
+  @@index([kind, active], map: "jogadi_teams_kind_idx")
   @@map("jogadi_teams")
 }
 
@@ -797,13 +802,16 @@ model ReworkResolution {
   @@map("rework_resolutions")
 }
 
-/// Good pieces of a lot packed by one person, per size. Paid per piece. POSTED | REVERSED (CHECK constraint).
+/// Good pieces of a lot packed by a packing team (older entries: one person), per size. Paid per
+/// piece, split equally over the team. CHECK: exactly one of packer and team. POSTED | REVERSED (CHECK).
 model PackingEntry {
   id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   number         Int              @unique @default(autoincrement())
   lotId          String           @map("lot_id") @db.Uuid
-  packerId       String           @map("packer_id") @db.Uuid
-  packerName     String           @map("packer_name")
+  packerId       String?          @map("packer_id") @db.Uuid
+  packerName     String?          @map("packer_name")
+  teamId         String?          @map("team_id") @db.Uuid
+  teamName       String?          @map("team_name")
   packDate       DateTime         @map("pack_date") @db.Date
   pieces         Int
   rate           Decimal          @db.Decimal(12, 2)
@@ -816,7 +824,9 @@ model PackingEntry {
   createdById    String           @map("created_by") @db.Uuid
   createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
   lot            ProductionLot    @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  packer         Karigar          @relation(fields: [packerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  packer         Karigar?         @relation(fields: [packerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  team           JogadiTeam?      @relation(fields: [teamId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  members        PackingEntryMember[]
   createdBy      User             @relation("PackingCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversedBy     User?            @relation("PackingReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   lines          PackingLine[]
@@ -825,7 +835,21 @@ model PackingEntry {
   @@index([packDate(sort: Desc), number(sort: Desc)], map: "packing_entries_date_idx")
   @@index([lotId], map: "packing_entries_lot_idx")
   @@index([packerId, packDate], map: "packing_entries_packer_idx")
+  @@index([teamId, packDate], map: "packing_entries_team_idx", where: raw("(team_id IS NOT NULL)"))
   @@map("packing_entries")
+}
+
+/// The packing team as it was when the entry was posted; the earning was split equally over them.
+model PackingEntryMember {
+  entryId     String       @map("entry_id") @db.Uuid
+  karigarId   String       @map("karigar_id") @db.Uuid
+  karigarName String       @map("karigar_name")
+  entry       PackingEntry @relation(fields: [entryId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  karigar     Karigar      @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@id([entryId, karigarId])
+  @@index([karigarId], map: "packing_entry_members_karigar_idx")
+  @@map("packing_entry_members")
 }
 
 model PackingLine {

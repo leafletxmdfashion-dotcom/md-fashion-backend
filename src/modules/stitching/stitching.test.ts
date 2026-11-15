@@ -101,7 +101,7 @@ async function setup() {
 
   // SAFETY: post() asserted the 201, so the team DTO is present.
   const team = (
-    await post(owner, "/api/v1/jogadi", { name: "Team Ram", members: [{ karigarId: ram }, { karigarId: sita }] })
+    await post(owner, "/api/v1/teams", { name: "Team Ram", members: [{ karigarId: ram }, { karigarId: sita }] })
   ).team as {
     id: string;
   };
@@ -177,32 +177,29 @@ describe("earning split", () => {
   });
 });
 
-describe("jogadi teams", () => {
-  it("keeps membership history, validates shares and counts the pieces a team holds", async () => {
+describe("teams", () => {
+  it("keeps membership history, refuses shares and counts the pieces a team holds", async () => {
     const { owner, lotId, teamId, ram, sita, hari } = await setup();
 
     expect(
-      (await owner.send("post", "/api/v1/jogadi", { name: "team ram", members: [{ karigarId: hari }] })).status,
+      (await owner.send("post", "/api/v1/teams", { name: "team ram", members: [{ karigarId: hari }] })).status,
     ).toBe(409);
     // A refused duplicate does not use up a team code.
-    const next = await post(owner, "/api/v1/jogadi", { name: "Team Hari", members: [{ karigarId: hari }] });
+    const next = await post(owner, "/api/v1/teams", { name: "Team Hari", members: [{ karigarId: hari }] });
     expect(next.team.code).toBe("JG-002");
 
-    const badShares = await owner.send("post", "/api/v1/jogadi", {
-      name: "Team Hari",
-      members: [
-        { karigarId: ram, sharePercent: 60 },
-        { karigarId: hari, sharePercent: 30 },
-      ],
+    // Team earnings always split equally: shares are no longer accepted.
+    const shares = await owner.send("post", "/api/v1/teams", {
+      name: "Team Shares",
+      members: [{ karigarId: ram, sharePercent: 60 }],
     });
 
-    expect(badShares.status).toBe(400);
-    expect(JSON.stringify(badShares.body.error.details)).toMatch(/exactly 100%/);
+    expect(shares.status).toBe(400);
 
     await issue(owner, lotId, teamId, [["Black", "S", 10]]);
 
     // Sita leaves, Hari joins: the issued work keeps Ram and Sita.
-    const updated = await owner.send("put", `/api/v1/jogadi/${teamId}`, {
+    const updated = await owner.send("put", `/api/v1/teams/${teamId}`, {
       name: "Team Ram",
       members: [{ karigarId: ram }, { karigarId: hari }],
     });
@@ -219,6 +216,41 @@ describe("jogadi teams", () => {
     const detail = (await owner.get(`/api/v1/stitching/issues/${issues[0]!.id}`)).body.data.issue as Issue;
 
     expect(detail.members.map((member) => member.name)).toEqual(["Ram", "Sita"]);
+  });
+
+  it("makes packing teams with their own code, keeps the type fixed, and keeps them out of stitching", async () => {
+    const { owner, lotId, ram, hari } = await setup();
+    const packing = (await post(owner, "/api/v1/teams", { kind: "PACKING", name: "Pack A", members: [{ karigarId: hari }] }))
+      .team;
+
+    expect(packing).toMatchObject({ kind: "PACKING", code: "PT-002", piecesHeld: 0, packedThisMonth: 0 });
+
+    const changed = await owner.send("put", `/api/v1/teams/${packing.id}`, {
+      kind: "JOGADI",
+      name: "Pack A",
+      members: [{ karigarId: hari }, { karigarId: ram }],
+    });
+
+    expect(changed.status).toBe(400);
+    expect(changed.body.error.details.kind[0]).toMatch(/cannot change/);
+
+    const kinds = async (query: string) =>
+      ((await owner.get(`/api/v1/teams${query}`)).body.data.teams as { name: string }[]).map((team) => team.name);
+
+    expect(await kinds("?kind=PACKING")).toEqual(["Pack A"]);
+    expect(await kinds("?kind=JOGADI")).toEqual(["Team Ram"]);
+    expect(await kinds("")).toEqual(["Pack A", "Team Ram"]);
+
+    const wrongKind = await owner.send("post", "/api/v1/stitching/issues", {
+      lotId,
+      operation: "Full stitch",
+      rate: 5,
+      issueDate: today,
+      teams: [{ teamId: packing.id, lines: [{ colour: "Black", sizeLabel: "S", quantity: 1 }] }],
+    });
+
+    expect(wrongKind.status).toBe(400);
+    expect(JSON.stringify(wrongKind.body.error.details)).toMatch(/active Jogadi team/);
   });
 });
 
@@ -362,7 +394,7 @@ describe("stitching issue", () => {
   it("divides one lot between several Jogadi teams in one posting, never more than is waiting", async () => {
     const { owner, lotId, teamId, hari } = await setup();
     // SAFETY: post() asserted the 201, so the team DTO is present.
-    const second = (await post(owner, "/api/v1/jogadi", { name: "Team Hari", members: [{ karigarId: hari }] }))
+    const second = (await post(owner, "/api/v1/teams", { name: "Team Hari", members: [{ karigarId: hari }] }))
       .team as {
       id: string;
     };
@@ -769,6 +801,6 @@ describe("stitching permissions", () => {
     expect((await staff.send("post", `/api/v1/stitching/issues/${issued.id}/reverse`, { reason: "Oops" })).status).toBe(
       403,
     );
-    expect((await staff.send("post", "/api/v1/jogadi", { name: "X", members: [{ karigarId: ram }] })).status).toBe(403);
+    expect((await staff.send("post", "/api/v1/teams", { name: "X", members: [{ karigarId: ram }] })).status).toBe(403);
   });
 });

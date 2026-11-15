@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { karigar, post, stitchedLot, today } from "../../test/fixtures";
+import { karigar, packingTeam, post, stitchedLot, today } from "../../test/fixtures";
 import { createUser, loggedInClient, resetDatabase, type TestClient } from "../../test/helpers";
 
 beforeEach(resetDatabase);
@@ -12,7 +12,8 @@ async function packed() {
   const entry = (
     await post(lot.owner, "/api/v1/packing/entries", {
       lotId: lot.lotId,
-      packerId: packer,
+      teamId: await packingTeam(lot.owner, "Pack A", [packer]),
+      rate: 1,
       packDate: today,
       lines: [
         { sizeLabel: "S", quantity: 20 },

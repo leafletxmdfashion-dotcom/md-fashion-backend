@@ -7,7 +7,7 @@ import { csrfProtection } from "../modules/auth/csrf";
 import { articleRoutes } from "../modules/articles/article.routes";
 import { cuttingRoutes, lotRoutes } from "../modules/cutting/cutting.routes";
 import { fabricRoutes } from "../modules/fabrics/fabric.routes";
-import { jogadiRoutes } from "../modules/jogadi/jogadi";
+import { teamRoutes } from "../modules/teams/teams";
 import { karigarRoutes } from "../modules/karigars/karigar.routes";
 import { godownRoutes } from "../modules/godown/godown.routes";
 import { packingRoutes } from "../modules/packing/packing.routes";
@@ -38,7 +38,7 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use("/articles", articleRoutes());
   router.use("/production-lots", lotRoutes());
   router.use("/cutting-batches", cuttingRoutes());
-  router.use("/jogadi", jogadiRoutes());
+  router.use("/teams", teamRoutes());
   router.use("/stitching", stitchingRoutes());
   router.use("/packing", packingRoutes());
   router.use("/godown", godownRoutes());

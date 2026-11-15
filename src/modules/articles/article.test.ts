@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { cutLot, karigar, post, stitch, stitchedLot, today } from "../../test/fixtures";
+import { cutLot, karigar, packingTeam, post, stitch, stitchedLot, today } from "../../test/fixtures";
 import { createUser, loggedInClient, resetDatabase, sql } from "../../test/helpers";
 
 beforeEach(resetDatabase);
@@ -47,12 +47,13 @@ describe("merge items", () => {
 
     await stitch(owner, other.lotId, teamId);
 
-    const packer = await karigar(owner, "Puja", "PACKER", 1);
+    const packer = await packingTeam(owner, "Pack A", [await karigar(owner, "Puja", "PACKER", 1)]);
 
     for (const lot of [lotId, other.lotId]) {
       await post(owner, "/api/v1/packing/entries", {
         lotId: lot,
-        packerId: packer,
+        teamId: packer,
+        rate: 1,
         packDate: today,
         lines: [{ sizeLabel: "M", quantity: 10 }],
       });

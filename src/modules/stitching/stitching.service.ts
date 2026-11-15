@@ -564,7 +564,7 @@ export const stitchingService = {
       if (lot.status === "CANCELLED") throw fieldError("lotId", `${lot.lot_number} is cancelled.`);
 
       const teams = await tx.jogadiTeam.findMany({
-        where: { id: { in: input.teams.map((team) => team.teamId) } },
+        where: { id: { in: input.teams.map((team) => team.teamId) }, kind: "JOGADI" },
         select: {
           id: true,
           name: true,
@@ -572,7 +572,7 @@ export const stitchingService = {
           members: {
             where: { leftAt: null },
             orderBy: { joinedAt: "asc" },
-            select: { karigarId: true, sharePercent: true, karigar: { select: { name: true } } },
+            select: { karigarId: true, karigar: { select: { name: true } } },
           },
         },
       });
@@ -584,7 +584,7 @@ export const stitchingService = {
         if (!team?.active) throw fieldError(`teams.${index}.teamId`, "Choose an active Jogadi team.");
 
         if (team.members.length === 0) {
-          throw fieldError(`teams.${index}.teamId`, `${team.name} has no members. Add them in Jogadi Teams.`);
+          throw fieldError(`teams.${index}.teamId`, `${team.name} has no members. Add them in Teams.`);
         }
       });
 
@@ -625,7 +625,6 @@ export const stitchingService = {
 
       for (const entry of input.teams) {
         const team = teamById.get(entry.teamId)!;
-        const shared = team.members.every((member) => member.sharePercent !== null);
 
         const issue = await tx.stitchingIssue.create({
           data: {
@@ -634,7 +633,8 @@ export const stitchingService = {
             teamName: team.name,
             operation: input.operation,
             rate: input.rate,
-            splitMethod: shared ? "PERCENT" : "EQUAL",
+            // Teams have no shares: earnings split equally (a receipt may still split by amount).
+            splitMethod: "EQUAL",
             issueDate: new Date(input.issueDate),
             notes: input.notes,
             createdById: actor.user.id,
@@ -653,7 +653,6 @@ export const stitchingService = {
                 data: team.members.map((member) => ({
                   karigarId: member.karigarId,
                   karigarName: member.karigar.name,
-                  sharePercent: shared ? member.sharePercent : null,
                 })),
               },
             },

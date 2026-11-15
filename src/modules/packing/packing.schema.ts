@@ -7,14 +7,14 @@ export const ENTRY_COLUMNS: ColumnSpecs = {
   date: { type: "date", sql: "e.pack_date" },
   number: { type: "number", sql: "e.number" },
   lot: { type: "text", sql: "l.search_text", sortSql: "l.lot_key" },
-  packer: { type: "text", sql: "lower(e.packer_name)", sortSql: "e.packer_name" },
+  packer: { type: "text", sql: "lower(COALESCE(e.team_name, e.packer_name))", sortSql: "COALESCE(e.team_name, e.packer_name)" },
   pieces: { type: "number", sql: "e.pieces" },
   status: { type: "enum", sql: "e.status", values: ["POSTED", "REVERSED"] },
 };
 
 export const LINE_COLUMNS: ColumnSpecs = {
   date: { type: "date", sql: "e.pack_date" },
-  packer: { type: "text", sql: "lower(e.packer_name)", sortSql: "e.packer_name" },
+  packer: { type: "text", sql: "lower(COALESCE(e.team_name, e.packer_name))", sortSql: "COALESCE(e.team_name, e.packer_name)" },
   item: { type: "text", sql: "lower(l.article_name)", sortSql: "l.article_name" },
   size: { type: "text", sql: "lower(pl.size_label)", sortSql: "pl.size_label" },
   quantity: { type: "number", sql: "pl.quantity" },
@@ -30,15 +30,14 @@ const notes = z
 export const packSchema = z
   .strictObject({
     lotId: z.uuid("Choose a lot."),
-    packerId: z.uuid("Choose who packed."),
+    teamId: z.uuid("Choose the packing team."),
     packDate: businessDate,
-    /** Left out: the packer's own rate per piece. Setting it needs permission to see money. */
+    /** Paid per piece, split equally over the team (like a stitching issue's rate). */
     rate: z
       .number({ error: "Enter the rate per piece." })
       .min(0, "Rate cannot be negative.")
       .max(99_999, "Rate is too large.")
-      .multipleOf(0.01, "Use at most 2 decimals.")
-      .optional(),
+      .multipleOf(0.01, "Use at most 2 decimals."),
     notes,
     lines: z
       .array(
@@ -77,7 +76,9 @@ const listPage = {
   page: z.coerce.number().int().min(1).max(100_000).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(25),
   lotId: z.uuid().optional(),
+  /** A person: entries they packed alone or as a member of the packing team. */
   packerId: z.uuid().optional(),
+  teamId: z.uuid().optional(),
 };
 
 export const entryListQuerySchema = z.object({ ...listPage, ...columnQueryFields(ENTRY_COLUMNS) });
@@ -88,6 +89,8 @@ export const staffQuerySchema = z.object({
   dateFrom: z.iso.date().optional(),
   dateTo: z.iso.date().optional(),
 });
+
+export const lastRateQuerySchema = z.object({ lotId: z.uuid(), teamId: z.uuid().optional() });
 
 export const idParamsSchema = z.object({ id: z.uuid() });
 

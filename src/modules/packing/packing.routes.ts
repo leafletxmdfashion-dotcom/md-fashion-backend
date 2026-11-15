@@ -3,7 +3,6 @@ import { Router, type Request, type RequestHandler } from "express";
 import { z } from "zod";
 
 import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
-import { karigarCode } from "../../lib/labels";
 import { actorOf, can, clientMeta } from "../../lib/request";
 import { queryRows, rowQueryFields, type RowQuery, type RowSpecs } from "../../lib/row-query";
 import { requireAuth } from "../auth/auth.middleware";
@@ -11,6 +10,7 @@ import { requirePermission } from "../permissions/permission.middleware";
 import {
   entryListQuerySchema,
   idParamsSchema,
+  lastRateQuerySchema,
   lineListQuerySchema,
   packSchema,
   reverseSchema,
@@ -54,7 +54,7 @@ const queueHaystack = (row: QueueLot) =>
 
 function packerSpecs(money: boolean): RowSpecs<Packer> {
   return {
-    packer: { type: "text", value: (row) => `${row.name} ${karigarCode(row.number)}` },
+    packer: { type: "text", value: (row) => `${row.name} ${row.code} ${row.members ?? ""}` },
     items: { type: "text", value: (row) => row.items },
     entries: { type: "number", value: (row) => row.entries },
     lots: { type: "number", value: (row) => row.lots },
@@ -64,7 +64,7 @@ function packerSpecs(money: boolean): RowSpecs<Packer> {
     lastDate: { type: "date", value: (row) => row.lastDate },
   };
 }
-const packerHaystack = (row: Packer) => `${row.name} ${karigarCode(row.number)} ${row.items}`;
+const packerHaystack = (row: Packer) => `${row.name} ${row.code} ${row.members ?? ""} ${row.items}`;
 
 async function queueRows(req: Request) {
   // SAFETY: column params are validated by the schema; their keys are dynamic.
@@ -157,7 +157,7 @@ export function packingRoutes(): Router {
         { header: "Date", value: (e: Entry) => e.date },
         { header: "Lot", value: (e: Entry) => e.lot.lotNumber },
         { header: "Item / design", value: (e: Entry) => e.lot.articleName },
-        { header: "Packed by", value: (e: Entry) => e.packer.name },
+        { header: "Packed by", value: (e: Entry) => e.packedBy.name },
         { header: "Sizes", value: (e: Entry) => e.sizes },
         { header: "Pieces", value: (e: Entry) => e.pieces },
         ...(money
@@ -196,7 +196,7 @@ export function packingRoutes(): Router {
       [
         { header: "Date", value: (l) => l.date },
         { header: "Entry", value: (l) => docNumber("PK", l.entry.number) },
-        { header: "Packed by", value: (l) => l.packer.name },
+        { header: "Packed by", value: (l) => l.packedBy.name },
         { header: "Lot", value: (l) => l.lot.lotNumber },
         { header: "Item / design", value: (l) => l.articleName },
         { header: "Size", value: (l) => l.sizeLabel },
@@ -231,8 +231,9 @@ export function packingRoutes(): Router {
       res,
       "packing-by-packer",
       [
-        { header: "Code", value: (row: Packer) => karigarCode(row.number) },
-        { header: "Packer", value: (row: Packer) => row.name },
+        { header: "Code", value: (row: Packer) => row.code },
+        { header: "Packed by", value: (row: Packer) => row.name },
+        { header: "Members", value: (row: Packer) => row.members },
         { header: "Items packed", value: (row: Packer) => row.items },
         { header: "Entries", value: (row: Packer) => row.entries },
         { header: "Lots", value: (row: Packer) => row.lots },
@@ -244,6 +245,12 @@ export function packingRoutes(): Router {
       matching,
       (row) => row.id,
     );
+  }) satisfies RequestHandler);
+
+  router.get("/last-rate", view, (async (req, res) => {
+    const rate = await packingService.lastRate(lastRateQuerySchema.parse(req.query), showMoney(req));
+
+    res.json({ success: true, data: { rate } });
   }) satisfies RequestHandler);
 
   router.post("/entries", manage, (async (req, res) => {
