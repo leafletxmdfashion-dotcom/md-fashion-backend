@@ -637,7 +637,7 @@ model JogadiTeam {
   number      Int              @unique @default(autoincrement())
   kind        String           @default("JOGADI")
   /// Generated: 'JG-' or 'PT-' || lpad(number, 3).
-  code        String?          @default(dbgenerated("(CASE kind WHEN 'PACKING'::text THEN 'PT-'::text ELSE 'JG-'::text END || lpad((number)::text, 3, '0'::text))"))
+  code        String?          @default(dbgenerated("(\nCASE kind\n    WHEN 'PACKING'::text THEN 'PT-'::text\n    ELSE 'JG-'::text\nEND || lpad((number)::text, 3, '0'::text))"))
   name        String
   active      Boolean          @default(true)
   notes       String?

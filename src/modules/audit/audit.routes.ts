@@ -206,7 +206,8 @@ function toEvent(row: Row) {
     target: row.target_user_id ? { id: row.target_user_id, name: row.target_name, login: row.target_login } : null,
     record: entityKey ? { key: entityKey, id: row.metadata[entityKey] as string } : null,
     reason,
-    ip: row.ip,
+    // IPv4 clients reached over an IPv6 socket arrive as ::ffff:a.b.c.d; show the IPv4 address.
+    ip: row.ip?.replace(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/, "$1") ?? null,
     userAgent: row.user_agent,
     device: describeDevice(row.user_agent),
     sessionId: row.session_id,

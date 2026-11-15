@@ -7,6 +7,7 @@ import { csrfProtection } from "../modules/auth/csrf";
 import { articleRoutes } from "../modules/articles/article.routes";
 import { auditRoutes } from "../modules/audit/audit.routes";
 import { cuttingRoutes, lotRoutes } from "../modules/cutting/cutting.routes";
+import { dashboardRoutes } from "../modules/dashboard/dashboard";
 import { fabricRoutes } from "../modules/fabrics/fabric.routes";
 import { accessRoutes } from "../modules/permissions/access";
 import { teamRoutes } from "../modules/teams/teams";
@@ -37,6 +38,7 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use("/roles", roleRoutes());
   router.use("/access", accessRoutes());
   router.use("/audit-events", auditRoutes());
+  router.use("/dashboard", dashboardRoutes());
   router.use("/fabrics", fabricRoutes());
   router.use("/karigars", karigarRoutes());
   router.use("/articles", articleRoutes());
