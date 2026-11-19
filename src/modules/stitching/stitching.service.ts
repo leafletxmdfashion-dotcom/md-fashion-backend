@@ -15,7 +15,9 @@ import {
   type RejectListQuery,
   type ReworkListQuery,
   type ReworkResolveInput,
+  type SetRateInput,
 } from "./stitching.schema";
+import { postRateDifference, rateHistory } from "./rate-change";
 import { paisaText, splitEarning, toPaisa, type SplitMember, type SplitMethod } from "./stitching.split";
 
 // Stitching: cut pieces issued to a Jogadi team (drawing down cutting output), then
@@ -44,6 +46,12 @@ function audit(actor: AuthContext, meta: ClientMeta) {
 const today = () => new Date(factoryToday());
 
 const pcs = (count: number) => `${count.toLocaleString("en-IN")} piece${count === 1 ? "" : "s"}`;
+
+const receiptDescription = (number: number, lotNumber: string, good: number) =>
+  `Stitching ${receiptNumber(number)} · ${lotNumber} · ${pcs(good)} Good`;
+
+const reworkDescription = (number: number, lotNumber: string, recovered: number) =>
+  `Rework ${reworkNumber(number)} · ${lotNumber} · ${pcs(recovered)} recovered`;
 
 /** "M" for a bulk line (all colours of the size), "Black M" for an older colour line. */
 export const lineLabel = (colour: string, size: string) => (colour ? `${colour} ${size}` : size);
@@ -102,7 +110,8 @@ interface LockedIssue {
   lot_id: string;
   lot_number: string;
   team_name: string;
-  rate: string;
+  /** Null = rate pending: nothing has been paid for this issue yet. */
+  rate: string | null;
   split_method: "EQUAL" | "PERCENT";
   status: string;
 }
@@ -396,6 +405,10 @@ export const stitchingService = {
 
     if (query.teamId) clauses.push(Prisma.sql`i.team_id = ${query.teamId}::uuid`);
 
+    if (query.karigarId) clauses.push(Prisma.sql`i.karigar_id = ${query.karigarId}::uuid`);
+
+    if (query.ratePending) clauses.push(Prisma.sql`i.rate IS NULL AND i.status = 'POSTED'`);
+
     const filter = where(clauses);
     const order = orderBy(ISSUE_COLUMNS, query, "i.issue_date DESC", "i.number DESC");
 
@@ -405,7 +418,7 @@ export const stitchingService = {
       JOIN LATERAL (SELECT sum(quantity)::int AS issued, sum(received)::int AS received
                     FROM stitching_issue_lines WHERE issue_id = i.id) t ON true`;
 
-    const [rows, [summary]] = await Promise.all([
+    const [rows, [summary], [pending]] = await Promise.all([
       prisma.$queryRaw<
         {
           id: string;
@@ -413,8 +426,9 @@ export const stitchingService = {
           issue_date: string;
           status: string;
           operation: string;
-          rate: string;
-          team_id: string;
+          rate: string | null;
+          team_id: string | null;
+          karigar_id: string | null;
           team_name: string;
           lot_id: string;
           lot_number: string;
@@ -424,13 +438,16 @@ export const stitchingService = {
         }[]
       >`
         SELECT i.id, i.number, i.issue_date::text AS issue_date, i.status, i.operation, i.rate::text AS rate,
-               i.team_id, i.team_name, lp.id AS lot_id, lp.lot_number, lp.article_name, t.issued, t.received
+               i.team_id, i.karigar_id, i.team_name, lp.id AS lot_id, lp.lot_number, lp.article_name, t.issued, t.received
         ${from} ${filter} ${order} ${page(query)}`,
       prisma.$queryRaw<{ total: number; wip: number; open: number }[]>`
         SELECT count(*)::int AS total,
                COALESCE(sum(t.issued - t.received) FILTER (WHERE i.status = 'POSTED'), 0)::int AS wip,
                count(*) FILTER (WHERE i.status = 'POSTED' AND t.issued > t.received)::int AS open
         ${from} ${filter}`,
+      // Whatever the filters: posted issues whose rate is still to be set.
+      prisma.$queryRaw<{ count: number }[]>`
+        SELECT count(*)::int AS count FROM stitching_issues WHERE rate IS NULL AND status = 'POSTED'`,
     ]);
 
     return {
@@ -441,14 +458,17 @@ export const stitchingService = {
         status: row.status,
         operation: row.operation,
         rate: showMoney ? row.rate : null,
+        ratePending: row.rate === null,
+        /** Team id, or null when the work went to one karigar (karigarId); name is either's. */
         team: { id: row.team_id, name: row.team_name },
+        karigarId: row.karigar_id,
         lot: { id: row.lot_id, lotNumber: row.lot_number, articleName: row.article_name },
         issued: row.issued,
         received: row.received,
         wip: row.status === "POSTED" ? row.issued - row.received : 0,
       })),
       total: summary!.total,
-      summary: { wip: summary!.wip, open: summary!.open },
+      summary: { wip: summary!.wip, open: summary!.open, ratePending: pending!.count },
     };
   },
 
@@ -486,6 +506,7 @@ export const stitchingService = {
         })
       : [];
 
+    const rateChanges = showMoney ? await rateHistory("STITCHING_ISSUE", issue.id) : [];
     const linesById = new Map(issue.lines.map((line) => [line.id, line]));
 
     return {
@@ -494,11 +515,14 @@ export const stitchingService = {
       status: issue.status,
       date: issue.issueDate.toISOString().slice(0, 10),
       operation: issue.operation,
-      rate: showMoney ? issue.rate.toFixed(2) : null,
+      rate: showMoney ? (issue.rate?.toFixed(2) ?? null) : null,
+      ratePending: issue.rate === null,
+      rateChanges: showMoney ? rateChanges : null,
       splitMethod: issue.splitMethod,
       notes: issue.notes,
       lot: issue.lot,
       team: { id: issue.teamId, name: issue.teamName },
+      karigarId: issue.karigarId,
       members: issue.members.map((member) => ({
         karigarId: member.karigarId,
         name: member.karigarName,
@@ -563,8 +587,10 @@ export const stitchingService = {
 
       if (lot.status === "CANCELLED") throw fieldError("lotId", `${lot.lot_number} is cancelled.`);
 
+      const teamIds = input.teams.flatMap((entry) => (entry.teamId ? [entry.teamId] : []));
+      const karigarIds = input.teams.flatMap((entry) => (entry.karigarId ? [entry.karigarId] : []));
       const teams = await tx.jogadiTeam.findMany({
-        where: { id: { in: input.teams.map((team) => team.teamId) }, kind: "JOGADI" },
+        where: { id: { in: teamIds }, kind: "JOGADI" },
         select: {
           id: true,
           name: true,
@@ -576,10 +602,31 @@ export const stitchingService = {
           },
         },
       });
+      const karigars = await tx.karigar.findMany({
+        where: { id: { in: karigarIds } },
+        select: { id: true, name: true, active: true },
+      });
       const teamById = new Map(teams.map((team) => [team.id, team]));
+      const karigarById = new Map(karigars.map((karigar) => [karigar.id, karigar]));
+      // A karigar on their own and as a member of a chosen team would be paid twice for one lot split.
+      const inTeams = new Map(
+        teams.flatMap((team) => team.members.map((member) => [member.karigarId, team.name] as const)),
+      );
 
       input.teams.forEach((entry, index) => {
-        const team = teamById.get(entry.teamId);
+        if (entry.karigarId) {
+          const karigar = karigarById.get(entry.karigarId);
+
+          if (!karigar?.active) throw fieldError(`teams.${index}.teamId`, "Choose an active karigar.");
+
+          const team = inTeams.get(karigar.id);
+
+          if (team) throw fieldError(`teams.${index}.teamId`, `${karigar.name} is already in ${team}, chosen above.`);
+
+          return;
+        }
+
+        const team = teamById.get(entry.teamId!);
 
         if (!team?.active) throw fieldError(`teams.${index}.teamId`, "Choose an active Jogadi team.");
 
@@ -624,13 +671,19 @@ export const stitchingService = {
       const created: string[] = [];
 
       for (const entry of input.teams) {
-        const team = teamById.get(entry.teamId)!;
+        // SAFETY: validated above: a solo karigar or an active team with members.
+        const solo = entry.karigarId ? karigarById.get(entry.karigarId)! : null;
+        const team = entry.teamId ? teamById.get(entry.teamId)! : null;
+        const members = solo
+          ? [{ karigarId: solo.id, karigarName: solo.name }]
+          : team!.members.map((member) => ({ karigarId: member.karigarId, karigarName: member.karigar.name }));
 
         const issue = await tx.stitchingIssue.create({
           data: {
             lotId: lot.id,
-            teamId: team.id,
-            teamName: team.name,
+            teamId: team?.id ?? null,
+            karigarId: solo?.id ?? null,
+            teamName: solo?.name ?? team!.name,
             operation: input.operation,
             rate: input.rate,
             // Teams have no shares: earnings split equally (a receipt may still split by amount).
@@ -648,14 +701,7 @@ export const stitchingService = {
                 })),
               },
             },
-            members: {
-              createMany: {
-                data: team.members.map((member) => ({
-                  karigarId: member.karigarId,
-                  karigarName: member.karigar.name,
-                })),
-              },
-            },
+            members: { createMany: { data: members } },
           },
           select: { id: true },
         });
@@ -666,7 +712,9 @@ export const stitchingService = {
           metadata: {
             issueId: issue.id,
             lotId: lot.id,
-            teamId: team.id,
+            teamId: team?.id ?? null,
+            karigarId: solo?.id ?? null,
+            ratePending: input.rate === null,
             pieces: entry.lines.reduce((sum, line) => sum + line.quantity, 0),
           },
         });
@@ -738,6 +786,105 @@ export const stitchingService = {
   },
 
   /**
+   * Sets a pending rate, paying everything received so far as if it had been known all along,
+   * or changes a rate: pieces already paid get the difference posted on top (rate_changes).
+   * The issue's own split decides who gets what.
+   */
+  async setRate(actor: AuthContext, issueId: string, input: SetRateInput, meta: ClientMeta) {
+    await transaction(async (tx) => {
+      const issue = await lockIssue(tx, issueId);
+
+      if (issue.status === "REVERSED") throw errors.conflict(`${issueNumber(issue.number)} has been reversed.`);
+
+      const rate = input.rate.toFixed(2);
+
+      if (issue.rate === rate) throw fieldError("rate", `The rate is already Rs ${rate}.`);
+
+      const [receipts, resolutions, members] = await Promise.all([
+        tx.stitchingReceipt.findMany({
+          where: { issueId, status: "POSTED", good: { gt: 0 } },
+          select: { id: true, number: true, good: true, receiptDate: true },
+          orderBy: { number: "asc" },
+        }),
+        tx.reworkResolution.findMany({
+          where: { rework: { issueId }, recovered: { gt: 0 } },
+          select: { id: true, recovered: true, resolvedOn: true, rework: { select: { number: true } } },
+        }),
+        snapshotMembers(tx, issueId),
+      ]);
+      const paidPieces =
+        receipts.reduce((sum, receipt) => sum + receipt.good, 0) +
+        resolutions.reduce((sum, resolution) => sum + resolution.recovered, 0);
+
+      if (issue.rate === null) {
+        // Nothing was paid while the rate was blank: pay each receipt and recovered rework now.
+        const pay = async (
+          source: { type: "STITCHING" | "REWORK"; id: string; date: Date; pieces: number },
+          description: string,
+        ) => {
+          const split = splitEarning(BigInt(source.pieces) * toPaisa(rate), issue.split_method, members);
+
+          // SAFETY: the issue's own split over its own members; it succeeded when the issue was made.
+          if (!split.ok) throw errors.conflict(split.message);
+
+          await postEarning(tx, actor, {
+            sourceType: source.type,
+            sourceId: source.id,
+            lotId: issue.lot_id,
+            date: source.date,
+            pieces: source.pieces,
+            rate,
+            amounts: split.amounts,
+            description,
+          });
+        };
+
+        for (const receipt of receipts) {
+          await pay(
+            { type: "STITCHING", id: receipt.id, date: receipt.receiptDate, pieces: receipt.good },
+            receiptDescription(receipt.number, issue.lot_number, receipt.good),
+          );
+        }
+
+        for (const resolution of resolutions) {
+          await pay(
+            { type: "REWORK", id: resolution.id, date: resolution.resolvedOn, pieces: resolution.recovered },
+            reworkDescription(resolution.rework.number, issue.lot_number, resolution.recovered),
+          );
+        }
+      } else if (paidPieces > 0 && !input.reason) {
+        throw fieldError("reason", `Say why: pay already posted for ${pcs(paidPieces)} is adjusted.`);
+      }
+
+      await postRateDifference(tx, actor, {
+        sourceType: "STITCHING_ISSUE",
+        sourceId: issueId,
+        lotId: issue.lot_id,
+        oldRate: issue.rate,
+        newRate: rate,
+        pieces: paidPieces,
+        members,
+        method: issue.split_method,
+        costKind: "STITCHING_LABOUR",
+        label: `${issueNumber(issue.number)} · ${issue.lot_number}`,
+        reason: input.reason,
+      });
+      await tx.stitchingIssue.update({ where: { id: issueId }, data: { rate } });
+      // Receipts show what their pieces earn now.
+      await tx.$executeRaw`
+        UPDATE stitching_receipts SET earning = round(good * ${rate}::numeric, 2)
+        WHERE issue_id = ${issueId}::uuid AND status = 'POSTED'`;
+      await recordAudit(tx, {
+        type: "STITCHING_RATE_SET",
+        ...audit(actor, meta),
+        metadata: { issueId, oldRate: issue.rate, newRate: rate, paidPieces, reason: input.reason },
+      });
+    });
+
+    return this.getIssue(issueId, true);
+  },
+
+  /**
    * Receives stitched pieces back: Good + Rework + Reject per line, never more than
    * the team still holds. Good pieces are paid now; rework goes to the rework list.
    */
@@ -773,9 +920,14 @@ export const stitchingService = {
         }
       });
 
+      // Rate pending: pieces come back as usual; pay is posted when the rate is set, the issue's way.
+      if (issue.rate === null && input.split) {
+        throw fieldError("split", "Set the rate first to split the pay differently.");
+      }
+
       const members = await snapshotMembers(tx, issueId);
       const good = input.lines.reduce((sum, line) => sum + line.good, 0);
-      const total = BigInt(good) * toPaisa(issue.rate);
+      const total = issue.rate === null ? 0n : BigInt(good) * toPaisa(issue.rate);
       const split = receiptSplit(input.split, issue, members, total);
       const date = new Date(input.receiptDate);
 
@@ -834,16 +986,18 @@ export const stitchingService = {
         });
       }
 
-      await postEarning(tx, actor, {
-        sourceType: "STITCHING",
-        sourceId: receipt.id,
-        lotId: issue.lot_id,
-        date,
-        pieces: good,
-        rate: issue.rate,
-        amounts: split.amounts,
-        description: `Stitching ${receiptNumber(receipt.number)} · ${issue.lot_number} · ${pcs(good)} Good`,
-      });
+      if (issue.rate !== null) {
+        await postEarning(tx, actor, {
+          sourceType: "STITCHING",
+          sourceId: receipt.id,
+          lotId: issue.lot_id,
+          date,
+          pieces: good,
+          rate: issue.rate,
+          amounts: split.amounts,
+          description: receiptDescription(receipt.number, issue.lot_number, good),
+        });
+      }
 
       await recordAudit(tx, {
         type: "STITCHING_RECEIVED",
@@ -870,8 +1024,8 @@ export const stitchingService = {
     await transaction(async (tx) => {
       const issue = await lockIssue(tx, found.issueId);
 
-      const [receipt] = await tx.$queryRaw<{ number: number; status: string }[]>`
-        SELECT number, status FROM stitching_receipts WHERE id = ${receiptId}::uuid FOR UPDATE`;
+      const [receipt] = await tx.$queryRaw<{ number: number; status: string; good: number }[]>`
+        SELECT number, status, good FROM stitching_receipts WHERE id = ${receiptId}::uuid FOR UPDATE`;
 
       if (receipt!.status === "REVERSED")
         throw errors.conflict(`${receiptNumber(receipt!.number)} has already been reversed.`);
@@ -907,6 +1061,34 @@ export const stitchingService = {
         UPDATE stitching_issue_lines l SET received = l.received - v.received
         FROM (VALUES ${Prisma.join(values)}) AS v (id, received) WHERE l.id = v.id`;
       await tx.reworkItem.updateMany({ where: { receiptId }, data: { status: "CANCELLED" } });
+
+      // If the rate changed after this receipt was paid, its pieces carry the later difference too:
+      // take that back as well, so the pieces end at zero pay.
+      const paidAt = await tx.lotCost.findFirst({
+        where: { sourceId: receiptId, kind: "STITCHING_LABOUR", reversalOfId: null },
+        select: { rate: true },
+      });
+
+      if (issue.rate !== null && receipt!.good > 0) {
+        const paidRate = paidAt ? paidAt.rate.toFixed(2) : "0.00";
+
+        if (paidRate !== issue.rate) {
+          await postRateDifference(tx, actor, {
+            sourceType: "STITCHING_ISSUE",
+            sourceId: issue.id,
+            lotId: issue.lot_id,
+            oldRate: issue.rate,
+            newRate: paidRate,
+            pieces: receipt!.good,
+            members: await snapshotMembers(tx, issue.id),
+            method: issue.split_method,
+            costKind: "STITCHING_LABOUR",
+            label: `${issueNumber(issue.number)} · ${issue.lot_number}`,
+            reason: `${receiptNumber(receipt!.number)} reversed: ${reason}`.slice(0, 300),
+          });
+        }
+      }
+
       await reverseEarning(tx, actor, "STITCHING", receiptId, reason);
       await tx.stitchingReceipt.update({
         where: { id: receiptId },
@@ -1066,7 +1248,8 @@ export const stitchingService = {
 
       const date = new Date(input.resolvedOn);
       const members = await snapshotMembers(tx, found.issueId);
-      const total = BigInt(input.recovered) * toPaisa(issue.rate);
+      // Rate pending: paid when the rate is set.
+      const total = issue.rate === null ? 0n : BigInt(input.recovered) * toPaisa(issue.rate);
       const split = splitEarning(total, issue.split_method, members);
 
       if (!split.ok) throw fieldError("recovered", split.message);
@@ -1093,7 +1276,7 @@ export const stitchingService = {
         data: { recovered, failed, status: done ? (recovered > 0 ? "COMPLETED" : "FAILED") : "IN_PROGRESS" },
       });
 
-      if (input.recovered > 0) {
+      if (input.recovered > 0 && issue.rate !== null) {
         await postEarning(tx, actor, {
           sourceType: "REWORK",
           sourceId: resolution.id,
@@ -1102,7 +1285,7 @@ export const stitchingService = {
           pieces: input.recovered,
           rate: issue.rate,
           amounts: split.amounts,
-          description: `Rework ${reworkNumber(item!.number)} · ${issue.lot_number} · ${pcs(input.recovered)} recovered`,
+          description: reworkDescription(item!.number, issue.lot_number, input.recovered),
         });
       }
 

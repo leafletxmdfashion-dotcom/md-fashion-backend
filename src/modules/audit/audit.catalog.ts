@@ -62,6 +62,7 @@ export const AUDIT_EVENTS = {
   FABRIC_UPDATED: e("Fabric edited", "Fabric", "notice"),
   FABRIC_INWARD_POSTED: e("Fabric purchase recorded", "Fabric"),
   FABRIC_INWARD_REVERSED: e("Fabric purchase reversed", "Fabric", "warning"),
+  FABRIC_BILL_ADDED: e("Bill added to a fabric purchase", "Fabric", "notice"),
   FABRIC_STOCK_ADJUSTED: e("Fabric stock corrected", "Fabric", "warning"),
   KARIGAR_CREATED: e("Person added", "Teams & karigars"),
   KARIGAR_UPDATED: e("Person edited", "Teams & karigars", "notice"),
@@ -95,6 +96,9 @@ export const AUDIT_EVENTS = {
   DISPATCH_REVERSED: e("Dispatch reversed", "Godown", "warning"),
   GODOWN_ADJUSTED: e("Godown count corrected", "Godown", "warning"),
   LEDGER_ENTRY_POSTED: e("Payment or entry recorded", "Payments", "notice"),
+  MONEY_KIND_SAVED: e("Kind of money entry added or changed", "Payments", "info"),
+  STITCHING_RATE_SET: e("Stitching rate set or changed", "Stitching", "notice"),
+  PACKING_RATE_SET: e("Packing rate set or changed", "Packing", "notice"),
   LEDGER_ENTRY_REVERSED: e("Payment or entry reversed", "Payments", "warning"),
 } satisfies Record<AuditEventType, EventInfo>;
 

@@ -17,6 +17,7 @@ import {
   reworkListQuerySchema,
   reworkResolveSchema,
   reworkUpdateSchema,
+  setRateSchema,
   type IssueListQuery,
   type RejectListQuery,
   type ReworkListQuery,
@@ -96,6 +97,21 @@ export function stitchingRoutes(): Router {
     const issues = await stitchingService.issue(actorOf(req), issueSchema.parse(req.body), clientMeta(req));
 
     res.status(201).json({ success: true, data: { issues } });
+  }) satisfies RequestHandler);
+
+  // Sets a pending rate or changes one; a change after pay was posted adjusts that pay.
+  router.post("/issues/:id/rate", requirePermission("rates.manage"), requirePermission("costing.view"), (async (
+    req,
+    res,
+  ) => {
+    const issue = await stitchingService.setRate(
+      actorOf(req),
+      idOf(req),
+      setRateSchema.parse(req.body),
+      clientMeta(req),
+    );
+
+    res.json({ success: true, data: { issue } });
   }) satisfies RequestHandler);
 
   router.post("/issues/:id/reverse", requirePermission("stitching.reverse"), (async (req, res) => {

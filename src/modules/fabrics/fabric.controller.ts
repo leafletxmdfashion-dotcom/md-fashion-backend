@@ -4,6 +4,7 @@ import { errors } from "../../lib/errors";
 import { can, clientMeta } from "../../lib/request";
 import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
 import {
+  addBillSchema,
   adjustmentSchema,
   createInwardSchema,
   fabricListQuerySchema,
@@ -158,6 +159,16 @@ export const fabricController = {
   createInward: (async (req, res) => {
     const inward = await inwardService.create(actorOf(req), createInwardSchema.parse(req.body), clientMeta(req));
     res.status(201).json({ success: true, data: { inward: showCost(req) ? inward : hideInwardCost(inward) } });
+  }) satisfies RequestHandler,
+
+  addBill: (async (req, res) => {
+    const { inward, recostedBatches } = await inwardService.addBill(
+      actorOf(req),
+      idOf(req),
+      addBillSchema.parse(req.body),
+      clientMeta(req),
+    );
+    res.json({ success: true, data: { inward, recostedBatches } });
   }) satisfies RequestHandler,
 
   reverseInward: (async (req, res) => {

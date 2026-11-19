@@ -36,7 +36,13 @@ const quantity = z
   .max(999_999_999, "Quantity is too large.")
   .refine((value) => hasPlaces(value, 3), "Use at most 3 decimals for quantity.");
 
-const MAX_AMOUNT = 999_999_999_999.99;
+export const MAX_AMOUNT = 999_999_999_999.99;
+
+const rate = z
+  .number({ error: "Enter a rate." })
+  .min(0, "Rate cannot be negative.")
+  .max(99_999_999, "Rate is too large.")
+  .refine((value) => hasPlaces(value, 2), "Use at most 2 decimals for rate.");
 
 // Inner spaces are collapsed so "Cotton  Jersey" is the same fabric as "Cotton Jersey".
 const fabricName = z
@@ -51,31 +57,46 @@ const fabricName = z
  * its reorder level and description are updated when sent; a new name creates the
  * fabric with a generated code.
  */
-export const createInwardSchema = z.strictObject({
-  fabricName,
-  unit: z.enum(FABRIC_UNITS, { error: "Choose a unit." }),
-  // Left out: an existing fabric keeps its own. Null clears it.
-  lowStockThreshold: z.number().min(0, "Reorder level cannot be negative.").max(999_999_999).nullish(),
-  description: z
-    .string()
-    .trim()
-    .max(500, "Keep this under 500 characters.")
-    .nullish()
-    .transform((value) => (value === undefined ? undefined : value || null)),
-  inwardDate: businessDate,
-  quantity,
-  rate: z
-    .number({ error: "Enter a rate." })
-    .min(0, "Rate cannot be negative.")
-    .max(99_999_999, "Rate is too large.")
-    .refine((value) => hasPlaces(value, 2), "Use at most 2 decimals for rate."),
+export const createInwardSchema = z
+  .strictObject({
+    fabricName,
+    unit: z.enum(FABRIC_UNITS, { error: "Choose a unit." }),
+    // Left out: an existing fabric keeps its own. Null clears it.
+    lowStockThreshold: z.number().min(0, "Reorder level cannot be negative.").max(999_999_999).nullish(),
+    description: z
+      .string()
+      .trim()
+      .max(500, "Keep this under 500 characters.")
+      .nullish()
+      .transform((value) => (value === undefined ? undefined : value || null)),
+    inwardDate: businessDate,
+    quantity,
+    /** True when the fabric came before its bill: no rate yet, added later with Add bill. */
+    billPending: z.boolean().default(false),
+    rate: rate.nullish().transform((value) => value ?? null),
+    supplier: optionalText(100),
+    invoiceRef: optionalText(50),
+    notes: optionalText(500),
+  })
+  .superRefine((input, ctx) => {
+    if (input.billPending && input.rate !== null) {
+      ctx.addIssue({ code: "custom", path: ["rate"], message: "Leave the rate for when the bill comes." });
+    } else if (!input.billPending && input.rate === null) {
+      ctx.addIssue({ code: "custom", path: ["rate"], message: "Enter a rate, or mark the bill as not received yet." });
+    } else if (input.rate !== null && input.quantity * input.rate > MAX_AMOUNT) {
+      ctx.addIssue({ code: "custom", path: ["rate"], message: "Amount (quantity × rate) is too large." });
+    }
+  });
+
+/** The bill of a purchase that came before it: the rate, and supplier and invoice if not typed yet. */
+export const addBillSchema = z.strictObject({
+  rate,
   supplier: optionalText(100),
   invoiceRef: optionalText(50),
   notes: optionalText(500),
-}).refine((input) => input.quantity * input.rate <= MAX_AMOUNT, {
-  path: ["rate"],
-  message: "Amount (quantity × rate) is too large.",
 });
+
+export type AddBillInput = z.infer<typeof addBillSchema>;
 
 /** Fixing a fabric's details. The code is generated and never edited. */
 export const updateFabricSchema = z.strictObject({
@@ -112,6 +133,8 @@ export const fabricListQuerySchema = z.object({
 export const inwardListQuerySchema = z.object({
   ...search,
   fabricId: z.uuid().optional(),
+  /** PENDING = fabric received, bill not added yet. */
+  billStatus: z.enum(["PENDING", "BILLED"]).optional(),
   ...columnQueryFields(INWARD_COLUMNS),
   ...page,
 });

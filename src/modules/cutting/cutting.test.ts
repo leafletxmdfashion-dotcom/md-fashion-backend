@@ -176,7 +176,7 @@ describe("definition of done: one Thaan from new production to finalized cutting
 
     expect(posted.status).toBe("FINALIZED");
     expect(posted.posted).toMatchObject({ consumedKg: "29.82", wastageKg: "0.68", pala: 14, acceptedPieces: 56 });
-    expect(posted.costs).toEqual({ fabricCost: "15250", earningAmount: "140" });
+    expect(posted.costs).toEqual({ fabricCost: "15250", earningAmount: "140", provisional: false });
     expect(posted.outputs.map((o) => [o.sizeLabel, o.planned, o.available])).toEqual([
       ["S", 14, 14],
       ["M", 28, 28],
@@ -264,7 +264,9 @@ describe("one request per action", () => {
       action: "issue",
     });
     expect(tooMuch.status).toBe(400);
-    expect((await sql("SELECT count(*)::int AS n FROM production_lots WHERE lot_number = 'L-TOO-MUCH'")).rows[0].n).toBe(0);
+    expect(
+      (await sql("SELECT count(*)::int AS n FROM production_lots WHERE lot_number = 'L-TOO-MUCH'")).rows[0].n,
+    ).toBe(0);
   });
 
   it("saves edits and issues or finalizes them in the same request", async () => {
@@ -281,7 +283,11 @@ describe("one request per action", () => {
     const colour = issued.body.data.batch.colours[0];
     const finalized = await owner.send("post", `/api/v1/cutting-batches/${batch.id}/finalize`, {
       cutting: draft(masterId, [
-        { id: colour.id, name: "Black", rolls: [{ id: colour.rolls[0].id, thaan: colour.rolls[0].thaan, issuedKg: "10", returnedKg: "1" }] },
+        {
+          id: colour.id,
+          name: "Black",
+          rolls: [{ id: colour.rolls[0].id, thaan: colour.rolls[0].thaan, issuedKg: "10", returnedKg: "1" }],
+        },
       ]),
     });
     expect(finalized.status).toBe(201);
@@ -650,13 +656,20 @@ describe("lots and articles", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.data.batch.lot.fabric.unit).toBe("METER");
-    expect(res.body.data.batch.posted).toMatchObject({ consumedKg: "28.8", wastageKg: "1.2", pala: 4, acceptedPieces: 16 });
+    expect(res.body.data.batch.posted).toMatchObject({
+      consumedKg: "28.8",
+      wastageKg: "1.2",
+      pala: 4,
+      acceptedPieces: 16,
+    });
     expect(await balanceOf(owner, metreId)).toBe(70);
     expect((await sql("SELECT DISTINCT unit FROM cutting_movements WHERE batch_id = $1", [batch.id])).rows).toEqual([
       { unit: "METER" },
     ]);
 
-    const reversed = await owner.send("post", `/api/v1/cutting-batches/${batch.id}/reverse`, { reason: "Wrong marker" });
+    const reversed = await owner.send("post", `/api/v1/cutting-batches/${batch.id}/reverse`, {
+      reason: "Wrong marker",
+    });
 
     expect(reversed.status).toBe(201);
     expect((await sql("SELECT DISTINCT unit FROM cutting_movements WHERE batch_id = $1", [batch.id])).rows).toEqual([
@@ -753,7 +766,7 @@ describe("permissions", () => {
     expect((await staff.get("/api/v1/karigars?earnedMin=1")).status).toBe(403);
   });
 
-  it("shows a karigar manager pay rates but not earnings, which need costing.view", async () => {
+  it("hides pay rates and earnings from a karigar manager without See prices & costs", async () => {
     const { owner, fabricId, masterId } = await setup();
     const { batch } = await newProduction(owner, fabricId, draft(masterId, [black("30.500")]));
     await owner.send("post", `/api/v1/cutting-batches/${batch.id}/finalize`);
@@ -762,13 +775,13 @@ describe("permissions", () => {
 
     expect((await owner.get(`/api/v1/karigars/${masterId}`)).body.data.karigar.earned).toBeGreaterThan(0);
     const list = (await supervisor.get("/api/v1/karigars")).body.data.karigars;
-    expect(list[0]).toMatchObject({ name: "Ram Bahadur", payRate: 2.5, earned: null });
+    expect(list[0]).toMatchObject({ name: "Ram Bahadur", payRate: null, earned: null });
     expect((await supervisor.get(`/api/v1/karigars/${masterId}`)).body.data.karigar).toMatchObject({
-      payRate: 2.5,
+      payRate: null,
       earned: null,
     });
     expect((await supervisor.get("/api/v1/karigars?earnedMin=1")).status).toBe(403);
-    expect((await supervisor.get("/api/v1/karigars?payRateMin=1")).status).toBe(200);
+    expect((await supervisor.get("/api/v1/karigars?payRateMin=1")).status).toBe(403);
 
     const edited = await supervisor.send("put", `/api/v1/karigars/${masterId}`, {
       name: "Ram Bahadur",
@@ -776,6 +789,9 @@ describe("permissions", () => {
       payMode: "PER_PIECE",
       payRate: 3,
     });
-    expect(edited.body.data.karigar).toMatchObject({ payRate: 3, earned: null });
+    // A rate from someone who may not see rates is ignored: the person keeps theirs.
+    expect(edited.status, JSON.stringify(edited.body)).toBe(200);
+    expect(edited.body.data.karigar).toMatchObject({ payRate: null, earned: null });
+    expect((await owner.get(`/api/v1/karigars/${masterId}`)).body.data.karigar.payRate).toBe(2.5);
   });
 });

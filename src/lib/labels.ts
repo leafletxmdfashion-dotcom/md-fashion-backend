@@ -17,10 +17,14 @@ export const REWORK_STATUS_LABEL: Record<string, string> = {
 };
 
 export const CATEGORY_LABEL: Record<string, string> = {
-  CUTTING_MASTER: "Cutting master",
-  TAILOR: "Tailor",
-  HELPER: "Helper",
-  PACKER: "Packer",
+  KARIGAR: "Karigar",
+  CUTTING_MASTER: "Cutting Master",
+  STITCHING_SUPERVISOR: "Stitching Supervisor",
+  PACKING_STAFF: "Packing Staff",
+  GODOWN_STAFF: "Godown Staff",
+  STORE_KEEPER: "Store Keeper",
+  MANAGER: "Production Manager",
+  ACCOUNTANT: "Accountant",
   STAFF: "Staff",
   OTHER: "Other",
 };

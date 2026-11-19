@@ -4,7 +4,9 @@ import { prisma, warmUp } from "./db/prisma";
 import { logger } from "./lib/logger";
 
 const server = createApp().listen(env.PORT, () => {
-  logger.info({ port: env.PORT, env: env.NODE_ENV }, "API listening");
+  const db = new URL(env.DATABASE_URL);
+  // Always visible which database is live: local dev must never write to production.
+  logger.info({ port: env.PORT, env: env.NODE_ENV, db: `${db.hostname}${db.pathname}` }, "API listening");
   warmUp().catch((error: unknown) => logger.warn({ err: error }, "database warm-up failed"));
 });
 

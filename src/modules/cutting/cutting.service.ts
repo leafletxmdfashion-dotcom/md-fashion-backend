@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { prisma, Prisma, transaction } from "../../db/prisma";
 import { factoryToday } from "../../lib/business-date";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
@@ -100,9 +102,13 @@ async function lockBatch(tx: Tx, batchId: string): Promise<{ lot: LockedLot; bat
  * latest balance instead of the one from before the other issue committed.
  */
 async function lockFabric(tx: Tx, fabricId: string) {
-  const [fabric] = await tx.$queryRaw<{ name: string; unit: string; balance: string; rate: string | null }[]>`
+  const [fabric] = await tx.$queryRaw<
+    { name: string; unit: string; balance: string; rate: string | null; pending_bills: number }[]
+  >`
     SELECT f.name, f.unit, s.balance::text AS balance,
-           round(s.purchased_amount / nullif(s.purchased_qty, 0), 4)::text AS rate
+           round(s.purchased_amount / nullif(s.purchased_qty, 0), 4)::text AS rate,
+           (SELECT count(*) FROM fabric_inwards i
+            WHERE i.fabric_id = f.id AND i.bill_status = 'PENDING' AND i.reversed_at IS NULL)::int AS pending_bills
     FROM fabrics f JOIN fabric_stock s ON s.fabric_id = f.id
     WHERE f.id = ${fabricId}::uuid FOR UPDATE OF f, s`;
 
@@ -169,12 +175,12 @@ async function issueRolls(
   actor: AuthContext,
   lot: LockedLot,
   batch: BatchRecord,
-): Promise<{ count: number; rate: string | null }> {
+): Promise<{ count: number; rate: string | null; provisional: boolean }> {
   const pending = batch.colours.flatMap((colour) =>
     colour.rolls.flatMap((roll) => (roll.status === "DRAFT" ? [{ roll, colour }] : [])),
   );
 
-  if (pending.length === 0) return { count: 0, rate: null };
+  if (pending.length === 0) return { count: 0, rate: null, provisional: false };
 
   const fabric = await lockFabric(tx, lot.fabric_id);
 
@@ -188,6 +194,7 @@ async function issueRolls(
   }
 
   const reference = `${cutNumber(batch.number)} · ${lot.lot_number}`;
+  const rateProvisional = fabric.rate === null || fabric.pending_bills > 0;
 
   // Bulk writes: three statements however many Thaan are issued.
   await tx.fabricMovement.createMany({
@@ -220,14 +227,15 @@ async function issueRolls(
   });
   await tx.cuttingRoll.updateMany({
     where: { id: { in: pending.map(({ roll }) => roll.id) } },
-    data: { status: "ISSUED", issuedAt: new Date(), fabricRate: fabric.rate },
+    // A purchase still waiting for its bill makes the average rate (billed purchases only) provisional.
+    data: { status: "ISSUED", issuedAt: new Date(), fabricRate: fabric.rate, rateProvisional },
   });
 
   await tx.cuttingBatch.update({ where: { id: batch.id }, data: { status: "ISSUED" } });
 
   if (lot.status === "DRAFT") await tx.productionLot.update({ where: { id: lot.id }, data: { status: "ACTIVE" } });
 
-  return { count: pending.length, rate: fabric.rate };
+  return { count: pending.length, rate: fabric.rate, provisional: rateProvisional };
 }
 
 function serializeTotals(totals: Totals) {
@@ -356,7 +364,15 @@ function toBatchDto(batch: BatchRecord, showCost: boolean) {
           finalizedBy: batch.finalizedBy?.name ?? null,
         }
       : null,
-    costs: posted && showCost ? { fabricCost: dec(batch.fabricCost), earningAmount: dec(batch.earningAmount) } : null,
+    costs:
+      posted && showCost
+        ? {
+            fabricCost: dec(batch.fabricCost),
+            earningAmount: dec(batch.earningAmount),
+            // A fabric bill was pending: re-costed when it is added.
+            provisional: batch.costProvisional,
+          }
+        : null,
     outputs: batch.outputs.map((output) => ({
       colourName: output.colourName,
       sizeLabel: output.sizeLabel,
@@ -964,6 +980,8 @@ async function finalizeLocked(
     where: { id },
     data: {
       status: "FINALIZED",
+      costProvisional:
+        issued.provisional || batch.colours.some((colour) => colour.rolls.some((roll) => roll.rateProvisional)),
       calculationVersion: CALCULATION_VERSION,
       calculatedPalaKg: result.marker.calculatedPalaKg === null ? null : kg(result.marker.calculatedPalaKg),
       activePalaKg: kg(result.marker.activePalaKg!),
@@ -1195,7 +1213,8 @@ export const cuttingService = {
 
       await tx.cuttingRoll.updateMany({ where: { batchId: id }, data: { status: "REVERSED" } });
 
-      const costs = await tx.lotCost.findMany({ where: { batchId: id, reversalOfId: null } });
+      // Live costs only: a cost already re-priced (after a fabric bill) has its reversal and its replacement.
+      const costs = await tx.lotCost.findMany({ where: { batchId: id, reversalOfId: null, reversedBy: { is: null } } });
 
       await tx.lotCost.createMany({
         data: costs.map((cost) => ({
@@ -1249,3 +1268,97 @@ export const cuttingService = {
     return batchDto(id, showCost);
   },
 };
+
+/**
+ * Re-prices the fabric cost of cutting done while a purchase of this fabric was waiting for its
+ * bill, once no bill is pending any more: each such batch's fabric cost is reversed and posted
+ * again at the fabric's average rate over billed purchases. Lot costs stay append-only.
+ * Returns the batches re-costed. Called with the fabric locked (Add bill).
+ */
+export async function recostProvisionalCutting(tx: Tx, actor: AuthContext, fabricId: string): Promise<string[]> {
+  const [state] = await tx.$queryRaw<{ pending: number; rate: string | null }[]>`
+    SELECT (SELECT count(*) FROM fabric_inwards
+            WHERE fabric_id = ${fabricId}::uuid AND bill_status = 'PENDING' AND reversed_at IS NULL)::int AS pending,
+           round(s.purchased_amount / nullif(s.purchased_qty, 0), 4)::text AS rate
+    FROM fabric_stock s WHERE s.fabric_id = ${fabricId}::uuid`;
+
+  // Still a bill to come (or nothing billed at all): the cost stays provisional until then.
+  if (!state || state.pending > 0 || state.rate === null) return [];
+
+  const rate = state.rate;
+  const batches = await tx.$queryRaw<{ id: string; lot_id: string }[]>`
+    SELECT b.id, b.lot_id FROM cutting_batches b JOIN production_lots l ON l.id = b.lot_id
+    WHERE l.fabric_id = ${fabricId}::uuid AND b.cost_provisional AND b.status = 'FINALIZED'
+    ORDER BY b.number FOR UPDATE OF b`;
+  const date = today();
+
+  for (const batch of batches) {
+    const rolls = await tx.cuttingRoll.findMany({
+      where: { batchId: batch.id, status: "FINALIZED" },
+      select: { consumedKg: true, wastageKg: true },
+    });
+    const totals = rolls.reduce(
+      (sum, roll) => ({
+        consumed: sum.consumed + (parseScaled(roll.consumedKg?.toFixed() ?? "0", 6) ?? 0n),
+        wastage: sum.wastage + (parseScaled(roll.wastageKg?.toFixed() ?? "0", 6) ?? 0n),
+      }),
+      { consumed: 0n, wastage: 0n },
+    );
+    const { consumed, wastage } = fabricCosts([{ consumedKg: totals.consumed, wastageKg: totals.wastage, rate }]);
+    const live = await tx.lotCost.findMany({
+      where: {
+        batchId: batch.id,
+        kind: { in: ["FABRIC_CONSUMED", "FABRIC_WASTAGE"] },
+        reversalOfId: null,
+        reversedBy: { is: null },
+      },
+    });
+
+    if (live.length > 0) {
+      await tx.lotCost.createMany({
+        data: live.map((cost) => ({
+          lotId: cost.lotId,
+          batchId: batch.id,
+          sourceId: cost.sourceId,
+          kind: cost.kind,
+          entryDate: date,
+          quantity: cost.quantity.negated(),
+          rate: cost.rate,
+          amount: cost.amount.negated(),
+          reversalOfId: cost.id,
+          createdById: actor.user.id,
+        })),
+      });
+    }
+
+    // Fresh source ids: the (source, kind) of a live cost is unique, and the replaced rows keep theirs.
+    const priced = [
+      { kind: "FABRIC_CONSUMED", quantity: totals.consumed, paisa: consumed },
+      { kind: "FABRIC_WASTAGE", quantity: totals.wastage, paisa: wastage },
+    ].filter((cost) => cost.quantity > 0n);
+
+    await tx.lotCost.createMany({
+      data: priced.map((cost) => ({
+        lotId: batch.lot_id,
+        batchId: batch.id,
+        sourceId: randomUUID(),
+        kind: cost.kind,
+        entryDate: date,
+        quantity: kg(cost.quantity),
+        rate: ratePerKg(cost.paisa, cost.quantity),
+        amount: toDecimal(cost.paisa, 2),
+        createdById: actor.user.id,
+      })),
+    });
+    await tx.cuttingRoll.updateMany({
+      where: { batchId: batch.id },
+      data: { fabricRate: rate, rateProvisional: false },
+    });
+    await tx.cuttingBatch.update({
+      where: { id: batch.id },
+      data: { costProvisional: false, fabricCost: toDecimal(consumed + wastage, 2) },
+    });
+  }
+
+  return batches.map((batch) => batch.id);
+}

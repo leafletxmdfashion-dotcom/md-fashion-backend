@@ -106,7 +106,7 @@ export const dashboardService = {
       can(key as Permission),
     );
 
-    const [current, before, pipeline, rejects, jogadi, packing, items, fabric, costs, payments, recent] =
+    const [current, before, pipeline, rejects, jogadi, packing, items, fabric, costs, payments, recent, waiting] =
       await Promise.all([
         production ? dailyFlows(range) : [],
         production ? dailyFlows(previous) : [],
@@ -119,11 +119,16 @@ export const dashboardService = {
         can("costing.view") ? this.costs(range, previous) : null,
         can("payments.view") ? this.payments(range) : null,
         can("audit.view") ? this.recent() : null,
+        production || can("fabric.view")
+          ? this.waiting({ stitching: can("stitching.view"), packing: can("packing.view"), fabric: can("fabric.view") })
+          : null,
       ]);
 
     return {
       range: { ...range, days, bucket: week ? ("week" as const) : ("day" as const), previous },
-      flow: production ? { totals: totals(current), previous: totals(before), series: toSeries(current, range, week) } : null,
+      flow: production
+        ? { totals: totals(current), previous: totals(before), series: toSeries(current, range, week) }
+        : null,
       pipeline,
       rejects,
       teams: jogadi || packing ? { jogadi, packing } : null,
@@ -132,6 +137,7 @@ export const dashboardService = {
       costs,
       payments,
       recent,
+      waiting,
     };
   },
 
@@ -169,13 +175,46 @@ export const dashboardService = {
     return { rejected: row!.rejected, sentToRework: row!.rework };
   },
 
-  /** Good pieces received from each Jogadi in the range, busiest first. */
+  /**
+   * Work waiting for a price: stitching issues and packing entries whose rate is still to be set,
+   * and fabric received before its bill. Counts only (no money), each behind its own view right.
+   */
+  async waiting(show: { stitching: boolean; packing: boolean; fabric: boolean }) {
+    const [row] = await prisma.$queryRaw<
+      {
+        issues: number;
+        issue_pieces: number;
+        entries: number;
+        entry_pieces: number;
+        bills: number;
+        oldest: string | null;
+      }[]
+    >`
+        SELECT
+          (SELECT count(*)::int FROM stitching_issues WHERE rate IS NULL AND status = 'POSTED') AS issues,
+          (SELECT COALESCE(sum(r.good), 0)::int FROM stitching_receipts r JOIN stitching_issues i ON i.id = r.issue_id
+            WHERE i.rate IS NULL AND i.status = 'POSTED' AND r.status = 'POSTED') AS issue_pieces,
+          (SELECT count(*)::int FROM packing_entries WHERE rate IS NULL AND status = 'POSTED') AS entries,
+          (SELECT COALESCE(sum(pieces), 0)::int FROM packing_entries WHERE rate IS NULL AND status = 'POSTED') AS entry_pieces,
+          (SELECT count(*)::int FROM fabric_inwards WHERE bill_status = 'PENDING' AND reversed_at IS NULL) AS bills,
+          (SELECT min(inward_date)::text FROM fabric_inwards WHERE bill_status = 'PENDING' AND reversed_at IS NULL) AS oldest`;
+
+    return {
+      /** Issues with no rate, and Good pieces received on them so far (unpaid). */
+      stitchingRates: show.stitching ? { issues: row!.issues, pieces: row!.issue_pieces } : null,
+      packingRates: show.packing ? { entries: row!.entries, pieces: row!.entry_pieces } : null,
+      /** Purchases received before their bill; oldest = the longest waiting one's date. */
+      fabricBills: show.fabric ? { purchases: row!.bills, oldest: row!.oldest } : null,
+    };
+  },
+
+  /** Good pieces received from each Jogadi (team or one karigar) in the range, busiest first. */
   jogadiOutput(range: Range) {
     return prisma.$queryRaw<{ id: string; name: string; pieces: number }[]>`
-      SELECT i.team_id AS id, max(i.team_name) AS name, sum(r.good)::int AS pieces
+      SELECT COALESCE(i.team_id, i.karigar_id) AS id, max(i.team_name) AS name, sum(r.good)::int AS pieces
       FROM stitching_receipts r JOIN stitching_issues i ON i.id = r.issue_id
       WHERE r.status = 'POSTED' AND r.receipt_date BETWEEN ${range.from}::date AND ${range.to}::date
-      GROUP BY i.team_id HAVING sum(r.good) > 0 ORDER BY 3 DESC, 2 LIMIT 6`;
+      GROUP BY 1 HAVING sum(r.good) > 0 ORDER BY 3 DESC, 2 LIMIT 6`;
   },
 
   /** Pieces each packing team (or, before teams, each person) packed in the range. */

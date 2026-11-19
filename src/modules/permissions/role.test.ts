@@ -51,7 +51,8 @@ describe("roles and permissions", () => {
       ]),
     );
     expect(roles.find((role) => role.key === "CUTTING_MASTER")!.permissions).not.toContain("cutting.finalize");
-    expect(roles.find((role) => role.key === "ACCOUNTANT")!.permissions).toContain("costing.view");
+    // Prices are sensitive: only Owner and Admin see them by default.
+    expect(roles.find((role) => role.key === "ACCOUNTANT")!.permissions).not.toContain("costing.view");
     expect(roles.find((role) => role.key === "STORE_KEEPER")!.permissions).toEqual(
       expect.arrayContaining(["fabric.view", "fabric.inward"]),
     );
@@ -171,7 +172,7 @@ describe("roles and permissions", () => {
       (role) => role.key === "STAFF",
     )!;
 
-    // MANAGER holds costing.view; the admin may change MANAGER's other rights but not that one.
+    // The admin no longer holds costing.view, so cannot give it to MANAGER either.
     const manager = ((await owner.get("/api/v1/roles")).body.data.roles as Role[]).find(
       (role) => role.key === "MANAGER",
     )!;
@@ -179,7 +180,7 @@ describe("roles and permissions", () => {
     expect(
       (
         await admin.send("put", "/api/v1/roles/MANAGER", {
-          permissions: manager.permissions.filter((p) => p !== "costing.view"),
+          permissions: [...manager.permissions, "costing.view"],
         })
       ).status,
     ).toBe(403);

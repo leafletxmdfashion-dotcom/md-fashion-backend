@@ -16,11 +16,18 @@ import { karigarService, type PayVisibility } from "./karigar.service";
 
 const idOf = (req: Request) => z.object({ id: z.uuid() }).parse(req.params).id;
 
-// Rates are needed to set a karigar up; lifetime earnings are payroll data.
+// Pay rates and lifetime earnings are prices: only with See prices & costs.
 const payOf = (req: Request): PayVisibility => ({
-  rate: can(req, "costing.view") || can(req, "karigar.manage"),
+  rate: can(req, "costing.view"),
   earned: can(req, "costing.view"),
 });
+
+/** The person as typed; a rate from someone who may not see rates is ignored (the current one stays). */
+const personOf = (req: Request) => {
+  const { payRate, ...rest } = karigarSchema.parse(req.body);
+
+  return can(req, "costing.view") && payRate !== undefined ? { ...rest, payRate } : rest;
+};
 
 export function karigarRoutes(): Router {
   const router = Router();
@@ -80,20 +87,14 @@ export function karigarRoutes(): Router {
   }) satisfies RequestHandler);
 
   router.post("/", manage, (async (req, res) => {
-    const saved = await karigarService.create(actorOf(req), karigarSchema.parse(req.body), clientMeta(req), payOf(req));
+    const saved = await karigarService.create(actorOf(req), personOf(req), clientMeta(req), payOf(req));
 
     res.setHeader("Cache-Control", "no-store");
     res.status(201).json({ success: true, data: saved });
   }) satisfies RequestHandler);
 
   router.put("/:id", manage, (async (req, res) => {
-    const saved = await karigarService.update(
-      actorOf(req),
-      idOf(req),
-      karigarSchema.parse(req.body),
-      clientMeta(req),
-      payOf(req),
-    );
+    const saved = await karigarService.update(actorOf(req), idOf(req), personOf(req), clientMeta(req), payOf(req));
 
     res.setHeader("Cache-Control", "no-store");
     res.json({ success: true, data: saved });

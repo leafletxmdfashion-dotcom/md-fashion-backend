@@ -1,15 +1,18 @@
 import { isUniqueViolation, prisma, transaction, type Db } from "../../db/prisma";
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
+import { recostProvisionalCutting } from "../cutting/cutting.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
 import { fabricRepository, inwardRepository, type FabricDto, type InwardDto } from "./fabric.repository";
-import type {
-  AdjustmentInput,
-  CreateInwardInput,
-  FabricListQuery,
-  InwardListQuery,
-  MovementListQuery,
-  UpdateFabricInput,
+import {
+  MAX_AMOUNT,
+  type AddBillInput,
+  type AdjustmentInput,
+  type CreateInwardInput,
+  type FabricListQuery,
+  type InwardListQuery,
+  type MovementListQuery,
+  type UpdateFabricInput,
 } from "./fabric.schema";
 
 function fieldError(field: string, message: string): AppError {
@@ -166,6 +169,38 @@ export const inwardService = {
         metadata: { inwardId: id, fabricId, quantity: input.quantity, rate: input.rate },
       });
       return (await inwardRepository.findById(tx, id))!;
+    });
+  },
+
+  /**
+   * Adds the bill to fabric that came before it: the purchase gets its rate (and supplier and
+   * invoice), starts counting towards the average rate, and once no bill of this fabric is pending,
+   * cutting done meanwhile is re-costed at the real rate. One-time: corrections reverse and re-enter.
+   */
+  async addBill(actor: AuthContext, id: string, input: AddBillInput, meta: ClientMeta) {
+    return transaction(async (tx) => {
+      const inward = await inwardRepository.findById(tx, id, true);
+      if (!inward) throw errors.notFound("Purchase");
+      if (inward.reversal) throw errors.conflict("This purchase has been reversed.");
+      if (inward.billStatus === "BILLED") {
+        throw errors.conflict("This purchase already has its bill. To correct it, reverse it and enter it again.");
+      }
+      if (inward.quantity * input.rate > MAX_AMOUNT) {
+        throw new AppError(400, ErrorCode.VALIDATION_ERROR, "Amount (quantity × rate) is too large.", {
+          rate: ["Amount (quantity × rate) is too large."],
+        });
+      }
+
+      // Same lock as cutting takes: a cutting cannot be costed half before, half after the bill.
+      await fabricRepository.lock(tx, inward.fabric.id);
+      await inwardRepository.addBill(tx, id, input, actor.user.id, inward);
+      const recosted = await recostProvisionalCutting(tx, actor, inward.fabric.id);
+      await recordAudit(tx, {
+        type: "FABRIC_BILL_ADDED",
+        ...audit(actor, meta),
+        metadata: { inwardId: id, fabricId: inward.fabric.id, rate: input.rate, recostedBatches: recosted.length },
+      });
+      return { inward: (await inwardRepository.findById(tx, id))!, recostedBatches: recosted.length };
     });
   },
 

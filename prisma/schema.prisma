@@ -92,9 +92,11 @@ model User {
   fabricsCreated       Fabric[]
   inwardsCreated       FabricInward[]           @relation("InwardCreatedBy")
   inwardsReversed      FabricInward[]           @relation("InwardReversedBy")
+  inwardsBilled        FabricInward[]           @relation("InwardBilledBy")
   movementsCreated     FabricMovement[]
   karigarsCreated      Karigar[]
   karigarEntries       KarigarLedgerEntry[]
+  moneyEntryKinds      MoneyEntryKind[]
   articlesCreated      Article[]
   lotsCreated          ProductionLot[]
   batchesCreated       CuttingBatch[]           @relation("BatchCreatedBy")
@@ -104,6 +106,7 @@ model User {
   lotCosts             LotCost[]
   jogadiTeamsCreated   JogadiTeam[]
   stitchingIssues      StitchingIssue[]         @relation("IssueCreatedBy")
+  rateChanges          RateChange[]
   stitchingIssuesRev   StitchingIssue[]         @relation("IssueReversedBy")
   stitchingReceipts    StitchingReceipt[]       @relation("ReceiptCreatedBy")
   stitchingReceiptsRev StitchingReceipt[]       @relation("ReceiptReversedBy")
@@ -242,7 +245,8 @@ model FabricInward {
   fabricId       String           @map("fabric_id") @db.Uuid
   inwardDate     DateTime         @map("inward_date") @db.Date
   quantity       Decimal          @db.Decimal(12, 3)
-  rate           Decimal          @db.Decimal(12, 2)
+  /// Null while the bill is pending (bill_status PENDING, CHECK constraint).
+  rate           Decimal?         @db.Decimal(12, 2)
   /// Generated: round(quantity * rate, 2).
   amount         Decimal?         @default(dbgenerated("round((quantity * rate), 2)")) @db.Decimal(14, 2)
   supplier       String?
@@ -253,15 +257,21 @@ model FabricInward {
   reversedAt     DateTime?        @map("reversed_at") @db.Timestamptz(6)
   reversedById   String?          @map("reversed_by") @db.Uuid
   reversalReason String?          @map("reversal_reason")
+  /// PENDING: fabric received, bill not yet; BILLED: priced (CHECK constraint).
+  billStatus     String           @default("BILLED") @map("bill_status")
+  billedAt       DateTime?        @map("billed_at") @db.Timestamptz(6)
+  billedById     String?          @map("billed_by") @db.Uuid
   /// Generated: lower(supplier, invoice), trigram-indexed for search.
   searchText     String?          @default(dbgenerated("lower(((COALESCE(supplier, ''::text) || ' '::text) || COALESCE(invoice_ref, ''::text)))")) @map("search_text")
   fabric         Fabric           @relation(fields: [fabricId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   createdBy      User             @relation("InwardCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversedBy     User?            @relation("InwardReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  billedBy       User?            @relation("InwardBilledBy", fields: [billedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   movements      FabricMovement[]
 
   @@index([inwardDate(sort: Desc), number(sort: Desc)], map: "fabric_inwards_date_idx")
   @@index([fabricId, inwardDate(sort: Desc)], map: "fabric_inwards_fabric_idx")
+  @@index([fabricId], map: "fabric_inwards_pending_idx", where: raw("((bill_status = 'PENDING'::text) AND (reversed_at IS NULL))"))
   @@index([searchText(ops: raw("gin_trgm_ops"))], map: "fabric_inwards_search_idx", type: Gin)
   @@map("fabric_inwards")
 }
@@ -301,7 +311,7 @@ model Karigar {
   number            Int                    @unique @default(autoincrement())
   name              String
   phone             String?
-  /// CUTTING_MASTER | TAILOR | HELPER | PACKER | STAFF | OTHER (CHECK constraint)
+  /// See KARIGAR_CATEGORIES in karigar.schema.ts (CHECK constraint)
   category          String
   /// PER_PIECE | PER_PALA | PER_KG | FIXED_JOB | SALARY (CHECK constraint)
   payMode           String                 @map("pay_mode")
@@ -318,6 +328,7 @@ model Karigar {
   batches           CuttingBatch[]
   jogadiMemberships JogadiMember[]
   issueMemberships  StitchingIssueMember[]
+  soloIssues        StitchingIssue[]
   reworkAssigned    ReworkItem[]
   packingEntries    PackingEntry[]
   packingMembers    PackingEntryMember[]
@@ -331,20 +342,20 @@ model Karigar {
 
 /// Person ledger. Append-only (trigger); one earning per source document, reversed by a negative row.
 model KarigarLedgerEntry {
-  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  seq         BigInt   @unique @default(autoincrement())
-  karigarId   String   @map("karigar_id") @db.Uuid
-  entryDate   DateTime @map("entry_date") @db.Date
-  /// EARNING | EARNING_REVERSAL | PAYMENT | ADVANCE | EXPENSE | CREDIT | RECOVERY | ENTRY_REVERSAL (CHECK constraint)
+  id          String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  seq         BigInt          @unique @default(autoincrement())
+  karigarId   String          @map("karigar_id") @db.Uuid
+  entryDate   DateTime        @map("entry_date") @db.Date
+  /// EARNING | EARNING_REVERSAL | PAYMENT | ADVANCE | EXPENSE | CREDIT | RECOVERY | OTHER_PLUS | OTHER_MINUS | ENTRY_REVERSAL (CHECK constraint)
   type        String
-  payMode     String   @map("pay_mode")
-  quantity    Decimal  @db.Decimal(18, 6)
-  rate        Decimal  @db.Decimal(12, 2)
+  payMode     String          @map("pay_mode")
+  quantity    Decimal         @db.Decimal(18, 6)
+  rate        Decimal         @db.Decimal(12, 2)
   /// Effect on the balance: + the business owes the person, − the person owes the business.
-  amount      Decimal  @db.Decimal(14, 2)
+  amount      Decimal         @db.Decimal(14, 2)
   /// CUTTING | STITCHING | REWORK | PACKING | MANUAL (CHECK constraint)
-  sourceType  String   @map("source_type")
-  sourceId    String   @map("source_id") @db.Uuid
+  sourceType  String          @map("source_type")
+  sourceId    String          @map("source_id") @db.Uuid
   description String
   /// CASH | BANK | WALLET, for money paid or received (CHECK constraint).
   method      String?
@@ -352,15 +363,35 @@ model KarigarLedgerEntry {
   category    String?
   /// Voucher, cheque or transaction number.
   reference   String?
-  createdById String   @map("created_by") @db.Uuid
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  karigar     Karigar  @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  createdBy   User     @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  /// Set exactly for OTHER_PLUS / OTHER_MINUS: the business's own kind of entry (CHECK constraint).
+  kindId      String?         @map("kind_id") @db.Uuid
+  createdById String          @map("created_by") @db.Uuid
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  karigar     Karigar         @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy   User            @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  kind        MoneyEntryKind? @relation(fields: [kindId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@unique([sourceType, sourceId, karigarId, type], map: "karigar_ledger_once")
   @@index([karigarId, entryDate], map: "karigar_ledger_karigar_idx")
   @@index([entryDate(sort: Desc), seq(sort: Desc)], map: "karigar_ledger_date_idx")
   @@map("karigar_ledger")
+}
+
+/// A kind of money entry the business added ("Bonus", "Fine"...). Name unique ignoring case and spacing.
+model MoneyEntryKind {
+  id          String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String
+  /// +1 adds to the balance (business owes more), -1 takes from it (CHECK constraint).
+  sign        Int                  @db.SmallInt
+  movesMoney  Boolean              @default(false) @map("moves_money")
+  active      Boolean              @default(true)
+  createdById String               @map("created_by") @db.Uuid
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdBy   User                 @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  entries     KarigarLedgerEntry[]
+
+  @@map("money_entry_kinds")
 }
 
 /// An item / design. name_key blocks names that differ only by case, spacing or punctuation.
@@ -419,6 +450,7 @@ model ProductionLot {
   costs             LotCost[]
   stitchingIssues   StitchingIssue[]
   stitchingReceipts StitchingReceipt[]
+  rateChanges       RateChange[]
   reworkItems       ReworkItem[]
   packingEntries    PackingEntry[]
   godownMovements   GodownMovement[]
@@ -437,6 +469,8 @@ model CuttingBatch {
   cuttingDate         DateTime          @map("cutting_date") @db.Date
   /// DRAFT | ISSUED | FINALIZED | REVERSED (CHECK constraint)
   status              String            @default("DRAFT")
+  /// Fabric cost posted at a provisional rate (a bill was pending); re-costed when the bill is added.
+  costProvisional     Boolean           @default(false) @map("cost_provisional")
   notes               String?
   widthM              Decimal?          @map("width_m") @db.Decimal(12, 6)
   lengthM             Decimal?          @map("length_m") @db.Decimal(12, 6)
@@ -531,6 +565,8 @@ model CuttingRoll {
   /// DRAFT | ISSUED | FINALIZED | REVERSED (CHECK constraint)
   status          String            @default("DRAFT")
   fabricRate      Decimal?          @map("fabric_rate") @db.Decimal(14, 4)
+  /// The fabric had a purchase waiting for its bill when this Thaan was issued: the rate is provisional.
+  rateProvisional Boolean           @default(false) @map("rate_provisional")
   issuedAt        DateTime?         @map("issued_at") @db.Timestamptz(6)
   estimatedPala   Int?              @map("estimated_pala")
   confirmedPala   Int?              @map("confirmed_pala")
@@ -674,10 +710,14 @@ model StitchingIssue {
   id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   number         Int                    @unique @default(autoincrement())
   lotId          String                 @map("lot_id") @db.Uuid
-  teamId         String                 @map("team_id") @db.Uuid
+  /// A Jogadi team, or (karigarId) one karigar on their own: exactly one is set (CHECK constraint).
+  teamId         String?                @map("team_id") @db.Uuid
+  karigarId      String?                @map("karigar_id") @db.Uuid
+  /// The team's name, or the karigar's, as it was at issue.
   teamName       String                 @map("team_name")
   operation      String
-  rate           Decimal                @db.Decimal(12, 2)
+  /// Null = rate pending: nothing is paid until it is set (see rate_changes).
+  rate           Decimal?               @db.Decimal(12, 2)
   /// EQUAL | PERCENT (CHECK constraint)
   splitMethod    String                 @map("split_method")
   issueDate      DateTime               @map("issue_date") @db.Date
@@ -689,7 +729,8 @@ model StitchingIssue {
   createdById    String                 @map("created_by") @db.Uuid
   createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
   lot            ProductionLot          @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  team           JogadiTeam             @relation(fields: [teamId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  team           JogadiTeam?            @relation(fields: [teamId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  karigar        Karigar?               @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   createdBy      User                   @relation("IssueCreatedBy", fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   reversedBy     User?                  @relation("IssueReversedBy", fields: [reversedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
   lines          StitchingIssueLine[]
@@ -700,6 +741,7 @@ model StitchingIssue {
   @@index([issueDate(sort: Desc), number(sort: Desc)], map: "stitching_issues_date_idx")
   @@index([lotId], map: "stitching_issues_lot_idx")
   @@index([teamId], map: "stitching_issues_team_idx")
+  @@index([karigarId], map: "stitching_issues_karigar_idx", where: raw("(karigar_id IS NOT NULL)"))
   @@map("stitching_issues")
 }
 
@@ -841,7 +883,8 @@ model PackingEntry {
   teamName       String?              @map("team_name")
   packDate       DateTime             @map("pack_date") @db.Date
   pieces         Int
-  rate           Decimal              @db.Decimal(12, 2)
+  /// Null = rate pending: earning stays 0 and nothing is paid until it is set (see rate_changes).
+  rate           Decimal?             @db.Decimal(12, 2)
   earning        Decimal              @db.Decimal(14, 2)
   notes          String?
   status         String               @default("POSTED")
@@ -956,4 +999,27 @@ model GodownStock {
 
   @@id([articleId, sizeLabel])
   @@map("godown_stock")
+}
+
+/// A rate per piece set or changed on a stitching issue or packing entry. A change after work was paid posts
+/// only the difference (karigar_ledger / lot_costs with source RATE_CHANGE and this id). Append-only (trigger).
+model RateChange {
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number      Int           @unique @default(autoincrement())
+  /// STITCHING_ISSUE | PACKING_ENTRY (CHECK constraint)
+  sourceType  String        @map("source_type")
+  sourceId    String        @map("source_id") @db.Uuid
+  lotId       String        @map("lot_id") @db.Uuid
+  oldRate     Decimal?      @map("old_rate") @db.Decimal(12, 2)
+  newRate     Decimal       @map("new_rate") @db.Decimal(12, 2)
+  pieces      Int
+  amount      Decimal       @db.Decimal(14, 2)
+  reason      String?
+  createdById String        @map("created_by") @db.Uuid
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  lot         ProductionLot @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdBy   User          @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([sourceType, sourceId, createdAt], map: "rate_changes_source_idx")
+  @@map("rate_changes")
 }

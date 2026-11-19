@@ -9,7 +9,7 @@ beforeEach(resetDatabase);
 describe("dashboard", () => {
   it("adds up the flow, where pieces are now, teams, items and money for the range", async () => {
     const { owner, lotId, articleId } = await stitchedLot();
-    const teamId = await packingTeam(owner, "Pack A", [await karigar(owner, "Puja", "PACKER")]);
+    const teamId = await packingTeam(owner, "Pack A", [await karigar(owner, "Puja", "PACKING_STAFF")]);
 
     await post(owner, "/api/v1/packing/entries", {
       lotId,
@@ -42,6 +42,12 @@ describe("dashboard", () => {
     expect(data.costs.find((row: { kind: string }) => row.kind === "PACKING_LABOUR").amount).toBe("60.00");
     expect(Number(data.payments.payable)).toBeGreaterThan(0);
     expect(data.recent.length).toBeGreaterThan(0);
+    // Nothing is waiting for a price in this fixture.
+    expect(data.waiting).toEqual({
+      stitchingRates: { issues: 0, pieces: 0 },
+      packingRates: { entries: 0, pieces: 0 },
+      fabricBills: { purchases: 0, oldest: null },
+    });
 
     expect((await owner.get("/api/v1/dashboard?from=2026-01-01&to=2027-06-01")).status).toBe(400);
     expect((await owner.get(`/api/v1/dashboard?from=${today}&to=2000-01-01`)).status).toBe(400);
@@ -60,6 +66,8 @@ describe("dashboard", () => {
     expect(data.costs).toBeNull();
     expect(data.payments).toBeNull();
     expect(data.recent).toBeNull();
+    // Packing staff (stitching and packing view, no fabric) see work waiting for a rate, not fabric bills.
+    expect(data.waiting).toMatchObject({ fabricBills: null, packingRates: { entries: 0 }, stitchingRates: { issues: 0 } });
     expect(data.range.days).toBe(30);
   });
 

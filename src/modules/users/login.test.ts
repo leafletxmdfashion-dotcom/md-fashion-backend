@@ -14,7 +14,7 @@ beforeEach(resetDatabase);
 const person = (login?: object) => ({
   name: "Ram Tailor",
   phone: "9801234567",
-  category: "TAILOR",
+  category: "KARIGAR",
   payMode: "PER_PIECE",
   payRate: 25,
   notes: "Joined in Kartik",

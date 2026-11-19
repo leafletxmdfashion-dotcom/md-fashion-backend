@@ -8,6 +8,8 @@ import { requirePermission } from "../permissions/permission.middleware";
 import {
   entrySchema,
   idParamsSchema,
+  kindSchema,
+  kindUpdateSchema,
   ledgerQuerySchema,
   peopleQuerySchema,
   reverseSchema,
@@ -71,6 +73,28 @@ export function paymentsRoutes(): Router {
     const { entries } = await paymentsService.myLedger(actorOf(req).user.id, allRows(ledgerQuery(req)));
 
     sendCsv(req, res, "my-ledger", ledgerColumns(false), entries, (e) => e.id);
+  }) satisfies RequestHandler);
+
+  // The business's own kinds of entry ("Bonus", "Fine"...), next to the five built-in ones.
+  router.get("/kinds", view, (async (req, res) => {
+    res.json({ success: true, data: { kinds: await paymentsService.kinds(req.query.all === "1") } });
+  }) satisfies RequestHandler);
+
+  router.post("/kinds", manage, (async (req, res) => {
+    const kind = await paymentsService.createKind(actorOf(req), kindSchema.parse(req.body), clientMeta(req));
+
+    res.status(201).json({ success: true, data: { kind } });
+  }) satisfies RequestHandler);
+
+  router.patch("/kinds/:id", manage, (async (req, res) => {
+    const kind = await paymentsService.updateKind(
+      actorOf(req),
+      idOf(req),
+      kindUpdateSchema.parse(req.body),
+      clientMeta(req),
+    );
+
+    res.json({ success: true, data: { kind } });
   }) satisfies RequestHandler);
 
   router.get("/people", view, (async (req, res) => {

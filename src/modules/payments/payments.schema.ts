@@ -9,6 +9,12 @@ export const MANUAL_TYPES = ["PAYMENT", "ADVANCE", "EXPENSE", "CREDIT", "RECOVER
 
 export type ManualType = (typeof MANUAL_TYPES)[number];
 
+/** Ledger types of entries made with one of the business's own kinds (money_entry_kinds). */
+export const OTHER_TYPES = ["OTHER_PLUS", "OTHER_MINUS"] as const;
+
+/** Manual entries that can be reversed on the payments screen. */
+export const REVERSIBLE_TYPES: readonly string[] = [...MANUAL_TYPES, ...OTHER_TYPES];
+
 /** What an entry does to the balance: + the business owes the person more, − less (or the person owes). */
 export const SIGN: Record<ManualType, 1 | -1> = { PAYMENT: -1, ADVANCE: -1, EXPENSE: -1, CREDIT: 1, RECOVERY: 1 };
 
@@ -20,11 +26,13 @@ export const LABEL: Record<string, string> = {
   EXPENSE: "Expense",
   CREDIT: "Credit",
   RECOVERY: "Money received back",
+  OTHER_PLUS: "Other (+)",
+  OTHER_MINUS: "Other (−)",
   ENTRY_REVERSAL: "Reversal",
 };
 
 /** Kinds an entry is counted under: a reversal counts under what it reverses. */
-export const KINDS = ["EARNING", "PAYMENT", "ADVANCE", "EXPENSE", "CREDIT", "RECOVERY"] as const;
+export const KINDS = ["EARNING", "PAYMENT", "ADVANCE", "EXPENSE", "CREDIT", "RECOVERY", "OTHER"] as const;
 
 export const LEDGER_COLUMNS: ColumnSpecs = {
   date: { type: "date", sql: "x.entry_date" },
@@ -51,23 +59,51 @@ const text = (max: number) =>
     .nullish()
     .transform((value) => value || null);
 
-export const entrySchema = z.strictObject({
-  karigarId: z.uuid("Choose the person."),
-  type: z.enum(MANUAL_TYPES, { error: "Choose what this is." }),
-  amount: z
-    .number({ error: "Enter the amount." })
-    .positive("Enter an amount above zero.")
-    .max(99_999_999, "Amount is too large.")
-    .multipleOf(0.01, "Use at most 2 decimals (paisa)."),
-  entryDate: businessDate,
-  method: z
-    .enum(["CASH", "BANK", "WALLET"])
-    .nullish()
-    .transform((value) => value ?? null),
-  category: text(40),
-  reference: text(60),
-  note: text(300),
+export const entrySchema = z
+  .strictObject({
+    karigarId: z.uuid("Choose the person."),
+    /** A built-in kind, or… */
+    type: z.enum(MANUAL_TYPES, { error: "Choose what this is." }).optional(),
+    /** …one of the business's own kinds. */
+    kindId: z.uuid("Choose what this is.").optional(),
+    amount: z
+      .number({ error: "Enter the amount." })
+      .positive("Enter an amount above zero.")
+      .max(99_999_999, "Amount is too large.")
+      .multipleOf(0.01, "Use at most 2 decimals (paisa)."),
+    entryDate: businessDate,
+    method: z
+      .enum(["CASH", "BANK", "WALLET"])
+      .nullish()
+      .transform((value) => value ?? null),
+    category: text(40),
+    reference: text(60),
+    note: text(300),
+  })
+  .refine((entry) => Boolean(entry.type) !== Boolean(entry.kindId), {
+    path: ["type"],
+    message: "Choose what this is.",
+  });
+
+const kindName = z
+  .string({ error: "Name the kind of entry." })
+  .trim()
+  .transform((name) => name.replace(/\s+/g, " "))
+  .pipe(z.string().min(2, "Use at least 2 characters.").max(40, "Keep this under 40 characters."));
+
+export const kindSchema = z.strictObject({
+  name: kindName,
+  /** +1 adds to the balance (we owe them more), -1 takes from it. */
+  sign: z.union([z.literal(1), z.literal(-1)], { error: "Choose whether it adds to or takes from the balance." }),
+  movesMoney: z.boolean().default(false),
 });
+
+export const kindUpdateSchema = z
+  .strictObject({ name: kindName.optional(), active: z.boolean().optional() })
+  .refine((update) => update.name !== undefined || update.active !== undefined, { message: "Nothing to change." });
+
+export type KindInput = z.infer<typeof kindSchema>;
+export type KindUpdate = z.infer<typeof kindUpdateSchema>;
 
 export const reverseSchema = z.strictObject({
   reason: z.string().trim().min(3, "Give a reason (at least 3 characters).").max(300),

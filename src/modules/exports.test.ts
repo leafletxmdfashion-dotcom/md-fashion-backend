@@ -60,7 +60,7 @@ async function exportCsv(client: TestClient, url: string) {
 async function everything() {
   const lot = await stitchedLot();
   const { owner, lotId, articleId, ram } = lot;
-  const packer = await karigar(owner, "Puja", "PACKER", 1.5);
+  const packer = await karigar(owner, "Puja", "PACKING_STAFF", 1.5);
   await post(owner, "/api/v1/packing/entries", {
     lotId,
     teamId: await packingTeam(owner, "Pack A", [packer]),
@@ -200,7 +200,7 @@ describe("exports", () => {
     const userId = await createUser({ email: "ram@garment.test", role: "KARIGAR" });
     const linked = await owner.send("put", `/api/v1/karigars/${ram}`, {
       name: "Ram",
-      category: "TAILOR",
+      category: "KARIGAR",
       payMode: "PER_PIECE",
       payRate: 0,
       userId,

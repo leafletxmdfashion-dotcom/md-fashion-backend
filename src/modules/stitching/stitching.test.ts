@@ -42,7 +42,7 @@ async function post(client: TestClient, url: string, body: object, status = 201)
   return res.body.data;
 }
 
-async function karigar(owner: TestClient, name: string, category = "TAILOR") {
+async function karigar(owner: TestClient, name: string, category = "KARIGAR") {
   // SAFETY: post() asserted the 201, so the karigar DTO is present.
   return (await post(owner, "/api/v1/karigars", { name, category, payMode: "PER_PIECE", payRate: 0 })).karigar
     .id as string;
@@ -220,8 +220,9 @@ describe("teams", () => {
 
   it("makes packing teams with their own code, keeps the type fixed, and keeps them out of stitching", async () => {
     const { owner, lotId, ram, hari } = await setup();
-    const packing = (await post(owner, "/api/v1/teams", { kind: "PACKING", name: "Pack A", members: [{ karigarId: hari }] }))
-      .team;
+    const packing = (
+      await post(owner, "/api/v1/teams", { kind: "PACKING", name: "Pack A", members: [{ karigarId: hari }] })
+    ).team;
 
     expect(packing).toMatchObject({ kind: "PACKING", code: "PT-002", piecesHeld: 0, packedThisMonth: 0 });
 
@@ -394,8 +395,7 @@ describe("stitching issue", () => {
   it("divides one lot between several Jogadi teams in one posting, never more than is waiting", async () => {
     const { owner, lotId, teamId, hari } = await setup();
     // SAFETY: post() asserted the 201, so the team DTO is present.
-    const second = (await post(owner, "/api/v1/teams", { name: "Team Hari", members: [{ karigarId: hari }] }))
-      .team as {
+    const second = (await post(owner, "/api/v1/teams", { name: "Team Hari", members: [{ karigarId: hari }] })).team as {
       id: string;
     };
     const divide = (black: [number, number]) =>
@@ -802,5 +802,181 @@ describe("stitching permissions", () => {
       403,
     );
     expect((await staff.send("post", "/api/v1/teams", { name: "X", members: [{ karigarId: ram }] })).status).toBe(403);
+  });
+});
+
+describe("one karigar and rate pending", () => {
+  const labour = async (lotId: string) =>
+    (
+      await sql(
+        "SELECT COALESCE(sum(amount), 0)::numeric(14, 2)::text AS amount FROM lot_costs WHERE lot_id = $1 AND kind = 'STITCHING_LABOUR'",
+        [lotId],
+      )
+    ).rows[0].amount as string;
+
+  const receive = (client: TestClient, issueId: string, lineId: string, good: number, rework = 0) =>
+    post(client, `/api/v1/stitching/issues/${issueId}/receipts`, {
+      receiptDate: today,
+      lines: [{ issueLineId: lineId, good, rework, reject: 0 }],
+    });
+
+  it("issues to one karigar without a team, alongside a team, but never to a member of that team", async () => {
+    const { owner, lotId, teamId, ram, hari } = await setup();
+    const lines = [{ colour: "Black", sizeLabel: "S", quantity: 2 }];
+
+    const clash = await owner.send("post", "/api/v1/stitching/issues", {
+      lotId,
+      operation: "Full stitching",
+      rate: 10,
+      issueDate: today,
+      teams: [
+        { teamId, lines },
+        { karigarId: ram, lines },
+      ],
+    });
+
+    expect(clash.status).toBe(400);
+    expect(clash.body.error.details["teams.1.teamId"][0]).toMatch(/Ram is already in Team Ram/);
+
+    const both = await owner.send("post", "/api/v1/stitching/issues", {
+      lotId,
+      operation: "Full stitching",
+      issueDate: today,
+      teams: [{ teamId, karigarId: hari, lines }],
+    });
+
+    expect(both.status).toBe(400);
+
+    const { issues } = await post(owner, "/api/v1/stitching/issues", {
+      lotId,
+      operation: "Full stitching",
+      rate: 10,
+      issueDate: today,
+      teams: [
+        { teamId, lines },
+        { karigarId: hari, lines },
+      ],
+    });
+
+    expect(issues[1]).toMatchObject({ team: { id: null, name: "Hari" }, karigarId: hari, members: [{ name: "Hari" }] });
+
+    await receive(owner, issues[1].id, issues[1].lines[0].id, 2);
+
+    expect((await ledger()).filter((row) => row.name === "Hari")).toEqual([
+      { name: "Hari", type: "EARNING", source_type: "STITCHING", amount: "20.00" },
+    ]);
+    expect((await owner.get(`/api/v1/stitching/issues?karigarId=${hari}`)).body.data.total).toBe(1);
+  });
+
+  it("receives without a rate, pays everything when it is set, and posts only the difference when changed", async () => {
+    const { owner, lotId, teamId } = await setup();
+    const issued = (
+      await post(owner, "/api/v1/stitching/issues", {
+        lotId,
+        operation: "Full stitching",
+        issueDate: today,
+        teams: [{ teamId, lines: [{ colour: "Black", sizeLabel: "M", quantity: 20 }] }],
+      })
+    ).issues[0] as Issue & { ratePending: boolean };
+
+    expect(issued).toMatchObject({ rate: null, ratePending: true });
+
+    const lineId = issued.lines[0]!.id;
+
+    // A custom split needs a rate.
+    const split = await owner.send("post", `/api/v1/stitching/issues/${issued.id}/receipts`, {
+      receiptDate: today,
+      lines: [{ issueLineId: lineId, good: 1, rework: 0, reject: 0 }],
+      split: { method: "AMOUNT", members: [] },
+    });
+
+    expect(split.status).toBe(400);
+
+    await receive(owner, issued.id, lineId, 10, 2);
+
+    const rework = (await owner.get("/api/v1/stitching/rework")).body.data.items[0] as { id: string };
+
+    await post(owner, `/api/v1/stitching/rework/${rework.id}/resolve`, { resolvedOn: today, recovered: 2, failed: 0 });
+
+    expect(await ledger()).toEqual([]);
+    expect(await labour(lotId)).toBe("0.00");
+    expect((await owner.get("/api/v1/stitching/issues?ratePending=1")).body.data.total).toBe(1);
+
+    // 10 Good + 2 recovered at Rs 10, split equally between Ram and Sita.
+    const set = await post(owner, `/api/v1/stitching/issues/${issued.id}/rate`, { rate: 10 }, 200);
+
+    expect(set.issue).toMatchObject({ rate: "10.00", ratePending: false });
+    expect(await ledger()).toEqual([
+      { name: "Ram", type: "EARNING", source_type: "STITCHING", amount: "50.00" },
+      { name: "Sita", type: "EARNING", source_type: "STITCHING", amount: "50.00" },
+      { name: "Ram", type: "EARNING", source_type: "REWORK", amount: "10.00" },
+      { name: "Sita", type: "EARNING", source_type: "REWORK", amount: "10.00" },
+    ]);
+    expect(await labour(lotId)).toBe("120.00");
+
+    // From now on receipts pay at once.
+    await receive(owner, issued.id, lineId, 4);
+
+    expect(await labour(lotId)).toBe("160.00");
+
+    // A change needs a reason, then adds (12 − 10) × 16 paid pieces = Rs 32.
+    expect((await owner.send("post", `/api/v1/stitching/issues/${issued.id}/rate`, { rate: 12 })).status).toBe(400);
+
+    const changed = await post(
+      owner,
+      `/api/v1/stitching/issues/${issued.id}/rate`,
+      { rate: 12, reason: "New rate" },
+      200,
+    );
+
+    expect(changed.issue.rateChanges).toEqual([
+      expect.objectContaining({ oldRate: null, newRate: "10.00", pieces: 12, amount: "120.00" }),
+      expect.objectContaining({ oldRate: "10.00", newRate: "12.00", pieces: 16, amount: "32.00" }),
+    ]);
+    expect((await ledger()).slice(-2)).toEqual([
+      { name: "Ram", type: "EARNING", source_type: "RATE_CHANGE", amount: "16.00" },
+      { name: "Sita", type: "EARNING", source_type: "RATE_CHANGE", amount: "16.00" },
+    ]);
+    expect(await labour(lotId)).toBe("192.00");
+
+    // Reversing the last receipt (4 pieces paid at 10, now worth 12) takes back all Rs 48.
+    const last = changed.issue.receipts.at(-1) as { id: string };
+
+    await post(owner, `/api/v1/stitching/receipts/${last.id}/reverse`, { reason: "Counted twice" }, 200);
+
+    expect(await labour(lotId)).toBe("144.00");
+
+    // A lower rate takes pay back: (11 − 12) × 12 pieces.
+    await post(owner, `/api/v1/stitching/issues/${issued.id}/rate`, { rate: 11, reason: "Corrected" }, 200);
+
+    expect(await labour(lotId)).toBe("132.00");
+
+    const people = await sql(
+      `SELECT k.name, sum(l.amount)::text AS total FROM karigar_ledger l JOIN karigars k ON k.id = l.karigar_id
+       WHERE l.source_type <> 'CUTTING' GROUP BY k.name ORDER BY k.name`,
+    );
+
+    expect(people.rows).toEqual([
+      { name: "Ram", total: "66.00" },
+      { name: "Sita", total: "66.00" },
+    ]);
+  });
+
+  it("needs costing.view to set a rate", async () => {
+    const { owner, lotId, teamId } = await setup();
+    const issued = (
+      await post(owner, "/api/v1/stitching/issues", {
+        lotId,
+        operation: "Full stitching",
+        issueDate: today,
+        teams: [{ teamId, lines: [{ colour: "Black", sizeLabel: "S", quantity: 1 }] }],
+      })
+    ).issues[0] as Issue;
+
+    await createUser({ email: "super@garment.test", role: "STITCHING_SUPERVISOR" });
+
+    const supervisor = await loggedInClient("super@garment.test");
+
+    expect((await supervisor.send("post", `/api/v1/stitching/issues/${issued.id}/rate`, { rate: 5 })).status).toBe(403);
   });
 });
