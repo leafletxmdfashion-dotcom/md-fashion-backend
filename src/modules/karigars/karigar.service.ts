@@ -82,9 +82,7 @@ function toKarigar(row: KarigarRow, pay: PayVisibility): KarigarDto {
     earned: pay.earned ? row.earned : null,
     active: row.active,
     notes: row.notes,
-    user: row.user_id
-      ? { id: row.user_id, name: row.user_name!, email: row.user_email, phone: row.user_phone }
-      : null,
+    user: row.user_id ? { id: row.user_id, name: row.user_name!, email: row.user_email, phone: row.user_phone } : null,
     createdAt: row.created_at,
   };
 }
@@ -96,8 +94,9 @@ async function findById(id: string, pay: PayVisibility): Promise<KarigarDto | nu
 }
 
 /** Columns to write; an absent userId leaves the link as it is. The new-login request is not a column. */
-function dataOf({ userId, login: _login, ...rest }: KarigarInput) {
-  return userId === undefined ? rest : { ...rest, userId };
+/** Columns to write; a left-out rate or login keeps what is there (a new person gets rate 0). */
+function dataOf({ userId, login: _login, payRate, ...rest }: KarigarInput) {
+  return { ...rest, ...(payRate === undefined ? {} : { payRate }), ...(userId === undefined ? {} : { userId }) };
 }
 
 /** A person saved together with the login made for them (if one was). */

@@ -1,9 +1,11 @@
 import type { Request, RequestHandler } from "express";
+import { heldForApproval } from "../approvals/approvals";
 
 import { errors } from "../../lib/errors";
 import { can, clientMeta } from "../../lib/request";
 import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
 import {
+  addBillSchema,
   adjustmentSchema,
   createInwardSchema,
   fabricListQuerySchema,
@@ -77,7 +79,11 @@ export const fabricController = {
   }) satisfies RequestHandler,
 
   adjust: (async (req, res) => {
-    await fabricService.adjust(actorOf(req), idOf(req), adjustmentSchema.parse(req.body), clientMeta(req));
+    const input = adjustmentSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "FABRIC_ADJUSTMENT", targetId: idOf(req), payload: input })) return;
+
+    await fabricService.adjust(actorOf(req), idOf(req), input, clientMeta(req));
     res.status(201).json({ success: true, data: null });
   }) satisfies RequestHandler,
 
@@ -160,8 +166,22 @@ export const fabricController = {
     res.status(201).json({ success: true, data: { inward: showCost(req) ? inward : hideInwardCost(inward) } });
   }) satisfies RequestHandler,
 
+  addBill: (async (req, res) => {
+    const { inward, recostedBatches } = await inwardService.addBill(
+      actorOf(req),
+      idOf(req),
+      addBillSchema.parse(req.body),
+      clientMeta(req),
+    );
+    res.json({ success: true, data: { inward, recostedBatches } });
+  }) satisfies RequestHandler,
+
   reverseInward: (async (req, res) => {
     const { reason } = reverseInwardSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "PURCHASE_REVERSAL", targetId: idOf(req), payload: { reason } }))
+      return;
+
     const inward = await inwardService.reverse(actorOf(req), idOf(req), reason, clientMeta(req));
     res.json({ success: true, data: { inward: showCost(req) ? inward : hideInwardCost(inward) } });
   }) satisfies RequestHandler,

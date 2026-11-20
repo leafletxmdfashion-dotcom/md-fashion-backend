@@ -8,7 +8,7 @@ beforeEach(resetDatabase);
 /** A stitched lot with S 20, M 40, L 21 packed into the godown. */
 async function packed() {
   const lot = await stitchedLot();
-  const packer = await karigar(lot.owner, "Puja", "PACKER", 1);
+  const packer = await karigar(lot.owner, "Puja", "PACKING_STAFF", 1);
   const entry = (
     await post(lot.owner, "/api/v1/packing/entries", {
       lotId: lot.lotId,

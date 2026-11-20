@@ -5,6 +5,7 @@ import { z } from "zod";
 import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
 import { actorOf, can, clientMeta } from "../../lib/request";
 import { queryRows, rowQueryFields, type RowQuery, type RowSpecs } from "../../lib/row-query";
+import { heldForApproval } from "../approvals/approvals";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
 import {
@@ -18,6 +19,7 @@ import {
   type EntryListQuery,
   type LineListQuery,
 } from "./packing.schema";
+import { setRateSchema } from "../stitching/stitching.schema";
 import { packingService } from "./packing.service";
 
 const idOf = (req: Request) => idParamsSchema.parse(req.params).id;
@@ -259,8 +261,21 @@ export function packingRoutes(): Router {
     res.status(201).json({ success: true, data: { entry } });
   }) satisfies RequestHandler);
 
+  // Sets a pending rate or changes one; a change after pay was posted adjusts that pay.
+  router.post("/entries/:id/rate", requirePermission("rates.manage"), requirePermission("costing.view"), (async (
+    req,
+    res,
+  ) => {
+    const entry = await packingService.setRate(actorOf(req), idOf(req), setRateSchema.parse(req.body), clientMeta(req));
+
+    res.json({ success: true, data: { entry } });
+  }) satisfies RequestHandler);
+
   router.post("/entries/:id/reverse", manage, (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "PACKING_REVERSAL", targetId: idOf(req), payload: { reason } })) return;
+
     const entry = await packingService.reverse(actorOf(req), idOf(req), reason, clientMeta(req));
 
     res.json({ success: true, data: { entry } });

@@ -2,19 +2,28 @@ import { z } from "zod";
 
 import { businessDate } from "../../lib/business-date";
 import { columnQueryFields, type ColumnQuery, type ColumnSpecs } from "../../lib/list-query";
+import { ratePerPiece } from "../stitching/stitching.schema";
 
 export const ENTRY_COLUMNS: ColumnSpecs = {
   date: { type: "date", sql: "e.pack_date" },
   number: { type: "number", sql: "e.number" },
   lot: { type: "text", sql: "l.search_text", sortSql: "l.lot_key" },
-  packer: { type: "text", sql: "lower(COALESCE(e.team_name, e.packer_name))", sortSql: "COALESCE(e.team_name, e.packer_name)" },
+  packer: {
+    type: "text",
+    sql: "lower(COALESCE(e.team_name, e.packer_name))",
+    sortSql: "COALESCE(e.team_name, e.packer_name)",
+  },
   pieces: { type: "number", sql: "e.pieces" },
   status: { type: "enum", sql: "e.status", values: ["POSTED", "REVERSED"] },
 };
 
 export const LINE_COLUMNS: ColumnSpecs = {
   date: { type: "date", sql: "e.pack_date" },
-  packer: { type: "text", sql: "lower(COALESCE(e.team_name, e.packer_name))", sortSql: "COALESCE(e.team_name, e.packer_name)" },
+  packer: {
+    type: "text",
+    sql: "lower(COALESCE(e.team_name, e.packer_name))",
+    sortSql: "COALESCE(e.team_name, e.packer_name)",
+  },
   item: { type: "text", sql: "lower(l.article_name)", sortSql: "l.article_name" },
   size: { type: "text", sql: "lower(pl.size_label)", sortSql: "pl.size_label" },
   quantity: { type: "number", sql: "pl.quantity" },
@@ -30,14 +39,12 @@ const notes = z
 export const packSchema = z
   .strictObject({
     lotId: z.uuid("Choose a lot."),
-    teamId: z.uuid("Choose the packing team."),
+    /** A packing team, or (packerId) one person packing on their own. */
+    teamId: z.uuid("Choose the packing team or person.").optional(),
+    packerId: z.uuid("Choose the packing team or person.").optional(),
     packDate: businessDate,
-    /** Paid per piece, split equally over the team (like a stitching issue's rate). */
-    rate: z
-      .number({ error: "Enter the rate per piece." })
-      .min(0, "Rate cannot be negative.")
-      .max(99_999, "Rate is too large.")
-      .multipleOf(0.01, "Use at most 2 decimals."),
+    /** Paid per piece, split equally over the team. Blank = rate pending, paid when it is set. */
+    rate: ratePerPiece.nullish().transform((value) => value ?? null),
     notes,
     lines: z
       .array(
@@ -56,6 +63,10 @@ export const packSchema = z
       .refine((lines) => lines.length > 0, "Enter the pieces packed."),
   })
   .superRefine((input, ctx) => {
+    if (Boolean(input.teamId) === Boolean(input.packerId)) {
+      ctx.addIssue({ code: "custom", path: ["teamId"], message: "Choose the packing team or person." });
+    }
+
     const seen = new Set<string>();
 
     input.lines.forEach((line, index) => {
@@ -79,6 +90,8 @@ const listPage = {
   /** A person: entries they packed alone or as a member of the packing team. */
   packerId: z.uuid().optional(),
   teamId: z.uuid().optional(),
+  /** "1" = only entries whose rate is still to be set. */
+  ratePending: z.enum(["1"]).optional(),
 };
 
 export const entryListQuerySchema = z.object({ ...listPage, ...columnQueryFields(ENTRY_COLUMNS) });

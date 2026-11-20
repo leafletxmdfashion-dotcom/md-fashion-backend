@@ -30,7 +30,7 @@ export async function post(client: TestClient, url: string, body: object, status
 export async function karigar(
   owner: TestClient,
   name: string,
-  category = "TAILOR",
+  category = "KARIGAR",
   payRate = 0,
   extra: object = {},
 ): Promise<string> {

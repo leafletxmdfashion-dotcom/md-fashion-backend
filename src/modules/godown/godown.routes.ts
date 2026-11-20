@@ -4,6 +4,7 @@ import { z } from "zod";
 import { allRows, day, docNumber, EXPORT_MAX, sendCsv } from "../../lib/csv-export";
 import { actorOf, clientMeta } from "../../lib/request";
 import { queryRows, rowQueryFields, type RowQuery, type RowSpecs } from "../../lib/row-query";
+import { heldForApproval } from "../approvals/approvals";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
 import {
@@ -261,13 +262,22 @@ export function godownRoutes(): Router {
 
   router.post("/dispatches/:id/reverse", manage, (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "DISPATCH_REVERSAL", targetId: idOf(req), payload: { reason } }))
+      return;
+
     const dispatch = await godownService.reverseDispatch(actorOf(req), idOf(req), reason, clientMeta(req));
 
     res.json({ success: true, data: { dispatch } });
   }) satisfies RequestHandler);
 
   router.post("/adjustments", manage, (async (req, res) => {
-    const adjustment = await godownService.adjust(actorOf(req), adjustSchema.parse(req.body), clientMeta(req));
+    const input = adjustSchema.parse(req.body);
+    const { articleId, ...rest } = input;
+
+    if (await heldForApproval(req, res, { type: "GODOWN_ADJUSTMENT", targetId: articleId, payload: rest })) return;
+
+    const adjustment = await godownService.adjust(actorOf(req), input, clientMeta(req));
 
     res.status(201).json({ success: true, data: { adjustment } });
   }) satisfies RequestHandler);

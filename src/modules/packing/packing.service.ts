@@ -4,7 +4,9 @@ import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { columnFilters, contains, orderBy, page, where } from "../../lib/list-query";
 import { recordAudit } from "../audit/audit.service";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
-import { paisaText, splitEarning, toPaisa } from "../stitching/stitching.split";
+import { postRateDifference, rateHistory } from "../stitching/rate-change";
+import type { SetRateInput } from "../stitching/stitching.schema";
+import { paisaText, splitEarning, toPaisa, type SplitMember } from "../stitching/stitching.split";
 import { ENTRY_COLUMNS, LINE_COLUMNS, type EntryListQuery, type LineListQuery, type PackInput } from "./packing.schema";
 
 // Packing: Good pieces from stitching (receipt Good + recovered rework) wait to be packed
@@ -81,7 +83,12 @@ async function lockLot(tx: Tx, lotId: string) {
 }
 
 /** Who packed an entry: its packing team, or (older entries) one person. */
-function packedBy(row: { team_id: string | null; team_name: string | null; packer_id: string | null; packer_name: string | null }) {
+function packedBy(row: {
+  team_id: string | null;
+  team_name: string | null;
+  packer_id: string | null;
+  packer_name: string | null;
+}) {
   return row.team_id
     ? { kind: "TEAM" as const, id: row.team_id, name: row.team_name ?? "" }
     : { kind: "PERSON" as const, id: row.packer_id ?? "", name: row.packer_name ?? "" };
@@ -195,10 +202,12 @@ export const packingService = {
 
     if (query.teamId) clauses.push(Prisma.sql`e.team_id = ${query.teamId}::uuid`);
 
+    if (query.ratePending) clauses.push(Prisma.sql`e.rate IS NULL AND e.status = 'POSTED'`);
+
     const filter = where(clauses);
     const from = Prisma.sql`FROM packing_entries e JOIN production_lots l ON l.id = e.lot_id`;
 
-    const [rows, [summary]] = await Promise.all([
+    const [rows, [summary], [pending]] = await Promise.all([
       prisma.$queryRaw<
         {
           id: string;
@@ -213,7 +222,7 @@ export const packingService = {
           team_id: string | null;
           team_name: string | null;
           pieces: number;
-          rate: string;
+          rate: string | null;
           earning: string;
           sizes: string;
         }[]
@@ -228,6 +237,9 @@ export const packingService = {
                COALESCE(sum(e.pieces) FILTER (WHERE e.status = 'POSTED'), 0)::int AS pieces,
                COALESCE(sum(e.earning) FILTER (WHERE e.status = 'POSTED'), 0)::text AS earning
         ${from} ${filter}`,
+      // Whatever the filters: posted entries whose rate is still to be set.
+      prisma.$queryRaw<{ count: number }[]>`
+        SELECT count(*)::int AS count FROM packing_entries WHERE rate IS NULL AND status = 'POSTED'`,
     ]);
 
     return {
@@ -240,7 +252,8 @@ export const packingService = {
         packedBy: packedBy(row),
         pieces: row.pieces,
         sizes: row.sizes,
-        rate: showMoney ? Number(row.rate).toFixed(2) : null,
+        rate: showMoney && row.rate !== null ? Number(row.rate).toFixed(2) : null,
+        ratePending: row.rate === null,
         earning: showMoney ? Number(row.earning).toFixed(2) : null,
       })),
       total: summary!.total,
@@ -248,6 +261,7 @@ export const packingService = {
         entries: summary!.posted,
         pieces: summary!.pieces,
         earning: showMoney ? Number(summary!.earning).toFixed(2) : null,
+        ratePending: pending!.count,
       },
     };
   },
@@ -387,7 +401,7 @@ export const packingService = {
 
     const [row] = await prisma.$queryRaw<{ rate: string }[]>`
       SELECT e.rate::text AS rate FROM packing_entries e JOIN production_lots l ON l.id = e.lot_id
-      WHERE e.status = 'POSTED' AND l.article_id = (SELECT article_id FROM production_lots WHERE id = ${query.lotId}::uuid)
+      WHERE e.status = 'POSTED' AND e.rate IS NOT NULL AND l.article_id = (SELECT article_id FROM production_lots WHERE id = ${query.lotId}::uuid)
       ORDER BY (e.team_id IS NOT DISTINCT FROM ${query.teamId ?? null}::uuid) DESC, e.created_at DESC LIMIT 1`;
 
     return row ? Number(row.rate).toFixed(2) : null;
@@ -404,6 +418,7 @@ export const packingService = {
 
     const members = entry.members.map((member) => ({ karigarId: member.karigarId, name: member.karigarName }));
     const shares = showMoney && members.length > 0 ? equalShares(entry.earning.toFixed(2), members) : null;
+    const rateChanges = showMoney ? await rateHistory("PACKING_ENTRY", entry.id) : null;
 
     return {
       id: entry.id,
@@ -420,7 +435,9 @@ export const packingService = {
       /** The team as it was when packed, each with their equal share of the pay (money only). */
       members: members.map((member) => ({ ...member, earning: shares?.get(member.karigarId) ?? null })),
       pieces: entry.pieces,
-      rate: showMoney ? entry.rate.toFixed(2) : null,
+      rate: showMoney ? (entry.rate?.toFixed(2) ?? null) : null,
+      ratePending: entry.rate === null,
+      rateChanges,
       earning: showMoney ? entry.earning.toFixed(2) : null,
       notes: entry.notes,
       lines: entry.lines.map((line) => ({ sizeLabel: line.sizeLabel, quantity: line.quantity })),
@@ -438,21 +455,37 @@ export const packingService = {
 
       if (lot.status === "CANCELLED") throw fieldError("lotId", `${lot.lot_number} is cancelled.`);
 
-      // Locks the team so its members cannot change while the earning is split over them.
-      const [team] = await tx.$queryRaw<{ id: string; name: string; kind: string; active: boolean }[]>`
-        SELECT id, name, kind, active FROM jogadi_teams WHERE id = ${input.teamId}::uuid FOR SHARE`;
+      let team: { id: string; name: string } | null = null;
+      let members: { id: string; name: string }[];
 
-      if (!team || team.kind !== "PACKING" || !team.active) {
-        throw fieldError("teamId", "Choose an active packing team.");
-      }
+      if (input.teamId) {
+        // Locks the team so its members cannot change while the earning is split over them.
+        const [found] = await tx.$queryRaw<{ id: string; name: string; kind: string; active: boolean }[]>`
+          SELECT id, name, kind, active FROM jogadi_teams WHERE id = ${input.teamId}::uuid FOR SHARE`;
 
-      // By name, as the entry shows them: the leftover paisa of an equal split goes in this order.
-      const members = await tx.$queryRaw<{ id: string; name: string }[]>`
-        SELECT k.id, k.name FROM jogadi_members m JOIN karigars k ON k.id = m.karigar_id
-        WHERE m.team_id = ${team.id}::uuid AND m.left_at IS NULL ORDER BY k.name, k.number`;
+        if (!found || found.kind !== "PACKING" || !found.active) {
+          throw fieldError("teamId", "Choose an active packing team.");
+        }
 
-      if (members.length === 0) {
-        throw fieldError("teamId", `${team.name} has no members. Add them in Teams.`);
+        team = found;
+        // By name, as the entry shows them: the leftover paisa of an equal split goes in this order.
+        members = await tx.$queryRaw<{ id: string; name: string }[]>`
+          SELECT k.id, k.name FROM jogadi_members m JOIN karigars k ON k.id = m.karigar_id
+          WHERE m.team_id = ${found.id}::uuid AND m.left_at IS NULL ORDER BY k.name, k.number`;
+
+        if (members.length === 0) {
+          throw fieldError("teamId", `${found.name} has no members. Add them in Teams.`);
+        }
+      } else {
+        // One person packing on their own: no team needed.
+        const packer = await tx.karigar.findUnique({
+          where: { id: input.packerId! },
+          select: { id: true, name: true, active: true },
+        });
+
+        if (!packer?.active) throw fieldError("teamId", "Choose an active packing team or person.");
+
+        members = [{ id: packer.id, name: packer.name }];
       }
 
       const balances = await packingBalance(tx, lot.id);
@@ -476,7 +509,8 @@ export const packingService = {
         (a, b) => (position.get(a.sizeLabel) ?? 999) - (position.get(b.sizeLabel) ?? 999),
       );
       const pieces = lines.reduce((sum, line) => sum + line.quantity, 0);
-      const earning = BigInt(pieces) * toPaisa(input.rate);
+      // Rate pending: the pieces go to the godown now, the pay is posted when the rate is set.
+      const earning = input.rate === null ? 0n : BigInt(pieces) * toPaisa(input.rate);
       const split = splitEarning(
         earning,
         "EQUAL",
@@ -491,8 +525,10 @@ export const packingService = {
       const entry = await tx.packingEntry.create({
         data: {
           lotId: lot.id,
-          teamId: team.id,
-          teamName: team.name,
+          teamId: team?.id ?? null,
+          teamName: team?.name ?? null,
+          packerId: team ? null : members[0]!.id,
+          packerName: team ? null : members[0]!.name,
           packDate: date,
           pieces,
           rate: input.rate,
@@ -515,7 +551,7 @@ export const packingService = {
         select: { id: true, number: true },
       });
 
-      const description = `Packing ${packingNumber(entry.number)} · ${lot.lot_number} · ${pcs(pieces)} · ${team.name}`;
+      const description = `Packing ${packingNumber(entry.number)} · ${lot.lot_number} · ${pcs(pieces)} · ${team?.name ?? members[0]!.name}`;
       const paid = members.filter((member) => split.amounts.get(member.id)! > 0n);
 
       if (paid.length > 0) {
@@ -526,7 +562,8 @@ export const packingService = {
             type: "EARNING",
             payMode: "PER_PIECE",
             quantity: pieces,
-            rate: input.rate,
+            // SAFETY: only reached with pay to post, which needs a rate.
+            rate: input.rate!,
             amount: paisaText(split.amounts.get(member.id)!),
             sourceType: "PACKING",
             sourceId: entry.id,
@@ -544,7 +581,7 @@ export const packingService = {
             kind: "PACKING_LABOUR",
             entryDate: date,
             quantity: pieces,
-            rate: input.rate,
+            rate: input.rate!,
             amount: paisaText(earning),
             createdById: actor.user.id,
           },
@@ -567,13 +604,119 @@ export const packingService = {
       await recordAudit(tx, {
         type: "PACKING_POSTED",
         ...audit(actor, meta),
-        metadata: { entryId: entry.id, lotId: lot.id, teamId: team.id, members: members.length, pieces },
+        metadata: {
+          entryId: entry.id,
+          lotId: lot.id,
+          teamId: team?.id ?? null,
+          packerId: team ? null : members[0]!.id,
+          members: members.length,
+          pieces,
+        },
       });
 
       return entry.id;
     });
 
     return this.getEntry(id, actor.user.permissions.has("costing.view"));
+  },
+
+  /**
+   * Sets a pending rate (posts the pay for the pieces packed) or changes one (posts the
+   * difference on top, split equally like the entry's own pay).
+   */
+  async setRate(actor: AuthContext, id: string, input: SetRateInput, meta: ClientMeta) {
+    const found = await prisma.packingEntry.findUnique({ where: { id }, select: { lotId: true } });
+
+    if (!found) throw errors.notFound("Packing entry");
+
+    await transaction(async (tx) => {
+      const lot = await lockLot(tx, found.lotId);
+      const [entry] = await tx.$queryRaw<
+        { number: number; status: string; rate: string | null; pieces: number; pack_date: Date; who: string }[]
+      >`
+        SELECT number, status, rate::text AS rate, pieces, pack_date, COALESCE(team_name, packer_name) AS who
+        FROM packing_entries WHERE id = ${id}::uuid FOR UPDATE`;
+
+      if (!entry) throw errors.notFound("Packing entry");
+
+      if (entry.status === "REVERSED") throw errors.conflict(`${packingNumber(entry.number)} has been reversed.`);
+
+      const rate = input.rate.toFixed(2);
+
+      if (entry.rate === rate) throw fieldError("rate", `The rate is already Rs ${rate}.`);
+
+      if (entry.rate !== null && !input.reason) {
+        throw fieldError("reason", `Say why: pay already posted for ${pcs(entry.pieces)} is adjusted.`);
+      }
+
+      const members = await entryMembers(tx, id);
+      const earning = BigInt(entry.pieces) * toPaisa(rate);
+
+      if (entry.rate === null) {
+        // Nothing was paid while the rate was blank: post the pay now, as packing would have.
+        const split = splitEarning(earning, "EQUAL", members);
+
+        // SAFETY: an equal split over at least one member always succeeds.
+        if (!split.ok) throw errors.conflict(split.message);
+
+        const description = `Packing ${packingNumber(entry.number)} · ${lot.lot_number} · ${pcs(entry.pieces)} · ${entry.who}`;
+
+        await tx.karigarLedgerEntry.createMany({
+          data: [...split.amounts]
+            .filter(([, amount]) => amount > 0n)
+            .map(([karigarId, amount]) => ({
+              karigarId,
+              entryDate: entry.pack_date,
+              type: "EARNING",
+              payMode: "PER_PIECE",
+              quantity: entry.pieces,
+              rate,
+              amount: paisaText(amount),
+              sourceType: "PACKING",
+              sourceId: id,
+              description,
+              createdById: actor.user.id,
+            })),
+        });
+
+        if (earning > 0n) {
+          await tx.lotCost.create({
+            data: {
+              lotId: lot.id,
+              sourceId: id,
+              kind: "PACKING_LABOUR",
+              entryDate: entry.pack_date,
+              quantity: entry.pieces,
+              rate,
+              amount: paisaText(earning),
+              createdById: actor.user.id,
+            },
+          });
+        }
+      }
+
+      await postRateDifference(tx, actor, {
+        sourceType: "PACKING_ENTRY",
+        sourceId: id,
+        lotId: lot.id,
+        oldRate: entry.rate,
+        newRate: rate,
+        pieces: entry.pieces,
+        members,
+        method: "EQUAL",
+        costKind: "PACKING_LABOUR",
+        label: `${packingNumber(entry.number)} · ${lot.lot_number}`,
+        reason: input.reason,
+      });
+      await tx.packingEntry.update({ where: { id }, data: { rate, earning: paisaText(earning) } });
+      await recordAudit(tx, {
+        type: "PACKING_RATE_SET",
+        ...audit(actor, meta),
+        metadata: { entryId: id, oldRate: entry.rate, newRate: rate, pieces: entry.pieces, reason: input.reason },
+      });
+    });
+
+    return this.getEntry(id, true);
   },
 
   /** Undoes a packing entry whose pieces are still in the godown: every member's pay is reversed. */
@@ -584,8 +727,8 @@ export const packingService = {
 
     await transaction(async (tx) => {
       const lot = await lockLot(tx, found.lotId);
-      const [entry] = await tx.$queryRaw<{ number: number; status: string }[]>`
-        SELECT number, status FROM packing_entries WHERE id = ${id}::uuid FOR UPDATE`;
+      const [entry] = await tx.$queryRaw<{ number: number; status: string; rate: string | null; pieces: number }[]>`
+        SELECT number, status, rate::text AS rate, pieces FROM packing_entries WHERE id = ${id}::uuid FOR UPDATE`;
 
       if (!entry) throw errors.notFound("Packing entry");
 
@@ -624,6 +767,31 @@ export const packingService = {
           createdById: actor.user.id,
         })),
       });
+
+      // If the rate changed after this entry was paid, take back that difference too.
+      if (entry.rate !== null) {
+        const paidAt = await tx.lotCost.findFirst({
+          where: { sourceId: id, kind: "PACKING_LABOUR", reversalOfId: null },
+          select: { rate: true },
+        });
+        const paidRate = paidAt ? paidAt.rate.toFixed(2) : "0.00";
+
+        if (paidRate !== entry.rate) {
+          await postRateDifference(tx, actor, {
+            sourceType: "PACKING_ENTRY",
+            sourceId: id,
+            lotId: lot.id,
+            oldRate: entry.rate,
+            newRate: paidRate,
+            pieces: entry.pieces,
+            members: await entryMembers(tx, id),
+            method: "EQUAL",
+            costKind: "PACKING_LABOUR",
+            label: `${packingNumber(entry.number)} · ${lot.lot_number}`,
+            reason: `Reversed: ${reason}`.slice(0, 300),
+          });
+        }
+      }
 
       const [earnings, costs] = await Promise.all([
         tx.karigarLedgerEntry.findMany({ where: { sourceType: "PACKING", sourceId: id, type: "EARNING" } }),
@@ -674,6 +842,18 @@ export const packingService = {
     return this.getEntry(id, actor.user.permissions.has("costing.view"));
   },
 };
+
+/** Who shares an entry's pay: its members as packed, by name (a one-person entry from before teams: its packer). */
+async function entryMembers(tx: Tx, entryId: string): Promise<SplitMember[]> {
+  const rows = await tx.$queryRaw<{ id: string }[]>`
+    SELECT k.id FROM karigars k
+    WHERE k.id IN (SELECT karigar_id FROM packing_entry_members WHERE entry_id = ${entryId}::uuid)
+       OR (k.id = (SELECT packer_id FROM packing_entries WHERE id = ${entryId}::uuid)
+           AND NOT EXISTS (SELECT 1 FROM packing_entry_members WHERE entry_id = ${entryId}::uuid))
+    ORDER BY k.name, k.number`;
+
+  return rows.map((row) => ({ karigarId: row.id }));
+}
 
 /** Each member's equal share of an entry's pay, as posted (same split as at packing). */
 function equalShares(earning: string, members: { karigarId: string }[]): Map<string, string> {

@@ -3,6 +3,7 @@ import { Router, type Request, type RequestHandler } from "express";
 import { label, REWORK_STATUS_LABEL } from "../../lib/labels";
 import { allRows, day, docNumber, sendCsv } from "../../lib/csv-export";
 import { actorOf, can, clientMeta } from "../../lib/request";
+import { heldForApproval } from "../approvals/approvals";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
 import {
@@ -17,6 +18,7 @@ import {
   reworkListQuerySchema,
   reworkResolveSchema,
   reworkUpdateSchema,
+  setRateSchema,
   type IssueListQuery,
   type RejectListQuery,
   type ReworkListQuery,
@@ -98,8 +100,30 @@ export function stitchingRoutes(): Router {
     res.status(201).json({ success: true, data: { issues } });
   }) satisfies RequestHandler);
 
+  // Sets a pending rate or changes one; a change after pay was posted adjusts that pay.
+  router.post("/issues/:id/rate", requirePermission("rates.manage"), requirePermission("costing.view"), (async (
+    req,
+    res,
+  ) => {
+    const issue = await stitchingService.setRate(
+      actorOf(req),
+      idOf(req),
+      setRateSchema.parse(req.body),
+      clientMeta(req),
+    );
+
+    res.json({ success: true, data: { issue } });
+  }) satisfies RequestHandler);
+
   router.post("/issues/:id/reverse", requirePermission("stitching.reverse"), (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (
+      await heldForApproval(req, res, { type: "STITCHING_ISSUE_REVERSAL", targetId: idOf(req), payload: { reason } })
+    ) {
+      return;
+    }
+
     const issue = await stitchingService.reverseIssue(actorOf(req), idOf(req), reason, clientMeta(req));
 
     res.json({ success: true, data: { issue } });
@@ -118,6 +142,13 @@ export function stitchingRoutes(): Router {
 
   router.post("/receipts/:id/reverse", requirePermission("stitching.reverse"), (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (
+      await heldForApproval(req, res, { type: "STITCHING_RECEIPT_REVERSAL", targetId: idOf(req), payload: { reason } })
+    ) {
+      return;
+    }
+
     const issue = await stitchingService.reverseReceipt(actorOf(req), idOf(req), reason, clientMeta(req));
 
     res.json({ success: true, data: { issue } });

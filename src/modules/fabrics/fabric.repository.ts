@@ -2,6 +2,7 @@ import { prisma, Prisma, type Db } from "../../db/prisma";
 import { columnFilters, contains, orderBy, page, where } from "../../lib/list-query";
 import { AVG_RATE, FABRIC_COLUMNS, INWARD_COLUMNS, MOVEMENT_COLUMNS, STOCK_VALUE } from "./fabric.columns";
 import type {
+  AddBillInput,
   CreateInwardInput,
   FabricListQuery,
   InwardListQuery,
@@ -59,6 +60,10 @@ export interface InwardDto {
   supplier: string | null;
   invoiceRef: string | null;
   notes: string | null;
+  /** PENDING: fabric received, bill (rate) still to come. */
+  billStatus: "PENDING" | "BILLED";
+  /** When a pending purchase got its bill. */
+  billed: { at: Date; by: string | null } | null;
   createdBy: string | null;
   createdAt: Date;
   reversal: { at: Date; by: string | null; reason: string } | null;
@@ -128,12 +133,14 @@ const INWARD_SELECT = Prisma.raw(`
   i.id, i.number, i.fabric_id, f.code AS fabric_code, f.name AS fabric_name, f.unit AS fabric_unit,
   i.inward_date::text AS inward_date, i.quantity::float8 AS quantity, i.rate::float8 AS rate, i.amount::float8 AS amount,
   i.supplier, i.invoice_ref, i.notes, cu.name AS created_by_name, i.created_at,
-  i.reversed_at, ru.name AS reversed_by_name, i.reversal_reason`);
+  i.reversed_at, ru.name AS reversed_by_name, i.reversal_reason,
+  i.bill_status, i.billed_at, bu.name AS billed_by_name`);
 
 const INWARD_JOINS = Prisma.raw(`
   JOIN fabrics f ON f.id = i.fabric_id
   LEFT JOIN users cu ON cu.id = i.created_by
-  LEFT JOIN users ru ON ru.id = i.reversed_by`);
+  LEFT JOIN users ru ON ru.id = i.reversed_by
+  LEFT JOIN users bu ON bu.id = i.billed_by`);
 
 interface InwardRow {
   id: string;
@@ -144,8 +151,8 @@ interface InwardRow {
   fabric_unit: string;
   inward_date: string;
   quantity: number;
-  rate: number;
-  amount: number;
+  rate: number | null;
+  amount: number | null;
   supplier: string | null;
   invoice_ref: string | null;
   notes: string | null;
@@ -154,6 +161,9 @@ interface InwardRow {
   reversed_at: Date | null;
   reversed_by_name: string | null;
   reversal_reason: string | null;
+  bill_status: "PENDING" | "BILLED";
+  billed_at: Date | null;
+  billed_by_name: string | null;
 }
 
 function toInward(row: InwardRow): InwardDto {
@@ -168,6 +178,8 @@ function toInward(row: InwardRow): InwardDto {
     supplier: row.supplier,
     invoiceRef: row.invoice_ref,
     notes: row.notes,
+    billStatus: row.bill_status,
+    billed: row.billed_at ? { at: row.billed_at, by: row.billed_by_name } : null,
     createdBy: row.created_by_name,
     createdAt: row.created_at,
     reversal:
@@ -440,15 +452,23 @@ export const inwardRepository = {
         OR i.fabric_id IN (SELECT id FROM fabrics WHERE search_text LIKE ${pattern}))`);
     }
     if (query.fabricId) clauses.push(Prisma.sql`i.fabric_id = ${query.fabricId}::uuid`);
+    // Waiting for a bill = posted (not reversed) and pending.
+    if (query.billStatus === "PENDING") clauses.push(Prisma.sql`i.bill_status = 'PENDING' AND i.reversed_at IS NULL`);
+    if (query.billStatus === "BILLED") clauses.push(Prisma.sql`i.bill_status = 'BILLED'`);
     return clauses;
   },
 
-  async list(
-    query: InwardListQuery,
-  ): Promise<{ inwards: InwardDto[]; total: number; totalAmount: number | null; totalQuantity: Record<string, number> }> {
+  async list(query: InwardListQuery): Promise<{
+    inwards: InwardDto[];
+    total: number;
+    totalAmount: number | null;
+    totalQuantity: Record<string, number>;
+    /** Posted purchases still waiting for their bill (whatever the filter). */
+    billsPending: number;
+  }> {
     const filter = where(this.filterClauses(query));
     const order = orderBy(INWARD_COLUMNS, query, "i.inward_date DESC", "i.number DESC");
-    const [rows, summary] = await Promise.all([
+    const [rows, summary, [pending]] = await Promise.all([
       prisma.$queryRaw<InwardRow[]>`
         SELECT ${INWARD_SELECT} FROM fabric_inwards i ${INWARD_JOINS} ${filter} ${order} ${page(query)}`,
       // Totals cover posted purchases only: a reversed purchase no longer counts.
@@ -457,12 +477,15 @@ export const inwardRepository = {
                COALESCE(sum(i.quantity) FILTER (WHERE i.reversed_at IS NULL), 0)::float8 AS quantity,
                COALESCE(sum(i.amount) FILTER (WHERE i.reversed_at IS NULL), 0)::float8 AS amount
         FROM fabric_inwards i JOIN fabrics f ON f.id = i.fabric_id ${filter} GROUP BY f.unit`,
+      prisma.$queryRaw<{ count: number }[]>`
+        SELECT count(*)::int AS count FROM fabric_inwards WHERE bill_status = 'PENDING' AND reversed_at IS NULL`,
     ]);
     return {
       inwards: rows.map(toInward),
       total: summary.reduce((sum, row) => sum + row.count, 0),
       totalAmount: summary.reduce((sum, row) => sum + row.amount, 0),
       totalQuantity: Object.fromEntries(summary.map((row) => [row.unit, row.quantity])),
+      billsPending: pending!.count,
     };
   },
 
@@ -480,6 +503,7 @@ export const inwardRepository = {
         inwardDate: new Date(input.inwardDate),
         quantity: input.quantity,
         rate: input.rate,
+        billStatus: input.rate === null ? "PENDING" : "BILLED",
         supplier: input.supplier,
         invoiceRef: input.invoiceRef,
         notes: input.notes,
@@ -488,6 +512,23 @@ export const inwardRepository = {
       select: { id: true },
     });
     return inward.id;
+  },
+
+  /** Prices a pending purchase; the fabric_inwards_billed trigger adds it to the average rate. */
+  async addBill(db: Db, id: string, input: AddBillInput, billedBy: string, current: InwardDto): Promise<void> {
+    await db.fabricInward.update({
+      where: { id },
+      data: {
+        rate: input.rate,
+        billStatus: "BILLED",
+        billedAt: new Date(),
+        billedById: billedBy,
+        // Typed at receipt and left out now: kept.
+        supplier: input.supplier ?? current.supplier,
+        invoiceRef: input.invoiceRef ?? current.invoiceRef,
+        notes: input.notes ?? current.notes,
+      },
+    });
   },
 
   async markReversed(db: Db, id: string, reversedBy: string, reason: string): Promise<void> {

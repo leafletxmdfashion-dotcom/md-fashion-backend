@@ -122,6 +122,105 @@ describe("ledger", () => {
   });
 });
 
+describe("the business's own kinds of entry", () => {
+  const newKind = (client: TestClient, body: object) => client.send("post", "/api/v1/payments/kinds", body);
+
+  it("adds a kind once, uses it with its own direction, and reverses it like any manual entry", async () => {
+    const { owner, ram } = await stitchedLot();
+
+    const bonus = await newKind(owner, { name: "  Festival   bonus ", sign: 1 });
+
+    expect(bonus.status, JSON.stringify(bonus.body)).toBe(201);
+    expect(bonus.body.data.kind).toMatchObject({ name: "Festival bonus", sign: 1, movesMoney: false, active: true });
+
+    // Same name ignoring case and spacing, or a built-in label, is refused.
+    expect((await newKind(owner, { name: "festival BONUS", sign: -1 })).status).toBe(409);
+    expect((await newKind(owner, { name: "payment", sign: -1 })).status).toBe(409);
+    expect((await newKind(owner, { name: "Fine" })).status).toBe(400);
+
+    const fine = (await newKind(owner, { name: "Fine", sign: -1, movesMoney: false })).body.data.kind as { id: string };
+    const bonusId = bonus.body.data.kind.id as string;
+
+    const posted = await owner.send("post", "/api/v1/payments/entries", {
+      karigarId: ram,
+      kindId: bonusId,
+      amount: 500,
+      entryDate: today,
+      method: "CASH",
+      note: "Dashain",
+    });
+
+    expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+    // Not a cash kind: "Paid by" is dropped.
+    expect(posted.body.data.entry).toMatchObject({ label: "Festival bonus", amount: "500.00", method: null });
+
+    await owner.send("post", "/api/v1/payments/entries", {
+      karigarId: ram,
+      kindId: fine.id,
+      amount: 50,
+      entryDate: today,
+    });
+
+    // Ram earned 405: +500 bonus −50 fine = 855.
+    expect((await people(owner, "?search=ram")).people[0]).toMatchObject({ balance: "855.00", paid: "0.00" });
+
+    const others = (await owner.get(`/api/v1/payments/ledger?karigarId=${ram}&kind=OTHER`)).body.data;
+
+    expect(others.entries.map((row: { label: string; amount: string }) => [row.label, row.amount])).toEqual([
+      ["Fine", "-50.00"],
+      ["Festival bonus", "500.00"],
+    ]);
+
+    const reversed = await owner.send("post", `/api/v1/payments/entries/${posted.body.data.entry.id}/reverse`, {
+      reason: "Given twice",
+    });
+
+    expect(reversed.status, JSON.stringify(reversed.body)).toBe(200);
+    expect((await people(owner, "?search=ram")).people[0]).toMatchObject({ balance: "355.00" });
+
+    // A reversal still counts under the kind it undoes.
+    expect((await owner.get(`/api/v1/payments/ledger?karigarId=${ram}&kind=OTHER`)).body.data.total).toBe(3);
+  });
+
+  it("needs exactly one of a built-in type or a kind, and hides kinds that are switched off", async () => {
+    const { owner, ram } = await stitchedLot();
+    const kind = (await newKind(owner, { name: "Tea money", sign: -1, movesMoney: true })).body.data.kind as {
+      id: string;
+    };
+
+    const both = await owner.send("post", "/api/v1/payments/entries", {
+      karigarId: ram,
+      type: "PAYMENT",
+      kindId: kind.id,
+      amount: 10,
+      entryDate: today,
+    });
+
+    expect(both.status).toBe(400);
+    expect((await entry(owner, ram, "PAYMENT", 10, { type: undefined })).status).toBe(400);
+
+    const hidden = await owner.send("patch", `/api/v1/payments/kinds/${kind.id}`, { active: false });
+
+    expect(hidden.status, JSON.stringify(hidden.body)).toBe(200);
+    expect((await owner.get("/api/v1/payments/kinds")).body.data.kinds).toEqual([]);
+    expect((await owner.get("/api/v1/payments/kinds?all=1")).body.data.kinds).toHaveLength(1);
+
+    const onHidden = await owner.send("post", "/api/v1/payments/entries", {
+      karigarId: ram,
+      kindId: kind.id,
+      amount: 10,
+      entryDate: today,
+    });
+
+    expect(onHidden.status).toBe(400);
+
+    await createUser({ email: "staff@garment.test", role: "STAFF" });
+    const staff = await loggedInClient("staff@garment.test");
+
+    expect((await newKind(staff, { name: "Gift", sign: 1 })).status).toBe(403);
+  });
+});
+
 describe("people master", () => {
   it("counts only earnings as earned, links a login, and shows that person their own ledger only", async () => {
     const { owner, ram, sita } = await stitchedLot();
@@ -131,7 +230,7 @@ describe("people master", () => {
     const userId = await createUser({ email: "ram@garment.test", role: "KARIGAR", name: "Ram" });
     const linked = await owner.send("put", `/api/v1/karigars/${ram}`, {
       name: "Ram",
-      category: "TAILOR",
+      category: "KARIGAR",
       payMode: "PER_PIECE",
       payRate: 0,
       active: true,
@@ -144,7 +243,7 @@ describe("people master", () => {
     // One login, one person.
     const twice = await owner.send("put", `/api/v1/karigars/${sita}`, {
       name: "Sita",
-      category: "TAILOR",
+      category: "KARIGAR",
       payMode: "PER_PIECE",
       payRate: 0,
       active: true,
@@ -192,5 +291,28 @@ describe("people master", () => {
     await entry(owner, staffId, "PAYMENT", 15000, { method: "BANK" });
 
     expect((await people(owner, "?category=STAFF")).people[0]).toMatchObject({ name: "Office Gita", balance: "0.00" });
+  });
+
+  it("files people under the system's job roles", async () => {
+    const { owner } = await stitchedLot();
+
+    await karigar(owner, "Line Hari", "STITCHING_SUPERVISOR", 20000, { payMode: "SALARY" });
+    await karigar(owner, "Godown Mohan", "GODOWN_STAFF", 2);
+
+    expect((await people(owner, "?category=STITCHING_SUPERVISOR")).people).toEqual([
+      expect.objectContaining({ name: "Line Hari", category: "STITCHING_SUPERVISOR" }),
+    ]);
+    expect((await people(owner, "?category=GODOWN_STAFF")).people).toEqual([
+      expect.objectContaining({ name: "Godown Mohan" }),
+    ]);
+
+    const unknown = await owner.send("post", "/api/v1/karigars", {
+      name: "Nobody",
+      category: "ASTRONAUT",
+      payMode: "SALARY",
+      payRate: 0,
+    });
+
+    expect(unknown.status).toBe(400);
   });
 });

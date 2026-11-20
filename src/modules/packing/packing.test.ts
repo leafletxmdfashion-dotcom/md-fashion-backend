@@ -40,9 +40,9 @@ async function ledger(karigarId: string) {
 /** A stitched lot and a packing team of Puja, Raju and Asha. */
 async function setup() {
   const lot = await stitchedLot();
-  const puja = await karigar(lot.owner, "Puja", "PACKER");
-  const raju = await karigar(lot.owner, "Raju", "PACKER");
-  const asha = await karigar(lot.owner, "Asha", "PACKER");
+  const puja = await karigar(lot.owner, "Puja", "PACKING_STAFF");
+  const raju = await karigar(lot.owner, "Raju", "PACKING_STAFF");
+  const asha = await karigar(lot.owner, "Asha", "PACKING_STAFF");
   const teamId = await packingTeam(lot.owner, "Pack A", [puja, raju, asha]);
 
   return { ...lot, puja, raju, asha, teamId };
@@ -88,15 +88,15 @@ describe("packing", () => {
     expect(over.status).toBe(400);
     expect(over.body.error.details["lines.0.quantity"][0]).toMatch(/Only 40 pieces of M/);
 
-    const noRate = await owner.send("post", "/api/v1/packing/entries", {
+    const nobody = await owner.send("post", "/api/v1/packing/entries", {
       lotId,
-      teamId,
+      rate: 2,
       packDate: today,
       lines: [{ sizeLabel: "M", quantity: 1 }],
     });
 
-    expect(noRate.status).toBe(400);
-    expect(noRate.body.error.details.rate[0]).toMatch(/rate per piece/);
+    expect(nobody.status).toBe(400);
+    expect(nobody.body.error.details.teamId[0]).toMatch(/team or person/);
 
     const entry = (
       await post(owner, "/api/v1/packing/entries", {
@@ -149,7 +149,7 @@ describe("packing", () => {
     expect(wrongKind.status).toBe(400);
     expect(wrongKind.body.error.details.teamId[0]).toMatch(/active packing team/);
 
-    const puja = await karigar(owner, "Puja", "PACKER");
+    const puja = await karigar(owner, "Puja", "PACKING_STAFF");
     const teamId = await packingTeam(owner, "Pack B", [puja]);
     const off = await owner.send("put", `/api/v1/teams/${teamId}`, {
       name: "Pack B",
@@ -377,5 +377,96 @@ describe("packing permissions", () => {
       rate: "1.25",
       earning: "5.00",
     });
+  });
+});
+
+describe("one packer and rate pending", () => {
+  const totals = async (lotId: string) =>
+    (
+      await sql(
+        "SELECT COALESCE(sum(amount), 0)::numeric(14, 2)::text AS amount FROM lot_costs WHERE lot_id = $1 AND kind = 'PACKING_LABOUR'",
+        [lotId],
+      )
+    ).rows[0].amount as string;
+
+  it("packs by one person without a team, at a rate set later, then changed, then reversed back to zero", async () => {
+    const { owner, lotId, puja } = await setup();
+
+    const entry = (
+      await post(owner, "/api/v1/packing/entries", {
+        lotId,
+        packerId: puja,
+        packDate: today,
+        lines: [{ sizeLabel: "S", quantity: 10 }],
+      })
+    ).entry as { id: string; packedBy: { kind: string; name: string } };
+
+    expect(entry).toMatchObject({ packedBy: { kind: "PERSON", name: "Puja" }, ratePending: true, earning: "0.00" });
+    // Pieces are in the godown; nobody is paid yet.
+    expect(await stock()).toEqual([{ name: "Polo", size: "S", balance: 10 }]);
+    expect(await ledger(puja)).toEqual([]);
+    expect((await owner.get("/api/v1/packing/entries?ratePending=1")).body.data.total).toBe(1);
+
+    const set = await owner.send("post", `/api/v1/packing/entries/${entry.id}/rate`, { rate: 2 });
+
+    expect(set.status, JSON.stringify(set.body)).toBe(200);
+    expect(set.body.data.entry).toMatchObject({ rate: "2.00", earning: "20.00", ratePending: false });
+    expect(await ledger(puja)).toEqual([{ type: "EARNING", source_type: "PACKING", amount: "20.00" }]);
+    expect((await owner.get("/api/v1/packing/entries?ratePending=1")).body.data.total).toBe(0);
+
+    // Changing a paid rate needs a reason and posts only the difference.
+    expect((await owner.send("post", `/api/v1/packing/entries/${entry.id}/rate`, { rate: 2.5 })).status).toBe(400);
+
+    const changed = await owner.send("post", `/api/v1/packing/entries/${entry.id}/rate`, {
+      rate: 2.5,
+      reason: "Agreed rate",
+    });
+
+    expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+    expect(changed.body.data.entry.rateChanges).toEqual([
+      expect.objectContaining({ oldRate: null, newRate: "2.00" }),
+      expect.objectContaining({ oldRate: "2.00", newRate: "2.50", pieces: 10, amount: "5.00", reason: "Agreed rate" }),
+    ]);
+    expect((await ledger(puja)).at(-1)).toEqual({ type: "EARNING", source_type: "RATE_CHANGE", amount: "5.00" });
+    expect(await totals(lotId)).toBe("25.00");
+
+    expect(
+      (await owner.send("post", `/api/v1/packing/entries/${entry.id}/reverse`, { reason: "Wrong lot" })).status,
+    ).toBe(200);
+
+    const balance = (await sql("SELECT sum(amount)::text AS total FROM karigar_ledger WHERE karigar_id = $1", [puja]))
+      .rows[0].total as string;
+
+    expect(balance).toBe("0.00");
+    expect(await totals(lotId)).toBe("0.00");
+  });
+
+  it("splits a set rate equally over a team and refuses a rate on a reversed entry", async () => {
+    const { owner, lotId, teamId, puja, raju, asha } = await setup();
+    const entry = (
+      await post(owner, "/api/v1/packing/entries", {
+        lotId,
+        teamId,
+        packDate: today,
+        lines: [{ sizeLabel: "M", quantity: 5 }],
+      })
+    ).entry as { id: string };
+
+    expect((await owner.send("post", `/api/v1/packing/entries/${entry.id}/rate`, { rate: 1 })).status).toBe(200);
+
+    // Rs 5 over three people: 1.67 + 1.67 + 1.66, leftover paisa by name (Asha, Puja, Raju).
+    expect([await ledger(asha), await ledger(puja), await ledger(raju)].map((rows) => rows[0]!.amount)).toEqual([
+      "1.67",
+      "1.67",
+      "1.66",
+    ]);
+
+    expect(
+      (await owner.send("post", `/api/v1/packing/entries/${entry.id}/reverse`, { reason: "Recount" })).status,
+    ).toBe(200);
+
+    expect(
+      (await owner.send("post", `/api/v1/packing/entries/${entry.id}/rate`, { rate: 2, reason: "x" })).status,
+    ).toBe(409);
   });
 });

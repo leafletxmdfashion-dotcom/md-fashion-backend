@@ -3,7 +3,23 @@ import { z } from "zod";
 import { columnQueryFields, type ColumnQuery, type ColumnSpecs } from "../../lib/list-query";
 import { personLoginSchema } from "../users/user.schema";
 
-export const KARIGAR_CATEGORIES = ["CUTTING_MASTER", "TAILOR", "HELPER", "PACKER", "STAFF", "OTHER"] as const;
+/**
+ * What a person works as: the system's job roles (Owner, Admin and Viewer are login roles, not jobs), so a
+ * person's category and the login role they usually get line up. Keep in sync with md_frontend
+ * production.types.ts and karigars_category_check.
+ */
+export const KARIGAR_CATEGORIES = [
+  "KARIGAR",
+  "CUTTING_MASTER",
+  "STITCHING_SUPERVISOR",
+  "PACKING_STAFF",
+  "GODOWN_STAFF",
+  "STORE_KEEPER",
+  "MANAGER",
+  "ACCOUNTANT",
+  "STAFF",
+  "OTHER",
+] as const;
 
 export const PAY_MODES = ["PER_PIECE", "PER_PALA", "PER_KG", "FIXED_JOB", "SALARY"] as const;
 
@@ -39,7 +55,9 @@ export const karigarSchema = z.strictObject({
     .number({ error: "Enter the rate." })
     .min(0, "Rate cannot be negative.")
     .max(9_999_999, "Rate is too large.")
-    .multipleOf(0.01, "Use at most 2 decimals."),
+    .multipleOf(0.01, "Use at most 2 decimals.")
+    // Left out (or ignored, without See prices & costs) keeps the current rate; a new person gets 0.
+    .optional(),
   active: z.boolean().default(true),
   /** The login this person uses to see their own ledger; left out keeps the current one. */
   userId: z.uuid("Choose a login.").nullish(),

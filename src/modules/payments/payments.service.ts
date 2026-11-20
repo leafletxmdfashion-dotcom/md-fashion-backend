@@ -12,8 +12,11 @@ import {
   LEDGER_COLUMNS,
   MANUAL_TYPES,
   PEOPLE_COLUMNS,
+  REVERSIBLE_TYPES,
   SIGN,
   type EntryInput,
+  type KindInput,
+  type KindUpdate,
   type LedgerQuery,
   type PeopleQuery,
 } from "./payments.schema";
@@ -39,10 +42,13 @@ const ENTRIES = (karigarId?: string) => Prisma.sql`
   SELECT l.id, l.seq, l.karigar_id, l.entry_date, l.type, l.amount, l.description, l.method, l.category, l.reference,
          l.source_type, l.source_id, l.created_by, l.created_at,
          CASE WHEN l.type IN ('EARNING', 'EARNING_REVERSAL') THEN 'EARNING'
-              WHEN l.type = 'ENTRY_REVERSAL' THEN o.type ELSE l.type END AS kind
+              WHEN COALESCE(o.type, l.type) IN ('OTHER_PLUS', 'OTHER_MINUS') THEN 'OTHER'
+              WHEN l.type = 'ENTRY_REVERSAL' THEN o.type ELSE l.type END AS kind,
+         mk.name AS kind_name
   FROM karigar_ledger l
   LEFT JOIN karigar_ledger o ON l.type = 'ENTRY_REVERSAL' AND o.source_type = 'MANUAL'
        AND o.source_id = l.source_id AND o.karigar_id = l.karigar_id AND o.type <> 'ENTRY_REVERSAL'
+  LEFT JOIN money_entry_kinds mk ON mk.id = COALESCE(o.kind_id, l.kind_id)
   ${karigarId ? Prisma.sql`WHERE l.karigar_id = ${karigarId}::uuid` : Prisma.empty}`;
 
 /** Per person: balance and what it is made of. */
@@ -87,6 +93,25 @@ const BALANCE_FILTER = {
   settled: Prisma.sql`COALESCE(t.balance, 0) = 0`,
 };
 
+/** A custom kind's entry reads by its own name ("Bonus"); a reversal stays "Reversal". */
+const entryLabel = (type: string, kindName: string | null) =>
+  type !== "ENTRY_REVERSAL" && kindName ? kindName : (LABEL[type] ?? type);
+
+const kindDto = (kind: { id: string; name: string; sign: number; movesMoney: boolean; active: boolean }) => ({
+  id: kind.id,
+  name: kind.name,
+  sign: kind.sign as 1 | -1,
+  movesMoney: kind.movesMoney,
+  active: kind.active,
+});
+
+/** Built-in labels a custom kind may not copy (compared ignoring case). */
+const BUILT_IN_NAMES = new Set(MANUAL_TYPES.map((type) => LABEL[type]!.toLowerCase()));
+
+const nameTaken = (name: string) => errors.conflict(`"${name}" already exists. Pick it from the list instead.`);
+
+const isDuplicate = (error: unknown) => error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
+
 const EMPTY_LEDGER = { entries: [], total: 0, summary: { credit: "0.00", debit: "0.00", net: "0.00" } };
 
 async function ledger(query: LedgerQuery) {
@@ -114,6 +139,7 @@ async function ledger(query: LedgerQuery) {
         entry_date: string;
         type: string;
         kind: string;
+        kind_name: string | null;
         amount: string;
         running: string;
         description: string;
@@ -129,7 +155,7 @@ async function ledger(query: LedgerQuery) {
         created_at: Date;
       }[]
     >`
-      SELECT x.id, x.entry_date::text AS entry_date, x.type, x.kind, x.amount::text AS amount, x.running::text AS running,
+      SELECT x.id, x.entry_date::text AS entry_date, x.type, x.kind, x.kind_name, x.amount::text AS amount, x.running::text AS running,
              x.description, x.method, x.category, x.reference, x.source_type,
              (x.source_type = 'MANUAL' AND x.type <> 'ENTRY_REVERSAL' AND EXISTS (
                SELECT 1 FROM karigar_ledger r WHERE r.type = 'ENTRY_REVERSAL' AND r.source_type = 'MANUAL'
@@ -148,7 +174,8 @@ async function ledger(query: LedgerQuery) {
       date: row.entry_date,
       type: row.type,
       kind: row.kind,
-      label: LABEL[row.type] ?? row.type,
+      label: entryLabel(row.type, row.kind_name),
+      kindName: row.kind_name,
       amount: money(row.amount),
       balance: money(row.running),
       description: row.description,
@@ -272,20 +299,99 @@ export const paymentsService = {
     return karigar ? ledger({ ...query, karigarId: karigar.id }) : EMPTY_LEDGER;
   },
 
+  /** Kinds of entry the business added; hidden ones too when asked (for the manage list). */
+  async kinds(includeHidden = false) {
+    const kinds = await prisma.moneyEntryKind.findMany({
+      where: includeHidden ? {} : { active: true },
+      orderBy: { name: "asc" },
+    });
+
+    return kinds.map(kindDto);
+  },
+
+  async createKind(actor: AuthContext, input: KindInput, meta: ClientMeta) {
+    if (BUILT_IN_NAMES.has(input.name.toLowerCase())) throw nameTaken(input.name);
+
+    try {
+      return await transaction(async (tx) => {
+        const kind = await tx.moneyEntryKind.create({
+          data: { name: input.name, sign: input.sign, movesMoney: input.movesMoney, createdById: actor.user.id },
+        });
+
+        await recordAudit(tx, {
+          type: "MONEY_KIND_SAVED",
+          ...audit(actor, meta),
+          metadata: { kindId: kind.id, name: kind.name, sign: kind.sign, movesMoney: kind.movesMoney },
+        });
+
+        return kindDto(kind);
+      });
+    } catch (error) {
+      if (isDuplicate(error)) throw nameTaken(input.name);
+
+      throw error;
+    }
+  },
+
+  /** Rename or hide a kind. Which way it moves the balance never changes: old entries depend on it. */
+  async updateKind(actor: AuthContext, id: string, input: KindUpdate, meta: ClientMeta) {
+    if (input.name && BUILT_IN_NAMES.has(input.name.toLowerCase())) throw nameTaken(input.name);
+
+    try {
+      return await transaction(async (tx) => {
+        if (!(await tx.moneyEntryKind.findUnique({ where: { id }, select: { id: true } }))) {
+          throw errors.notFound("Kind of entry");
+        }
+
+        const kind = await tx.moneyEntryKind.update({
+          where: { id },
+          data: {
+            ...(input.name ? { name: input.name } : {}),
+            ...(input.active === undefined ? {} : { active: input.active }),
+          },
+        });
+
+        await recordAudit(tx, {
+          type: "MONEY_KIND_SAVED",
+          ...audit(actor, meta),
+          metadata: { kindId: id, name: kind.name, active: kind.active },
+        });
+
+        return kindDto(kind);
+      });
+    } catch (error) {
+      if (isDuplicate(error)) throw nameTaken(input.name ?? "");
+
+      throw error;
+    }
+  },
+
   async record(actor: AuthContext, input: EntryInput, meta: ClientMeta) {
     const karigar = await prisma.karigar.findUnique({ where: { id: input.karigarId }, select: { id: true } });
 
     if (!karigar) throw fieldError("karigarId", "Choose the person.");
 
-    const amount = toPaisa(input.amount) * BigInt(SIGN[input.type]);
-    const description = [LABEL[input.type], input.category, input.note].filter(Boolean).join(" · ").slice(0, 500);
+    const kind = input.kindId ? await prisma.moneyEntryKind.findUnique({ where: { id: input.kindId } }) : null;
+
+    if (input.kindId && !kind?.active) throw fieldError("type", "Choose what this is.");
+
+    // SAFETY: the schema allows exactly one of type / kindId, so type is set when there is no kind.
+    const type = kind ? (kind.sign > 0 ? "OTHER_PLUS" : "OTHER_MINUS") : input.type!;
+    const sign = kind ? kind.sign : SIGN[input.type!];
+    const method = kind && !kind.movesMoney ? null : input.method;
+    const amount = toPaisa(input.amount) * BigInt(sign);
+    const description = [kind?.name ?? LABEL[type], input.category, input.note]
+      .filter(Boolean)
+      .join(" · ")
+      .slice(0, 500);
 
     const id = await transaction(async (tx) => {
       const entry = await tx.karigarLedgerEntry.create({
         data: {
           karigarId: input.karigarId,
           entryDate: new Date(input.entryDate),
-          type: input.type,
+          type,
+          kindId: kind?.id ?? null,
           payMode: "MANUAL",
           quantity: 0,
           rate: 0,
@@ -293,7 +399,7 @@ export const paymentsService = {
           sourceType: "MANUAL",
           sourceId: randomUUID(),
           description,
-          method: input.method,
+          method,
           category: input.category,
           reference: input.reference,
           createdById: actor.user.id,
@@ -304,7 +410,13 @@ export const paymentsService = {
       await recordAudit(tx, {
         type: "LEDGER_ENTRY_POSTED",
         ...audit(actor, meta),
-        metadata: { entryId: entry.id, karigarId: input.karigarId, type: input.type, amount: paisaText(amount) },
+        metadata: {
+          entryId: entry.id,
+          karigarId: input.karigarId,
+          type,
+          kind: kind?.name ?? null,
+          amount: paisaText(amount),
+        },
       });
 
       return entry.id;
@@ -316,7 +428,11 @@ export const paymentsService = {
   async entry(id: string) {
     const entry = await prisma.karigarLedgerEntry.findUnique({
       where: { id },
-      include: { karigar: { select: { id: true, number: true, name: true } }, createdBy: { select: { name: true } } },
+      include: {
+        karigar: { select: { id: true, number: true, name: true } },
+        createdBy: { select: { name: true } },
+        kind: { select: { name: true } },
+      },
     });
 
     if (!entry) throw errors.notFound("Ledger entry");
@@ -325,7 +441,8 @@ export const paymentsService = {
       id: entry.id,
       date: entry.entryDate.toISOString().slice(0, 10),
       type: entry.type,
-      label: LABEL[entry.type] ?? entry.type,
+      label: entryLabel(entry.type, entry.kind?.name ?? null),
+      kindName: entry.kind?.name ?? null,
       amount: entry.amount.toFixed(2),
       description: entry.description,
       method: entry.method,
@@ -341,13 +458,20 @@ export const paymentsService = {
   async reverse(actor: AuthContext, id: string, reason: string, meta: ClientMeta) {
     const reversalId = await transaction(async (tx) => {
       const [original] = await tx.$queryRaw<
-        { karigar_id: string; type: string; amount: string; source_type: string; source_id: string; description: string }[]
+        {
+          karigar_id: string;
+          type: string;
+          amount: string;
+          source_type: string;
+          source_id: string;
+          description: string;
+        }[]
       >`SELECT karigar_id, type, amount::text AS amount, source_type, source_id, description
         FROM karigar_ledger WHERE id = ${id}::uuid`;
 
       if (!original) throw errors.notFound("Ledger entry");
 
-      if (original.source_type !== "MANUAL" || !(MANUAL_TYPES as readonly string[]).includes(original.type)) {
+      if (original.source_type !== "MANUAL" || !REVERSIBLE_TYPES.includes(original.type)) {
         throw errors.conflict("Only payments, advances, expenses, credits and money received back are reversed here.");
       }
 

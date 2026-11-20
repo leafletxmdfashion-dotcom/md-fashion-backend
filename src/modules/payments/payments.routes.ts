@@ -3,11 +3,14 @@ import { Router, type Request, type RequestHandler } from "express";
 import { allRows, sendCsv, type CsvColumn } from "../../lib/csv-export";
 import { CATEGORY_LABEL, karigarCode, label } from "../../lib/labels";
 import { actorOf, clientMeta } from "../../lib/request";
+import { heldForApproval } from "../approvals/approvals";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
 import {
   entrySchema,
   idParamsSchema,
+  kindSchema,
+  kindUpdateSchema,
   ledgerQuerySchema,
   peopleQuerySchema,
   reverseSchema,
@@ -73,6 +76,28 @@ export function paymentsRoutes(): Router {
     sendCsv(req, res, "my-ledger", ledgerColumns(false), entries, (e) => e.id);
   }) satisfies RequestHandler);
 
+  // The business's own kinds of entry ("Bonus", "Fine"...), next to the five built-in ones.
+  router.get("/kinds", view, (async (req, res) => {
+    res.json({ success: true, data: { kinds: await paymentsService.kinds(req.query.all === "1") } });
+  }) satisfies RequestHandler);
+
+  router.post("/kinds", manage, (async (req, res) => {
+    const kind = await paymentsService.createKind(actorOf(req), kindSchema.parse(req.body), clientMeta(req));
+
+    res.status(201).json({ success: true, data: { kind } });
+  }) satisfies RequestHandler);
+
+  router.patch("/kinds/:id", manage, (async (req, res) => {
+    const kind = await paymentsService.updateKind(
+      actorOf(req),
+      idOf(req),
+      kindUpdateSchema.parse(req.body),
+      clientMeta(req),
+    );
+
+    res.json({ success: true, data: { kind } });
+  }) satisfies RequestHandler);
+
   router.get("/people", view, (async (req, res) => {
     // SAFETY: column params are validated by the schema; their keys are dynamic.
     const query = peopleQuerySchema.parse(req.query) as PeopleQuery;
@@ -136,6 +161,9 @@ export function paymentsRoutes(): Router {
 
   router.post("/entries/:id/reverse", manage, (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "PAYMENT_REVERSAL", targetId: idOf(req), payload: { reason } })) return;
+
     const entry = await paymentsService.reverse(actorOf(req), idOf(req), reason, clientMeta(req));
 
     res.json({ success: true, data: { entry } });

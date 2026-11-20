@@ -27,10 +27,7 @@ const listedReason = z
   .transform((value) => value || null)
   .refine((value) => value === null || value !== "Other", "Say what was wrong.")
   .refine(
-    (value) =>
-      value === null ||
-      (REJECT_REASONS as readonly string[]).includes(value) ||
-      /^Other:\s*\S/.test(value),
+    (value) => value === null || (REJECT_REASONS as readonly string[]).includes(value) || /^Other:\s*\S/.test(value),
     "Choose a reason from the list.",
   );
 
@@ -78,6 +75,29 @@ const notes = z
 
 const reason = z.string().trim().min(3, "Give a reason (at least 3 characters).").max(500);
 
+/** A rate per piece in rupees; shared with packing. */
+export const ratePerPiece = z
+  .number({ error: "Enter the rate per piece." })
+  .min(0, "Rate cannot be negative.")
+  .max(99_999, "Rate is too large.")
+  .multipleOf(0.01, "Use at most 2 decimals.");
+
+/**
+ * Sets a pending rate, or changes one. A change after pay was posted needs a reason: the
+ * difference for pieces already paid is posted on top.
+ */
+export const setRateSchema = z.strictObject({
+  rate: ratePerPiece,
+  reason: z
+    .string()
+    .trim()
+    .max(300, "Keep the reason under 300 characters.")
+    .nullish()
+    .transform((value) => value || null),
+});
+
+export type SetRateInput = z.infer<typeof setRateSchema>;
+
 const pieces = (label: string) =>
   z
     .number({ error: `Enter ${label}.` })
@@ -106,27 +126,39 @@ export const issueSchema = z
   .strictObject({
     lotId: z.uuid("Choose a lot."),
     operation: z.string().trim().min(1, "Enter the work, e.g. Full stitching.").max(60, "Keep it under 60 characters."),
-    rate: z
-      .number({ error: "Enter the rate per piece." })
-      .min(0, "Rate cannot be negative.")
-      .max(99_999, "Rate is too large.")
-      .multipleOf(0.01, "Use at most 2 decimals."),
+    /** Blank = rate pending: pieces move as usual, pay is posted when the rate is set. */
+    rate: ratePerPiece.nullish().transform((value) => value ?? null),
     issueDate: businessDate,
     notes,
+    /** Each entry is a Jogadi team or one karigar on their own. */
     teams: z
-      .array(z.strictObject({ teamId: z.uuid("Choose a Jogadi team."), lines: issueLines }))
-      .min(1, "Choose a Jogadi team.")
-      .max(10, "Divide between at most 10 teams."),
+      .array(
+        z.strictObject({
+          teamId: z.uuid("Choose a Jogadi team or a karigar.").optional(),
+          karigarId: z.uuid("Choose a Jogadi team or a karigar.").optional(),
+          lines: issueLines,
+        }),
+      )
+      .min(1, "Choose a Jogadi team or a karigar.")
+      .max(10, "Divide between at most 10 teams or karigars."),
   })
   .superRefine((issue, ctx) => {
-    const teams = new Set<string>();
+    const chosen = new Set<string>();
 
     issue.teams.forEach((team, teamIndex) => {
-      if (teams.has(team.teamId)) {
-        ctx.addIssue({ code: "custom", path: ["teams", teamIndex, "teamId"], message: "This team is chosen twice." });
+      const assignee = team.teamId ?? team.karigarId;
+
+      if (Boolean(team.teamId) === Boolean(team.karigarId)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["teams", teamIndex, "teamId"],
+          message: "Choose a Jogadi team or a karigar.",
+        });
+      } else if (chosen.has(assignee!)) {
+        ctx.addIssue({ code: "custom", path: ["teams", teamIndex, "teamId"], message: "Chosen twice." });
       }
 
-      teams.add(team.teamId);
+      if (assignee) chosen.add(assignee);
 
       const seen = new Set<string>();
 
@@ -236,6 +268,10 @@ export const issueListQuerySchema = z.object({
   ...listPage,
   lotId: z.uuid().optional(),
   teamId: z.uuid().optional(),
+  /** Work issued to one karigar on their own. */
+  karigarId: z.uuid().optional(),
+  /** "1" = only issues whose rate is still to be set. */
+  ratePending: z.enum(["1"]).optional(),
   ...columnQueryFields(ISSUE_COLUMNS),
 });
 

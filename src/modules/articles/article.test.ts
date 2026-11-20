@@ -47,7 +47,7 @@ describe("merge items", () => {
 
     await stitch(owner, other.lotId, teamId);
 
-    const packer = await packingTeam(owner, "Pack A", [await karigar(owner, "Puja", "PACKER", 1)]);
+    const packer = await packingTeam(owner, "Pack A", [await karigar(owner, "Puja", "PACKING_STAFF", 1)]);
 
     for (const lot of [lotId, other.lotId]) {
       await post(owner, "/api/v1/packing/entries", {

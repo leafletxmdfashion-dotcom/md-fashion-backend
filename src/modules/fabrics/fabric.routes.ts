@@ -21,6 +21,13 @@ export function fabricRoutes(): Router {
   router.get("/inwards/suppliers", view, fabricController.suppliers);
   router.post("/inwards", requirePermission("fabric.inward"), fabricController.createInward);
   router.post("/inwards/:id/reverse", requirePermission("fabric.reverse"), fabricController.reverseInward);
+  // The bill of fabric received before it: a price, so it needs See prices & costs too.
+  router.post(
+    "/inwards/:id/bill",
+    requirePermission("fabric.inward"),
+    requirePermission("costing.view"),
+    fabricController.addBill,
+  );
 
   router.get("/:id", view, fabricController.get);
   router.put("/:id", requirePermission("fabric.manage"), fabricController.update);
