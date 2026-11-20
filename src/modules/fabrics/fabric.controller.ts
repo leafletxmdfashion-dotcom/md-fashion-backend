@@ -1,4 +1,5 @@
 import type { Request, RequestHandler } from "express";
+import { heldForApproval } from "../approvals/approvals";
 
 import { errors } from "../../lib/errors";
 import { can, clientMeta } from "../../lib/request";
@@ -78,7 +79,11 @@ export const fabricController = {
   }) satisfies RequestHandler,
 
   adjust: (async (req, res) => {
-    await fabricService.adjust(actorOf(req), idOf(req), adjustmentSchema.parse(req.body), clientMeta(req));
+    const input = adjustmentSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "FABRIC_ADJUSTMENT", targetId: idOf(req), payload: input })) return;
+
+    await fabricService.adjust(actorOf(req), idOf(req), input, clientMeta(req));
     res.status(201).json({ success: true, data: null });
   }) satisfies RequestHandler,
 
@@ -173,6 +178,10 @@ export const fabricController = {
 
   reverseInward: (async (req, res) => {
     const { reason } = reverseInwardSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "PURCHASE_REVERSAL", targetId: idOf(req), payload: { reason } }))
+      return;
+
     const inward = await inwardService.reverse(actorOf(req), idOf(req), reason, clientMeta(req));
     res.json({ success: true, data: { inward: showCost(req) ? inward : hideInwardCost(inward) } });
   }) satisfies RequestHandler,

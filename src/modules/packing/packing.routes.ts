@@ -5,6 +5,7 @@ import { z } from "zod";
 import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
 import { actorOf, can, clientMeta } from "../../lib/request";
 import { queryRows, rowQueryFields, type RowQuery, type RowSpecs } from "../../lib/row-query";
+import { heldForApproval } from "../approvals/approvals";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
 import {
@@ -272,6 +273,9 @@ export function packingRoutes(): Router {
 
   router.post("/entries/:id/reverse", manage, (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "PACKING_REVERSAL", targetId: idOf(req), payload: { reason } })) return;
+
     const entry = await packingService.reverse(actorOf(req), idOf(req), reason, clientMeta(req));
 
     res.json({ success: true, data: { entry } });

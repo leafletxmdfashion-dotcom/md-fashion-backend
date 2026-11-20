@@ -5,7 +5,14 @@
 export const PERMISSION_GROUPS = [
   {
     module: "General",
-    permissions: [{ key: "dashboard.view", label: "View dashboard", description: "Home page figures and shortcuts." }],
+    permissions: [
+      { key: "dashboard.view", label: "View dashboard", description: "Home page figures and shortcuts." },
+      {
+        key: "reports.view",
+        label: "View reports",
+        description: "The Reports page; each report also needs the right to view its own area.",
+      },
+    ],
   },
   {
     module: "Fabric",
@@ -89,6 +96,11 @@ export const PERMISSION_GROUPS = [
           "Fabric rates, purchase amounts and stock value; cutting fabric cost; lot cost; pay rates and earnings in cutting, stitching and packing; money on the dashboard and in exports.",
       },
       {
+        key: "costing.manage",
+        label: "Add lot costs",
+        description: "Add accessories, printing/washing and other costs to a lot, or remove ones added by hand.",
+      },
+      {
         key: "rates.manage",
         label: "Set & change rates",
         description: "Set a pending rate per piece, or change one after work was paid (needs See prices & costs).",
@@ -107,6 +119,16 @@ export const PERMISSION_GROUPS = [
       { key: "users.view", label: "View users", description: "Who has an account and their role." },
       { key: "users.manage", label: "Manage users", description: "Invite staff, change roles, disable accounts." },
       { key: "roles.manage", label: "Manage roles", description: "Create roles and choose what each can do." },
+      {
+        key: "settings.manage",
+        label: "Manage settings",
+        description: "Company details, lot numbering, default reorder level and approval rules.",
+      },
+      {
+        key: "approvals.decide",
+        label: "Approve corrections",
+        description: "Approve or reject requests to reverse or adjust posted records.",
+      },
       {
         key: "audit.view",
         label: "View audit log",

@@ -57,7 +57,7 @@ describe("roles and permissions", () => {
       expect.arrayContaining(["fabric.view", "fabric.inward"]),
     );
     // Dead modules are gone from every role.
-    expect(JSON.stringify(roles)).not.toMatch(/orders\.|products\.|settings\.manage/);
+    expect(JSON.stringify(roles)).not.toMatch(/orders\.|products\./);
   });
 
   it("lets an admin create a custom role, assign it, and the holder gets exactly those rights", async () => {

@@ -4,6 +4,7 @@ import { allRows, docNumber, sendCsv } from "../../lib/csv-export";
 import { BATCH_STATUS_LABEL, label, unitShort } from "../../lib/labels";
 import { errors } from "../../lib/errors";
 import { actorOf, can, clientMeta } from "../../lib/request";
+import { heldForApproval } from "../approvals/approvals";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
 import {
@@ -49,7 +50,8 @@ export function lotRoutes(): Router {
     const input = createLotSchema.parse(req.body);
 
     // Posting the new cutting needs the same right as the separate issue / finalize request.
-    if (input.action && !can(req, input.action === "issue" ? "cutting.issue" : "cutting.finalize")) throw errors.forbidden();
+    if (input.action && !can(req, input.action === "issue" ? "cutting.issue" : "cutting.finalize"))
+      throw errors.forbidden();
 
     const data = await lotService.create(actorOf(req), input, clientMeta(req), showCost(req));
 
@@ -57,7 +59,13 @@ export function lotRoutes(): Router {
   }) satisfies RequestHandler);
 
   router.patch("/:id", manage, (async (req, res) => {
-    const lot = await lotService.update(actorOf(req), idOf(req), updateLotSchema.parse(req.body), clientMeta(req), showCost(req));
+    const lot = await lotService.update(
+      actorOf(req),
+      idOf(req),
+      updateLotSchema.parse(req.body),
+      clientMeta(req),
+      showCost(req),
+    );
 
     res.json({ success: true, data: { lot } });
   }) satisfies RequestHandler);
@@ -170,6 +178,9 @@ export function cuttingRoutes(): Router {
 
   router.post("/:id/reverse", requirePermission("cutting.reverse"), (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "CUTTING_REVERSAL", targetId: idOf(req), payload: { reason } })) return;
+
     const batch = await cuttingService.reverse(actorOf(req), idOf(req), reason, clientMeta(req), showCost(req));
 
     res.status(201).json({ success: true, data: { batch } });

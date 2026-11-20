@@ -97,6 +97,9 @@ model User {
   karigarsCreated      Karigar[]
   karigarEntries       KarigarLedgerEntry[]
   moneyEntryKinds      MoneyEntryKind[]
+  settingsUpdated      AppSettings[]
+  approvalsRequested   ApprovalRequest[]        @relation("ApprovalRequestedBy")
+  approvalsDecided     ApprovalRequest[]        @relation("ApprovalDecidedBy")
   articlesCreated      Article[]
   lotsCreated          ProductionLot[]
   batchesCreated       CuttingBatch[]           @relation("BatchCreatedBy")
@@ -644,13 +647,18 @@ model LotCost {
   lotId        String        @map("lot_id") @db.Uuid
   /// Null for stitching labour, whose source is a receipt or rework resolution.
   batchId      String?       @map("batch_id") @db.Uuid
-  /// FABRIC_CONSUMED | FABRIC_WASTAGE | CUTTING_LABOUR | STITCHING_LABOUR (CHECK constraint)
+  /// FABRIC_CONSUMED | FABRIC_WASTAGE | CUTTING_LABOUR | STITCHING_LABOUR | PACKING_LABOUR (automatic);
+  /// ACCESSORIES | PROCESSING | OTHER_DIRECT (added by hand on the Costing page) (CHECK constraint)
   kind         String
   entryDate    DateTime      @map("entry_date") @db.Date
   quantity     Decimal       @db.Decimal(18, 6)
   rate         Decimal       @db.Decimal(14, 4)
   amount       Decimal       @db.Decimal(14, 2)
   reversalOfId String?       @unique @map("reversal_of") @db.Uuid
+  /// What a hand-added cost is for (required for those; CHECK constraint).
+  note         String?
+  /// Bill or voucher number of a hand-added cost.
+  reference    String?
   createdById  String        @map("created_by") @db.Uuid
   createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
   lot          ProductionLot @relation(fields: [lotId], references: [id], onDelete: NoAction, onUpdate: NoAction)
@@ -1022,4 +1030,51 @@ model RateChange {
 
   @@index([sourceType, sourceId, createdAt], map: "rate_changes_source_idx")
   @@map("rate_changes")
+}
+
+/// Business settings: a single row (id is always true). Read by everyone; changed with settings.manage.
+model AppSettings {
+  id                  Boolean  @id @default(true)
+  companyName         String   @map("company_name")
+  address             String?
+  phone               String?
+  defaultReorderLevel Decimal? @map("default_reorder_level") @db.Decimal(12, 3)
+  /// Suggests the next lot number: {seq} (required) and {year}.
+  lotNumberPattern    String   @default("LOT-{seq}") @map("lot_number_pattern")
+  approveAdjustments  Boolean  @default(false) @map("approve_adjustments")
+  approveReversals    Boolean  @default(false) @map("approve_reversals")
+  updatedById         String?  @map("updated_by") @db.Uuid
+  updatedAt           DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  updatedBy           User?    @relation(fields: [updatedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@map("app_settings")
+}
+
+/// A correction waiting for (or decided by) an approver. Approving replays the screen's own reversal or
+/// adjustment as the approver. Never deleted.
+model ApprovalRequest {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number        Int       @unique @default(autoincrement())
+  /// PURCHASE_REVERSAL | FABRIC_ADJUSTMENT | CUTTING_REVERSAL | STITCHING_ISSUE_REVERSAL | STITCHING_RECEIPT_REVERSAL |
+  /// PACKING_REVERSAL | DISPATCH_REVERSAL | GODOWN_ADJUSTMENT | PAYMENT_REVERSAL (CHECK constraint)
+  type          String
+  targetId      String    @map("target_id") @db.Uuid
+  payload       Json
+  title         String
+  change        String
+  reason        String
+  /// PENDING | APPROVED | REJECTED | CANCELLED (CHECK constraint)
+  status        String    @default("PENDING")
+  requestedById String    @map("requested_by") @db.Uuid
+  requestedAt   DateTime  @default(now()) @map("requested_at") @db.Timestamptz(6)
+  decidedById   String?   @map("decided_by") @db.Uuid
+  decidedAt     DateTime? @map("decided_at") @db.Timestamptz(6)
+  comment       String?
+  lastError     String?   @map("last_error")
+  requestedBy   User      @relation("ApprovalRequestedBy", fields: [requestedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  decidedBy     User?     @relation("ApprovalDecidedBy", fields: [decidedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([type, targetId], map: "approval_requests_open_idx", where: raw("((status = 'PENDING'::text) AND (type <> ALL (ARRAY['FABRIC_ADJUSTMENT'::text, 'GODOWN_ADJUSTMENT'::text])))"))
+  @@index([status, requestedAt(sort: Desc)], map: "approval_requests_status_idx")
+  @@map("approval_requests")
 }

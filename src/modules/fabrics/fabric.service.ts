@@ -2,6 +2,7 @@ import { isUniqueViolation, prisma, transaction, type Db } from "../../db/prisma
 import { AppError, ErrorCode, errors } from "../../lib/errors";
 import { recordAudit } from "../audit/audit.service";
 import { recostProvisionalCutting } from "../cutting/cutting.service";
+import { getSettings } from "../settings/settings";
 import type { AuthContext, ClientMeta } from "../sessions/session.types";
 import { fabricRepository, inwardRepository, type FabricDto, type InwardDto } from "./fabric.repository";
 import {
@@ -34,7 +35,10 @@ function audit(actor: AuthContext, meta: ClientMeta) {
 async function resolveFabric(tx: Db, actor: AuthContext, input: CreateInwardInput, meta: ClientMeta): Promise<string> {
   let found = await fabricRepository.lockByName(tx, input.fabricName);
   if (!found) {
-    const created = await fabricRepository.create(tx, input, actor.user.id);
+    // A new fabric with no reorder level typed gets the default from Settings (if one is set).
+    const reorder =
+      input.lowStockThreshold === undefined ? (await getSettings(tx)).defaultReorderLevel : input.lowStockThreshold;
+    const created = await fabricRepository.create(tx, { ...input, lowStockThreshold: reorder }, actor.user.id);
     if (created) {
       await recordAudit(tx, {
         type: "FABRIC_CREATED",

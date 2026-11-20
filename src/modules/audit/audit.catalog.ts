@@ -14,6 +14,8 @@ export const AUDIT_CATEGORIES = [
   "Godown",
   "Teams & karigars",
   "Payments",
+  "Costing",
+  "Approvals & settings",
 ] as const;
 
 export type AuditCategory = (typeof AUDIT_CATEGORIES)[number];
@@ -97,6 +99,13 @@ export const AUDIT_EVENTS = {
   GODOWN_ADJUSTED: e("Godown count corrected", "Godown", "warning"),
   LEDGER_ENTRY_POSTED: e("Payment or entry recorded", "Payments", "notice"),
   MONEY_KIND_SAVED: e("Kind of money entry added or changed", "Payments", "info"),
+  SETTINGS_SAVED: e("Settings changed", "Approvals & settings", "notice"),
+  LOT_COST_ADDED: e("Cost added to a lot", "Costing", "notice"),
+  LOT_COST_REMOVED: e("Cost removed from a lot", "Costing", "warning"),
+  APPROVAL_REQUESTED: e("Correction sent for approval", "Approvals & settings", "notice"),
+  APPROVAL_APPROVED: e("Correction approved", "Approvals & settings", "warning"),
+  APPROVAL_REJECTED: e("Correction rejected", "Approvals & settings", "notice"),
+  APPROVAL_CANCELLED: e("Correction request cancelled", "Approvals & settings"),
   STITCHING_RATE_SET: e("Stitching rate set or changed", "Stitching", "notice"),
   PACKING_RATE_SET: e("Packing rate set or changed", "Packing", "notice"),
   LEDGER_ENTRY_REVERSED: e("Payment or entry reversed", "Payments", "warning"),

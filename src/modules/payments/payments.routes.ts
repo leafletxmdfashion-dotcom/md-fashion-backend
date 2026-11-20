@@ -3,6 +3,7 @@ import { Router, type Request, type RequestHandler } from "express";
 import { allRows, sendCsv, type CsvColumn } from "../../lib/csv-export";
 import { CATEGORY_LABEL, karigarCode, label } from "../../lib/labels";
 import { actorOf, clientMeta } from "../../lib/request";
+import { heldForApproval } from "../approvals/approvals";
 import { requireAuth } from "../auth/auth.middleware";
 import { requirePermission } from "../permissions/permission.middleware";
 import {
@@ -160,6 +161,9 @@ export function paymentsRoutes(): Router {
 
   router.post("/entries/:id/reverse", manage, (async (req, res) => {
     const { reason } = reverseSchema.parse(req.body);
+
+    if (await heldForApproval(req, res, { type: "PAYMENT_REVERSAL", targetId: idOf(req), payload: { reason } })) return;
+
     const entry = await paymentsService.reverse(actorOf(req), idOf(req), reason, clientMeta(req));
 
     res.json({ success: true, data: { entry } });

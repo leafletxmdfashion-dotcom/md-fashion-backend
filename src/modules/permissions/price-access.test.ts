@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { post, stitchedLot, today } from "../../test/fixtures";
 import { createUser, loggedInClient, resetDatabase, sql } from "../../test/helpers";
 import { articleRoutes } from "../articles/article.routes";
+import { costingRoutes } from "../costing/costing";
 import { cuttingRoutes, lotRoutes } from "../cutting/cutting.routes";
 import { dashboardRoutes } from "../dashboard/dashboard";
 import { fabricRoutes } from "../fabrics/fabric.routes";
@@ -31,6 +32,7 @@ const MODULES: [string, () => Router][] = [
   ["/packing", packingRoutes],
   ["/godown", godownRoutes],
   ["/dashboard", dashboardRoutes],
+  ["/costing", costingRoutes],
 ];
 
 /** GET routes whose parameters the sweep cannot fill (no such document in the fixture). */
@@ -117,6 +119,7 @@ describe("price & cost access", () => {
       "/stitching/lots/:id/balance": lotId,
       "/packing/entries/:id": entry.id,
       "/godown/:articleId": articleId,
+      "/costing/lots/:id": lotId,
     };
 
     const leaks: string[] = [];

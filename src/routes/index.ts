@@ -16,6 +16,10 @@ import { godownRoutes } from "../modules/godown/godown.routes";
 import { packingRoutes } from "../modules/packing/packing.routes";
 import { paymentsRoutes } from "../modules/payments/payments.routes";
 import { roleRoutes } from "../modules/permissions/permission.routes";
+import { settingsRoutes } from "../modules/settings/settings";
+import { costingRoutes } from "../modules/costing/costing";
+import { approvalRoutes } from "../modules/approvals/approvals";
+import { reportRoutes } from "../modules/reports/reports";
 import { stitchingRoutes } from "../modules/stitching/stitching.routes";
 import { userRoutes } from "../modules/users/user.routes";
 
@@ -49,6 +53,10 @@ export function apiRouter(limiters: RateLimiters): Router {
   router.use("/packing", packingRoutes());
   router.use("/godown", godownRoutes());
   router.use("/payments", paymentsRoutes());
+  router.use("/settings", settingsRoutes());
+  router.use("/costing", costingRoutes());
+  router.use("/approvals", approvalRoutes());
+  router.use("/reports", reportRoutes());
 
   return router;
 }
